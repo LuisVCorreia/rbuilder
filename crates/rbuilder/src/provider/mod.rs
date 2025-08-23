@@ -12,6 +12,8 @@ use tokio_util::sync::CancellationToken;
 pub mod ipc_state_provider;
 pub mod reth_prov;
 pub mod state_provider_factory_from_provider_factory;
+pub mod http_state_provider;
+pub mod state_cache;
 
 /// Main trait to interact with the chain data.
 /// Allows to create different backends for chain data access without implementing lots of interfaces as would happen with reth_provider::StateProviderFactory

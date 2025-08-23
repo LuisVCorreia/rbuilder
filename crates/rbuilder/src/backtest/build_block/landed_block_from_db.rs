@@ -8,9 +8,6 @@
 
 use ahash::HashMap;
 use alloy_primitives::utils::format_ether;
-use reth_db::DatabaseEnv;
-use reth_node_api::NodeTypesWithDBAdapter;
-use reth_node_ethereum::EthereumNode;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
@@ -26,7 +23,7 @@ use crate::{
         base_config::load_config_toml_and_env, block_list_provider::BlockList,
         cli::LiveBuilderConfig,
     },
-    utils::{timestamp_as_u64, ProviderFactoryReopener},
+    utils::{timestamp_as_u64, HttpProviderFactoryReopener},
 };
 use clap::Parser;
 use std::{path::PathBuf, sync::Arc};
@@ -96,7 +93,7 @@ impl<ConfigType: LiveBuilderConfig> LandedBlockFromDBOrdersSource<ConfigType> {
 impl<ConfigType: LiveBuilderConfig>
     OrdersSource<
         ConfigType,
-        ProviderFactoryReopener<NodeTypesWithDBAdapter<EthereumNode, Arc<DatabaseEnv>>>,
+        HttpProviderFactoryReopener,
     > for LandedBlockFromDBOrdersSource<ConfigType>
 {
     fn available_orders(&self) -> Vec<OrdersWithTimestamp> {
@@ -109,9 +106,9 @@ impl<ConfigType: LiveBuilderConfig>
 
     fn create_provider_factory(
         &self,
-    ) -> eyre::Result<ProviderFactoryReopener<NodeTypesWithDBAdapter<EthereumNode, Arc<DatabaseEnv>>>>
+    ) -> eyre::Result<HttpProviderFactoryReopener>
     {
-        self.config.base_config().create_reth_provider_factory(true)
+        self.config.base_config().create_http_provider_factory_reopener()
     }
 
     fn create_block_building_context(&self) -> eyre::Result<BlockBuildingContext> {
@@ -131,7 +128,7 @@ impl<ConfigType: LiveBuilderConfig>
 
     fn print_custom_stats(
         &self,
-        provider: ProviderFactoryReopener<NodeTypesWithDBAdapter<EthereumNode, Arc<DatabaseEnv>>>,
+        provider: HttpProviderFactoryReopener,
     ) -> eyre::Result<()> {
         if self.sim_landed_block {
             let tx_sim_results = sim_historical_block(

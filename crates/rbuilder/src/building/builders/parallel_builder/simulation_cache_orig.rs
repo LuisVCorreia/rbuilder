@@ -14,9 +14,6 @@ pub struct CachedSimulationState {
     pub bundle_state: BundleState,
     pub total_profit: U256,
     pub per_order_profits: Vec<(OrderId, U256)>,
-    pub cumulative_gas_used: u64,
-    pub cumulative_blob_gas_used: u64,
-    pub coinbase_profit: U256,
 }
 
 /// An inner cache of simulation results, keyed by the ordering of the orders that produced the simulation state.
@@ -257,9 +254,6 @@ mod tests {
                 bundle_state,
                 total_profit: U256::from(self.last_used_id),
                 per_order_profits: vec![(self.create_order_id(), U256::from(10))],
-                cumulative_gas_used: 100,
-                cumulative_blob_gas_used: 5,
-                coinbase_profit: U256::from(2),
             }
         }
     }

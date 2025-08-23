@@ -69,6 +69,8 @@ pub enum Algorithm {
     AllPermutations,
     /// `Random` checks random permutations of the group.
     Random { seed: u64, count: usize },
+    /// `Genetic` uses a genetic algorithm to find a good ordering.
+    Genetic { population: usize, elitism: usize, crossover_rate: f64, mutation_rate: f64, tourn_k: usize, max_generations: usize, time_ms: u64, seed: u64 },
 }
 
 #[cfg(test)]

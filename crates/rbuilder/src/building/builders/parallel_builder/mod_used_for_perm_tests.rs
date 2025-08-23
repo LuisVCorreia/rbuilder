@@ -8,16 +8,13 @@ pub mod results_aggregator;
 pub mod simulation_cache;
 pub mod task;
 pub use groups::*;
-pub mod nonce_interleavings;
 pub mod metrics;
-pub use conflict_task_generator::*;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
-use std::sync::mpsc::RecvTimeoutError;
-
+pub mod nonce_interleavings;
+use metrics::{CacheStats, BlockMetrics};
 
 use ahash::HashMap;
 use conflict_resolving_pool::{ConflictResolvingPool, TaskQueue};
+use conflict_task_generator::ConflictTaskGenerator;
 use crossbeam::queue::SegQueue;
 use eyre::Result;
 use itertools::Itertools;
@@ -47,32 +44,11 @@ use self::{
     block_building_result_assembler::BlockBuildingResultAssembler,
     order_intake_store::OrderIntakeStore, results_aggregator::ResultsAggregator,
 };
-
-pub type GroupId = usize;
-pub type ConflictResolutionResultPerGroup = (GroupId, (ResolutionResult, ConflictGroup));
-
-use serde::Serialize;
 use std::fs;
 use std::path::Path;
 
-#[derive(Serialize)]
-struct BacktestPerfJson {
-    block_number: u64,
-    num_orders: usize,
-    groups_total: usize,
-    processing_duration_ms: u128,
-    blob_tx_processing_duration_ms: u128,
-    coinbase_reward: String,
-    // cache stats snapshot
-    cache_full_hits: usize,
-    cache_partial_hits: usize,
-    cache_saved: usize,
-    cache_requested: usize,
-    cache_requests: usize,
-    cache_rate_full_hits_pct: f64,
-    cache_rate_partial_hits_pct: f64,
-    cache_efficiency_pct: f64,
-}
+pub type GroupId = usize;
+pub type ConflictResolutionResultPerGroup = (GroupId, (ResolutionResult, ConflictGroup));
 
 /// ParallelBuilderConfig configures parallel builder.
 /// * `num_threads` - number of threads to use for merging.
@@ -97,16 +73,6 @@ fn get_shared_data_structures() -> (Arc<BestResults>, TaskQueue) {
     let best_results = Arc::new(BestResults::new());
     let task_queue = Arc::new(SegQueue::new());
     (best_results, task_queue)
-}
-
-fn write_perf_json(out_dir: &str, file_name: String, payload: &BacktestPerfJson) -> eyre::Result<()> {
-    let dir = Path::new(out_dir);
-    if !dir.exists() {
-        let _ = fs::create_dir_all(dir);
-    }
-    let json = serde_json::to_string_pretty(payload)?;
-    fs::write(dir.join(file_name), json)?;
-    Ok(())
 }
 
 struct ParallelBuilder<P> {
@@ -317,188 +283,6 @@ fn run_order_intake(
     }
 }
 
-// pub fn parallel_build_backtest<P>(
-//     input: BacktestSimulateBlockInput<'_, P>,
-//     config: ParallelBuilderConfig,
-// ) -> Result<Block>
-// where
-//     P: StateProviderFactory + Clone + 'static,
-// {
-//     let start_time = Instant::now();
-
-//     // Initialization stage
-//     let init_start = Instant::now();
-//     let (best_results, task_queue) = get_shared_data_structures();
-
-//     let (group_result_sender, group_result_receiver) = get_communication_channels();
-//     let group_result_sender_for_task_generator = group_result_sender.clone();
-
-//     let mut conflict_finder = ConflictFinder::new();
-
-//     let sorted_orders = {
-//         let mut orders = input.sim_orders.clone();
-//         orders.sort_by_key(|o| o.order.id());
-//         orders
-//     };
-
-//     let num_orders = sorted_orders.len();
-
-//     let simulation_cache = Arc::new(SharedSimulationCache::new());
-//     let init_duration = init_start.elapsed();
-
-//     // Worker pool and conflict manager creation
-//     let setup_start = Instant::now();
-
-//     let cancel_token = CancellationToken::new();
-//     let outstanding = Arc::new(AtomicUsize::new(0));
-//     let conflict_resolving_pool = ConflictResolvingPool::new(
-//         config.num_threads,
-//         Arc::clone(&task_queue),
-//         group_result_sender,
-//         cancel_token.clone(),
-//         input.ctx.clone(),
-//         input.provider.clone(),
-//         Arc::clone(&simulation_cache),
-//     ).with_outstanding_counter(outstanding.clone());
-
-//     // Start worker threads
-//     if let Err(err) = conflict_resolving_pool.start() {
-//         return Err(err);
-//     }
-
-//     let setup_duration = setup_start.elapsed();
-
-//     let block_state: Arc<dyn StateProvider> = input
-//         .provider
-//         .history_by_block_hash(input.ctx.attributes.parent)?
-//         .into();
-
-//     // Group processing
-//     conflict_finder.add_orders(sorted_orders);
-//     let groups = conflict_finder.get_order_groups();
-//     let groups_total = groups.len();
-
-//     // Generate tasks using the same logic as live builder
-//     let mut task_generator = ConflictTaskGenerator::new(Arc::clone(&task_queue), group_result_sender_for_task_generator);
-//     task_generator.process_groups(groups.clone());
-
-//     outstanding.store(task_queue.len(), Ordering::Release);
-
-//     let processing_start = Instant::now();
-//     let mut results: Vec<(GroupId, (ResolutionResult, ConflictGroup))> = Vec::new();
-//     let mut last_progress = Instant::now();
-//     loop {
-//         match group_result_receiver.recv_timeout(Duration::from_millis(250)) {
-//             Ok(res) => {
-//                 results.push(res);
-//                 last_progress = Instant::now();
-//             }
-//             Err(RecvTimeoutError::Timeout) => {
-//                 if outstanding.load(Ordering::Acquire) == 0 {
-//                     break;
-//                 }
-//                 println!("Waiting for {} more tasks to finish", outstanding.load(Ordering::Acquire));
-//             }
-//             Err(RecvTimeoutError::Disconnected) => break,
-//         }
-//     }
-
-//     // Stop workers
-//     cancel_token.cancel();
-
-//     let processing_end = last_progress; // updated on every Ok(res)
-//     let processing_duration = processing_end.duration_since(processing_start);
-
-//     // Block building result assembler creation
-//     let assembler_start = Instant::now();
-//     let mut block_building_result_assembler = BlockBuildingResultAssembler::new(
-//         &config,
-//         Arc::clone(&best_results),
-//         block_state.clone(),
-//         input.ctx.clone(),
-//         CancellationToken::new(),
-//         String::from("backtest_builder"),
-//         true,
-//         None,
-//     );
-//     let assembler_duration = assembler_start.elapsed();
-
-//     // Best results collection
-//     let collection_start = Instant::now();
-//     let best_results: HashMap<GroupId, (ResolutionResult, ConflictGroup)> = results
-//         .into_iter()
-//         .sorted_by(|a, b| b.1 .0.total_profit.cmp(&a.1 .0.total_profit))
-//         .into_group_map_by(|(group_id, _)| *group_id)
-//         .into_iter()
-//         .map(|(group_id, mut group_results)| (group_id, group_results.remove(0).1))
-//         .collect();
-//     let collection_duration = collection_start.elapsed();
-
-//     // Block building
-//     let building_start = Instant::now();
-//     let block_building_helper = block_building_result_assembler
-//         .build_backtest_block(best_results, OffsetDateTime::now_utc())?;
-
-//     let payout_tx_value = if config.coinbase_payment {
-//         None
-//     } else {
-//         Some(block_building_helper.true_block_value()?)
-//     };
-//     let finalize_block_result = block_building_helper.finalize_block(
-//         &mut block_building_result_assembler.local_ctx,
-//         payout_tx_value,
-//         None,
-//     )?;
-//     let building_duration = building_start.elapsed();
-//     let total_duration = start_time.elapsed();
-
-//     trace!("Initialization time: {:?}", init_duration);
-//     trace!("Setup time: {:?}", setup_duration);
-//     trace!("Group processing time: {:?}", processing_duration);
-//     trace!("Assembler creation time: {:?}", assembler_duration);
-//     trace!("Best results collection time: {:?}", collection_duration);
-//     trace!("Block building time: {:?}", building_duration);
-//     trace!("Total time taken: {:?}", total_duration);
-
-//     let coinbase_reward = finalize_block_result.block.trace.coinbase_reward.to_string();
-
-//     let (
-//         full_hits,
-//         partial_hits,
-//         saved,
-//         requested,
-//         requests,
-//         rate_full_hits,
-//         rate_partial_hits,
-//         efficiency,
-//     ) = simulation_cache.stats();
-
-//     let perf = BacktestPerfJson {
-//         block_number: input.ctx.evm_env.block_env.number,
-//         num_orders,
-//         groups_total,
-//         processing_duration_ms: processing_duration.as_millis(),
-//         blob_tx_processing_duration_ms: input.ctx.blob_tx_selection_duration.map_or(0, |d| d.as_millis()),
-//         coinbase_reward,
-//         cache_full_hits: full_hits,
-//         cache_partial_hits: partial_hits,
-//         cache_saved: saved,
-//         cache_requested: requested,
-//         cache_requests: requests,
-//         cache_rate_full_hits_pct: rate_full_hits,
-//         cache_rate_partial_hits_pct: rate_partial_hits,
-//         cache_efficiency_pct: efficiency,
-//     };
-
-//     let _ = write_perf_json(
-//         "performance_testing/better_permutations",
-//         format!("block_{:0>8}.json", perf.block_number),
-//         &perf,
-//     );
-
-//     Ok(finalize_block_result.block)
-// }
-
 pub fn parallel_build_backtest<P>(
     input: BacktestSimulateBlockInput<'_, P>,
     config: ParallelBuilderConfig,
@@ -512,8 +296,7 @@ where
     let init_start = Instant::now();
     let (best_results, task_queue) = get_shared_data_structures();
 
-    let (group_result_sender, group_result_receiver) = get_communication_channels();
-    let group_result_sender_for_task_generator = group_result_sender.clone();
+    let (group_result_sender, _) = get_communication_channels();
 
     let mut conflict_finder = ConflictFinder::new();
 
@@ -523,27 +306,23 @@ where
         orders
     };
 
-    let num_orders = sorted_orders.len();
-
+    conflict_finder.add_orders(sorted_orders);
     let simulation_cache = Arc::new(SharedSimulationCache::new());
     let init_duration = init_start.elapsed();
 
     // Worker pool and conflict manager creation
     let setup_start = Instant::now();
 
-    let cancel_token = CancellationToken::new();
-    let outstanding = Arc::new(AtomicUsize::new(0));
-    let conflict_resolving_pool = ConflictResolvingPool::new(
+    let mut conflict_resolving_pool = ConflictResolvingPool::new(
         config.num_threads,
         Arc::clone(&task_queue),
         group_result_sender,
-        cancel_token.clone(),
+        CancellationToken::new(),
         input.ctx.clone(),
         input.provider.clone(),
         Arc::clone(&simulation_cache),
-    ).with_outstanding_counter(outstanding.clone());
+    );
 
-    // NOTE: don't start workers yet; generate tasks first.
     let setup_duration = setup_start.elapsed();
 
     let block_state: Arc<dyn StateProvider> = input
@@ -552,46 +331,62 @@ where
         .into();
 
     // Group processing
-    conflict_finder.add_orders(sorted_orders);
-    let groups = conflict_finder.get_order_groups();
-    let groups_total = groups.len();
-
-    // Generate tasks using the same logic as live builder
-    let mut task_generator = ConflictTaskGenerator::new(Arc::clone(&task_queue), group_result_sender_for_task_generator);
     let processing_start = Instant::now();
-    task_generator.process_groups(groups.clone());
+    let groups = conflict_finder.get_order_groups();
+    let (results, group_metrics) = conflict_resolving_pool.process_groups_backtest(
+        groups.clone(),
+        &input.ctx,
+        block_state.clone(),
+        Arc::clone(&simulation_cache),
+    );
+    let processing_duration = processing_start.elapsed();
 
-    // Initialize outstanding from the actual number of enqueued tasks
-    let planned = task_queue.len();
-    outstanding.store(planned, Ordering::Release);
+    // Cache stats
+    let (
+        full_hits,
+        partial_hits,
+        saved,
+        requested,
+        requests,
+        rate_full_hits_pct,
+        rate_partial_hits_pct,
+        efficiency_pct,
+    ) = simulation_cache.stats();
 
-    // Start worker threads (after tasks are enqueued)
-    if let Err(err) = conflict_resolving_pool.start() {
-        return Err(err);
+    let cache_stats = CacheStats {
+        full_hits,
+        partial_hits,
+        saved,
+        requested,
+        requests,
+        rate_full_hits_pct,
+        rate_partial_hits_pct,
+        efficiency_pct,
+    };
+
+    // Build and write JSON
+    let block_number = input.ctx.evm_env.block_env.number;
+    let parent_hash = format!("{:#x}", input.ctx.attributes.parent);
+
+    let groups_analyzed = group_metrics.len();
+    let groups_skipped_size_1 = groups.iter().filter(|g| g.orders.len() == 1).count();
+
+    let payload = BlockMetrics {
+        block_number,
+        parent_hash,
+        groups_analyzed,
+        groups_skipped_size_1,
+        groups: group_metrics,
+        simulation_cache: cache_stats,
+    };
+
+    let out_dir = Path::new("conflict_testing/permutation_metrics_improved");
+    if !out_dir.exists() {
+        let _ = fs::create_dir_all(out_dir);
     }
-    
-    let mut results: Vec<(GroupId, (ResolutionResult, ConflictGroup))> = Vec::new();
-    let mut last_progress = Instant::now();
-    loop {
-        match group_result_receiver.recv_timeout(Duration::from_millis(250)) {
-            Ok(res) => {
-                results.push(res);
-                last_progress = Instant::now();
-            }
-            Err(RecvTimeoutError::Timeout) => {
-                if outstanding.load(Ordering::Acquire) == 0 {
-                    break;
-                }
-            }
-            Err(RecvTimeoutError::Disconnected) => break,
-        }
-    }
-
-    // Stop workers
-    cancel_token.cancel();
-
-    let processing_end = last_progress; // updated on every Ok(res)
-    let processing_duration = processing_end.duration_since(processing_start);
+    let out_path = out_dir.join(format!("block_{:0>8}.json", block_number));
+    let json = serde_json::to_string_pretty(&payload)?;
+    fs::write(&out_path, json)?;
 
     // Block building result assembler creation
     let assembler_start = Instant::now();
@@ -644,45 +439,8 @@ where
     trace!("Block building time: {:?}", building_duration);
     trace!("Total time taken: {:?}", total_duration);
 
-    let coinbase_reward = finalize_block_result.block.trace.coinbase_reward.to_string();
-
-    let (
-        full_hits,
-        partial_hits,
-        saved,
-        requested,
-        requests,
-        rate_full_hits,
-        rate_partial_hits,
-        efficiency,
-    ) = simulation_cache.stats();
-
-    let perf = BacktestPerfJson {
-        block_number: input.ctx.evm_env.block_env.number,
-        num_orders,
-        groups_total,
-        processing_duration_ms: processing_duration.as_millis(),
-        blob_tx_processing_duration_ms: input.ctx.blob_tx_selection_duration.map_or(0, |d| d.as_millis()),
-        coinbase_reward,
-        cache_full_hits: full_hits,
-        cache_partial_hits: partial_hits,
-        cache_saved: saved,
-        cache_requested: requested,
-        cache_requests: requests,
-        cache_rate_full_hits_pct: rate_full_hits,
-        cache_rate_partial_hits_pct: rate_partial_hits,
-        cache_efficiency_pct: efficiency,
-    };
-
-    let _ = write_perf_json(
-        "performance_testing/better_permutations",
-        format!("block_{:0>8}.json", perf.block_number),
-        &perf,
-    );
-
     Ok(finalize_block_result.block)
 }
-
 
 #[derive(Debug)]
 pub struct ParallelBuildingAlgorithm {

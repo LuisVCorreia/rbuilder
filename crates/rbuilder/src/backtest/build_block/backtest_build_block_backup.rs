@@ -11,7 +11,7 @@ use crate::{
         execute::{backtest_prepare_orders_from_building_context, BacktestBlockInput},
         OrdersWithTimestamp,
     },
-    building::{builders::{BacktestSimulateBlockInput}, blob_tx_selection::select_orders_under_blob_cap, BlockBuildingContext},
+    building::{builders::{BacktestSimulateBlockInput, Block, parallel_builder::ConflictFinder}, BlockBuildingContext, evm_inspector::UsedStateTrace, ExecutionResult, conflict::{find_conflicts_exhaustive, Conflict}},
     live_builder::cli::LiveBuilderConfig,
     primitives::{Order, OrderId, SimulatedOrder},
     provider::StateProviderFactory,
@@ -19,9 +19,12 @@ use crate::{
 use ahash::HashMap;
 use alloy_primitives::{utils::format_ether, U256};
 use clap::Parser;
+use eyre::Context;
+use serde::Serialize;
 use std::{
-    path::{PathBuf},
-    sync::Arc, time::Instant,
+    fs,
+    path::{Path, PathBuf},
+    sync::Arc,
 };
 
 #[derive(Parser, Debug)]
@@ -127,7 +130,7 @@ where
 
     orders_source.print_custom_stats(provider_factory.clone())?;
 
-    let mut ctx = orders_source.create_block_building_context()?;
+    let ctx = orders_source.create_block_building_context()?;
     let BacktestBlockInput { sim_orders, .. } = backtest_prepare_orders_from_building_context(
         ctx.clone(),
         available_orders.clone(),
@@ -146,24 +149,6 @@ where
             orders_source.block_time_as_unix_ms(),
         );
     }
-
-    println!(
-        "Simulated orders: {}",
-        sim_orders.len()
-    );
-
-    // let processing_start = Instant::now();
-    // let blob_cap = ctx.max_blob_gas_per_block();
-    // let sim_orders = select_orders_under_blob_cap(&sim_orders, blob_cap);
-    // let processing_duration = processing_start.elapsed();
-    // ctx.blob_tx_selection_duration = Some(processing_duration);
-
-    // println!(
-    //     "Selected {} orders under {} blob gas cap in {} ms",
-    //     sim_orders.len(),
-    //     format_ether(U256::from(blob_cap)),
-    //     processing_duration.as_millis()
-    // );
 
     if !build_block_cfg.no_block_building {
         let winning_builder = build_block_cfg

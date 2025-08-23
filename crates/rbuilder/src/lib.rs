@@ -9,3 +9,7 @@ pub mod provider;
 pub mod roothash;
 pub mod telemetry;
 pub mod utils;
+
+#[cfg(all(unix, not(target_env = "musl")))]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;

@@ -67,6 +67,73 @@ impl SimulationTracer for AccumulatorSimulationTracer {
     }
 
     fn get_used_state_tracer(&self) -> Option<&UsedStateTrace> {
+        // // Open the file in append mode. This will create the file if it doesn't exist,
+        // // and add new content to the end if it does.
+        // if let Ok(mut file) = OpenOptions::new()
+        //     .create(true)
+        //     .append(true)
+        //     .open("state_trace_rbuilder.txt")
+        // {
+        //     // Use writeln! to write formatted strings to the file.
+        //     // We ignore the Result of the write operation for this debugging purpose.
+        //     let _ = writeln!(file, "\n--- Dumping UsedStateTrace ---");
+
+        //     if !self.used_state_trace.read_slot_values.is_empty() {
+        //         let _ = writeln!(file, "\n[Read Slots]");
+        //         for (slot_key, value) in self.used_state_trace.read_slot_values.iter() {
+        //             let _ = writeln!(file, "  - Address: {:?}, Slot: {:?}, Value: {:?}", slot_key.address, slot_key.key, value);
+        //         }
+        //     }
+
+        //     if !self.used_state_trace.written_slot_values.is_empty() {
+        //         let _ = writeln!(file, "\n[Written Slots]");
+        //         for (slot_key, value) in self.used_state_trace.written_slot_values.iter() {
+        //             let _ = writeln!(file, "  - Address: {:?}, Slot: {:?}, Value: {:?}", slot_key.address, slot_key.key, value);
+        //         }
+        //     }
+
+        //     if !self.used_state_trace.read_balances.is_empty() {
+        //         let _ = writeln!(file, "\n[Read Balances]");
+        //         for (address, balance) in self.used_state_trace.read_balances.iter() {
+        //             let _ = writeln!(file, "  - Address: {:?}, Balance: {:?}", address, balance);
+        //         }
+        //     }
+
+        //     if !self.used_state_trace.received_amount.is_empty() {
+        //         let _ = writeln!(file, "\n[Received Amounts (Wei)]");
+        //         for (address, amount) in self.used_state_trace.received_amount.iter() {
+        //             let _ = writeln!(file, "  - Address: {:?}, Amount: {:?}", address, amount);
+        //         }
+        //     }
+
+        //     if !self.used_state_trace.sent_amount.is_empty() {
+        //         let _ = writeln!(file, "\n[Sent Amounts (Wei)]");
+        //         for (address, amount) in self.used_state_trace.sent_amount.iter() {
+        //             let _ = writeln!(file, "  - Address: {:?}, Amount: {:?}", address, amount);
+        //         }
+        //     }
+
+        //     if !self.used_state_trace.created_contracts.is_empty() {
+        //         let _ = writeln!(file, "\n[Created Contracts]");
+        //         for address in &self.used_state_trace.created_contracts {
+        //             let _ = writeln!(file, "  - Address: {:?}", address);
+        //         }
+        //     }
+
+        //     if !self.used_state_trace.destructed_contracts.is_empty() {
+        //         let _ = writeln!(file, "\n[Destructed Contracts]");
+        //         for address in &self.used_state_trace.destructed_contracts {
+        //             let _ = writeln!(file, "  - Address: {:?}", address);
+        //         }
+        //     }
+
+        //     let _ = writeln!(file, "--- End of Trace Dump ---\n");
+        // } else {
+        //     // If the file can't be opened, print an error to the console as a fallback.
+        //     println!("Error: Could not open or write to state_trace_rbuilder.txt");
+        // }
+
+        // The function's primary purpose (returning the trace) remains unchanged.
         Some(&self.used_state_trace)
     }
 }

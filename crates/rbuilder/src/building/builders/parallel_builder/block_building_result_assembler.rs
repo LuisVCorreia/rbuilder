@@ -5,7 +5,7 @@ use super::{
 use ahash::HashMap;
 use alloy_primitives::utils::format_ether;
 use reth_provider::StateProvider;
-use std::{sync::Arc, time::Instant};
+use std::{sync::Arc, time::Instant, cmp::Ordering};
 use time::OffsetDateTime;
 use tokio_util::sync::CancellationToken;
 use tracing::{info_span, trace};
@@ -276,13 +276,25 @@ impl BlockBuildingResultAssembler {
 
         block_building_helper.set_trace_orders_closed_at(orders_closed_at);
 
-        let mut best_orderings_per_group: Vec<(ResolutionResult, ConflictGroup)> =
-            best_results.into_values().collect();
+        // Keep the key so we can tie-break deterministically.
+        let mut entries: Vec<(GroupId, ResolutionResult, ConflictGroup)> = best_results
+            .into_iter()                         // (gid, (res, grp))
+            .map(|(gid, (res, grp))| (gid, res, grp))
+            .collect();
 
-        // Sort groups by total profit in descending order
-        best_orderings_per_group.sort_by(|(a_ordering, _), (b_ordering, _)| {
-            b_ordering.total_profit.cmp(&a_ordering.total_profit)
+        // Sort: profit desc, tie-break by group_id asc (total order, deterministic)
+        entries.sort_unstable_by(|(ga, ra, _), (gb, rb, _)| {
+            match rb.total_profit.cmp(&ra.total_profit) {
+                Ordering::Equal => ga.cmp(gb),
+                other => other,
+            }
         });
+
+        // Drop key after sorting, keep your original type
+        let mut best_orderings_per_group: Vec<(ResolutionResult, ConflictGroup)> = entries
+            .into_iter()
+            .map(|(_, res, grp)| (res, grp))
+            .collect();
 
         let use_suggested_fee_recipient_as_coinbase =
             self.coinbase_payment && !self.contains_refunds(&best_orderings_per_group);
@@ -318,6 +330,11 @@ impl BlockBuildingResultAssembler {
                             success = false,
                             error = ?err,
                             "Failed to execute order in backtest"
+                        );
+                        println!(
+                            "Failed to execute order {} in backtest: {}",
+                            sim_order.id(),
+                            err
                         );
                     }
                 }

@@ -1,14 +1,11 @@
 use crate::primitives::SimulatedOrder;
 use ahash::{HashMap, HashSet};
-use alloy_primitives::{utils::format_ether, U256};
+use alloy_primitives::{utils::format_ether, Address, U256};
 use crossbeam_queue::SegQueue;
 use itertools::Itertools;
 use std::{sync::Arc, time::Instant};
 use tracing::trace;
-use super::nonce_interleavings::{
-    compute_interleaving_stats,
-    build_sender_nonce_view, ALL_PERMS_CAP as MULTINOMIAL_ALL_PERMS_THRESHOLD,
-};
+
 use super::{
     task::ConflictTask, Algorithm, ConflictGroup, ConflictResolutionResultPerGroup, GroupId,
     ResolutionResult, TaskPriority, TaskQueue,
@@ -17,7 +14,87 @@ use std::sync::mpsc as std_mpsc;
 
 const THRESHOLD_FOR_SIGNIFICANT_CHANGE: u64 = 20;
 const NUMBER_OF_TOP_ORDERS_TO_CONSIDER_FOR_SIGNIFICANT_CHANGE: usize = 10;
+const MULTINOMIAL_ALL_PERMS_THRESHOLD: usize = 120;
 const NUMBER_OF_RANDOM_TASKS: usize = 50;
+
+fn sender_and_nonce(order: &SimulatedOrder) -> Option<(Address, u64)> {
+    // Mempool case: exactly one tx per order.
+    let txs = order.order.list_txs();
+    if txs.len() != 1 {
+        return None;
+    }
+
+    let (tx, _) = &txs[0];
+
+    let nonce = tx.nonce();
+    let signer = tx.signer();
+
+    Some((signer, nonce))
+}
+
+fn build_sender_chains(group: &super::ConflictGroup) -> Option<Vec<Vec<usize>>> {
+    // Map: sender -> (nonce -> best_index)
+    let mut best_by_nonce: HashMap<Address, HashMap<u64, usize>> = HashMap::default();
+
+    for (idx, o) in group.orders.iter().enumerate() {
+        let (sender, nonce) = sender_and_nonce(o)?;
+        let entry = best_by_nonce.entry(sender).or_default();
+
+        match entry.get(&nonce) {
+            None => {
+                entry.insert(nonce, idx);
+            }
+            Some(&cur_idx) => {
+                // Keep the better of the two
+                let cur = &group.orders[cur_idx];
+                let newv = o.sim_value.coinbase_profit;
+                let curv = cur.sim_value.coinbase_profit;
+
+                let better = if newv != curv {
+                    newv > curv
+                } else {
+                    // tie-break by mev_gas_price, then favor lower index (stable-ish)
+                    let newg = o.sim_value.mev_gas_price;
+                    let curg = cur.sim_value.mev_gas_price;
+                    if newg != curg {
+                        newg > curg
+                    } else {
+                        idx < cur_idx
+                    }
+                };
+                if better {
+                    entry.insert(nonce, idx);
+                }
+            }
+        }
+    }
+
+    // Build chains per sender by nonce asc
+    let mut chains: Vec<Vec<usize>> = Vec::with_capacity(best_by_nonce.len());
+    for (_sender, by_nonce) in best_by_nonce {
+        let mut v: Vec<(u64, usize)> = by_nonce.into_iter().collect();
+        v.sort_by_key(|(n, _)| *n);
+        // extract indices
+        chains.push(v.into_iter().map(|(_, i)| i).collect());
+    }
+
+    Some(chains)
+}
+
+/// ln(n!) helper
+fn ln_fact(x: usize) -> f64 {
+    (1..=x).map(|i| (i as f64).ln()).sum()
+}
+
+/// Decide if interleavings (multinomial) ≤ cap using logs.
+fn interleavings_leq_cap(lengths: &[usize], cap: usize) -> bool {
+    let n: usize = lengths.iter().sum();
+    if n == 0 { return true; }
+    let ln_cap = (cap as f64).ln();
+    let ln_n = ln_fact(n);
+    let ln_den: f64 = lengths.iter().map(|&l| ln_fact(l)).sum();
+    (ln_n - ln_den) <= ln_cap + 1e-12
+}
 
 /// Manages conflicts and updates for conflict groups, coordinating with a worker pool to process tasks.
 pub struct ConflictTaskGenerator {
@@ -333,120 +410,6 @@ impl ConflictTaskGenerator {
     }
 }
 
-use std::sync::OnceLock;
-static RB_ALLOWLIST: OnceLock<HashMap<u64, HashSet<usize>>> = OnceLock::new();
-
-fn selected_groups() -> &'static HashMap<u64, HashSet<usize>> {
-    RB_ALLOWLIST.get_or_init(|| {
-        let mut m: HashMap<u64, HashSet<usize>> = HashMap::default();
-
-        // helper to insert
-        let mut ins = |bn: u64, gid: usize| { m.entry(bn).or_default().insert(gid); };
-
-        ins(22274264, 104);
-        ins(20314472, 21);
-        ins(21626181, 10);
-        ins(20311195, 4);
-        ins(22489877, 9);
-        ins(22485725, 43);
-        ins(22485138, 5);
-        ins(20100348, 3);
-        ins(19874363, 2);
-        ins(20969654, 13);
-        ins(19657221, 115);
-        ins(22712795, 38);
-        ins(22712795, 32);
-        ins(21195356, 125);
-        ins(21195356, 22);
-        ins(19660788, 147);
-        ins(19660788, 158);
-        ins(20967865, 21);
-        ins(21854682, 57);
-        ins(21854682, 65);
-        ins(21408989, 27);
-        ins(21405709, 5);
-        ins(21191186, 0);
-        ins(22273666, 14);
-        ins(22273968, 0);
-        ins(21628569, 21);
-        ins(21628569, 5);
-        ins(22713092, 36);
-        ins(20098565, 59);
-        ins(20097670, 4);
-        ins(19871974, 9);
-        ins(20752606, 7);
-        ins(22053356, 0);
-        ins(21195654, 11);
-        ins(20096476, 22);
-        ins(20533017, 55);
-        ins(20099460, 81);
-        ins(19662577, 40);
-        ins(22277248, 96);
-        ins(20758891, 84);
-        ins(20758891, 2);
-        ins(20534208, 58);
-        ins(20534208, 7);
-        ins(22055148, 3);
-        ins(21627080, 0);
-        ins(21627080, 23);
-        ins(19664061, 28);
-        ins(19664061, 49);
-        ins(19877353, 47);
-        ins(21850521, 69);
-        ins(19663766, 24);
-        ins(21630657, 5);
-        ins(19878248, 6);
-        ins(21407499, 13);
-        ins(20094404, 14);
-        ins(21408395, 6);
-        ins(21406904, 25);
-        ins(22708631, 13);
-        ins(21191485, 3);
-        ins(20970547, 21);
-        ins(20969056, 18);
-        ins(20314771, 10);
-        ins(20967265, 5);
-        ins(22276948, 5);
-        ins(20093805, 45);
-        ins(20095290, 179);
-        ins(22051261, 13);
-        ins(22276053, 0);
-        ins(21194167, 18);
-        ins(21631553, 71);
-        ins(21191783, 15);
-        ins(22490176, 31);
-        ins(19876754, 0);
-        ins(22274564, 1);
-
-        m
-    })
-}
-
-#[inline]
-fn is_selected_group(block_number: u64, group_id: usize) -> bool {
-    selected_groups()
-        .get(&block_number)
-        .map_or(false, |set| set.contains(&group_id))
-}
-
-/// Optional, non-breaking wrapper: pass `Some(block_number)` to filter,
-/// or `None` to behave like the legacy `get_tasks_for_group`.
-pub fn get_tasks_for_group_filtered(
-    group: &ConflictGroup,
-    priority: TaskPriority,
-    block_number: Option<u64>,
-) -> Vec<ConflictTask> {
-    if let Some(bn) = block_number {
-        if !is_selected_group(bn, group.id) {
-            // Skip this group entirely
-            return vec![];
-        }
-    }
-    // Fall back to the existing policy
-    get_tasks_for_group(group, priority)
-}
-
-
 /// Generates a vector of conflict tasks for a given order group.
 ///
 /// # Arguments
@@ -459,98 +422,70 @@ pub fn get_tasks_for_group_filtered(
 /// A vector of `ConflictTask`s for the given group.
 pub fn get_tasks_for_group(group: &ConflictGroup, priority: TaskPriority) -> Vec<ConflictTask> {
     let mut tasks = vec![];
+
     let created_at = Instant::now();
 
-    if let Some(view) = build_sender_nonce_view(group) {
-        if view.chains_slots.len() == 1 {
-            // Single sender: only AllPermutations (no need for Greedy/others)
-            tasks.push(ConflictTask {
-                group_idx: group.id,
-                algorithm: Algorithm::AllPermutations,
-                priority,
-                group: group.clone(),
-                created_at,
-            });
-            return tasks;
-        }
+    // if let Some(chains) = build_sender_chains(group) {
+    //     let lengths: Vec<usize> = chains.iter().map(|c| c.len()).collect();
 
-        // Always try Greedy first (fast baseline)
-        tasks.push(ConflictTask {
-            group_idx: group.id,
-            algorithm: Algorithm::Greedy,
-            priority,
-            group: group.clone(),
-            created_at,
-        });
+    //     if chains.len() == 1 {
+    //         // Single sender => exactly one valid ordering. Submit one High task.
+    //         tasks.push(ConflictTask {
+    //             group_idx: group.id,
+    //             algorithm: Algorithm::AllPermutations,
+    //             priority,
+    //             group: group.clone(),
+    //             created_at,
+    //         });
+    //         return tasks;
+    //     }
+        
+    //     // We want to run Greedy first so we can get quick, decent results
+    //     tasks.push(ConflictTask {
+    //         group_idx: group.id,
+    //         algorithm: Algorithm::Greedy,
+    //         priority,
+    //         group: group.clone(),
+    //         created_at,
+    //     });
 
-        if let Some(stats) = compute_interleaving_stats(group) {
-            let ln_cap = (MULTINOMIAL_ALL_PERMS_THRESHOLD as f64).ln();
-            let small = stats.ln_with_choice <= ln_cap + 1e-12;
-
-            println!("Group {}: {} orders, multinomial {}, ln={}{}",
-                group.id,
-                group.orders.len(),
-                stats.ln_multinomial,
-                stats.ln_with_choice,
-                if small { "" } else { " (too large)" }
-            );
-
-            if small {
-                tasks.push(ConflictTask {
-                    group_idx: group.id,
-                    algorithm: Algorithm::AllPermutations,
-                    priority,
-                    group: group.clone(),
-                    created_at,
-                });
-            } else {
-                // Add Genetic algorithm task
-                tasks.push(ConflictTask {
-                    group_idx: group.id,
-                    algorithm: Algorithm::Genetic {
-                        population: 24,
-                        elitism: 2,
-                        crossover_rate: 0.9,
-                        mutation_rate: 0.2,
-                        tourn_k: 3,
-                        max_generations: 500,
-                        time_ms: 5000,
-                        seed: group.id as u64,
-                    },
-                    priority: TaskPriority::Medium,
-                    group: group.clone(),
-                    created_at,
-                });
-
-                tasks.push(ConflictTask {
-                    group_idx: group.id,
-                    algorithm: Algorithm::Random {
-                        seed: group.id as u64,
-                        count: NUMBER_OF_RANDOM_TASKS,
-                    },
-                    priority: TaskPriority::Low,
-                    group: group.clone(),
-                    created_at,
-                });
-                
-                tasks.push(ConflictTask {
-                    group_idx: group.id,
-                    algorithm: Algorithm::Length,
-                    priority: TaskPriority::Low,
-                    group: group.clone(),
-                    created_at,
-                });
-                tasks.push(ConflictTask {
-                    group_idx: group.id,
-                    algorithm: Algorithm::ReverseGreedy,
-                    priority: TaskPriority::Low,
-                    group: group.clone(),
-                    created_at,
-                });
-            }
-            return tasks;
-        }
-    }
+    //     let small = interleavings_leq_cap(&lengths, MULTINOMIAL_ALL_PERMS_THRESHOLD);
+    //     if small {            
+    //         tasks.push(ConflictTask {
+    //             group_idx: group.id,
+    //             algorithm: Algorithm::AllPermutations,
+    //             priority,
+    //             group: group.clone(),
+    //             created_at,
+    //         });
+    //     } else {
+    //         tasks.push(ConflictTask {
+    //             group_idx: group.id,
+    //             algorithm: Algorithm::Random {
+    //                 seed: group.id as u64,
+    //                 count: NUMBER_OF_RANDOM_TASKS,
+    //             },
+    //             priority: TaskPriority::Low,
+    //             group: group.clone(),
+    //             created_at,
+    //         });
+    //         tasks.push(ConflictTask {
+    //             group_idx: group.id,
+    //             algorithm: Algorithm::Length,
+    //             priority: TaskPriority::Low,
+    //             group: group.clone(),
+    //             created_at,
+    //         });
+    //         tasks.push(ConflictTask {
+    //             group_idx: group.id,
+    //             algorithm: Algorithm::ReverseGreedy,
+    //             priority: TaskPriority::Low,
+    //             group: group.clone(),
+    //             created_at,
+    //         });
+    //     }
+    //     return tasks;
+    // }
 
     // Fallback: legacy policy (bundles/multi-tx orders / cannot extract sender+nonce)
     tasks.push(ConflictTask {

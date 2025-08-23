@@ -1,7 +1,7 @@
 use crate::{
     building::builders::mock_block_building_helper::MockRootHasher,
     live_builder::simulation::SimulatedOrderCommand,
-    provider::{RootHasher, StateProviderFactory},
+    provider::{RootHasher, StateProviderFactory, http_state_provider::HttpStateProviderFactory},
     roothash::{calculate_state_root, run_trie_prefetcher, RootHashContext, RootHashError},
     telemetry::{inc_provider_bad_reopen_counter, inc_provider_reopen_counter},
 };
@@ -327,5 +327,57 @@ impl<T, HasherType> std::fmt::Debug for RootHasherImpl<T, HasherType> {
         f.debug_struct("RootHasherImpl")
             .field("parent_num_hash", &self.parent_num_hash)
             .finish()
+    }
+}
+
+/// HttpProviderFactoryReopener wraps HttpStateProviderFactory to match the same interface as ProviderFactoryReopener
+/// This allows using HTTP providers in the backtest system without major changes
+#[derive(Clone)]
+pub struct HttpProviderFactoryReopener {
+    http_provider: HttpStateProviderFactory,
+}
+
+impl HttpProviderFactoryReopener {
+    pub fn new(http_provider: HttpStateProviderFactory) -> Self {
+        Self { http_provider }
+    }
+}
+
+impl StateProviderFactory for HttpProviderFactoryReopener {
+    fn latest(&self) -> ProviderResult<StateProviderBox> {
+        self.http_provider.latest()
+    }
+
+    fn history_by_block_number(&self, block: BlockNumber) -> ProviderResult<StateProviderBox> {
+        self.http_provider.history_by_block_number(block)
+    }
+
+    fn history_by_block_hash(&self, block: BlockHash) -> ProviderResult<StateProviderBox> {
+        self.http_provider.history_by_block_hash(block)
+    }
+
+    fn best_block_number(&self) -> ProviderResult<BlockNumber> {
+        self.http_provider.best_block_number()
+    }
+
+    fn block_hash(&self, number: BlockNumber) -> ProviderResult<Option<B256>> {
+        self.http_provider.block_hash(number)
+    }
+
+    fn header(&self, block_hash: &BlockHash) -> ProviderResult<Option<Header>> {
+        self.http_provider.header(block_hash)
+    }
+
+    fn header_by_number(&self, num: u64) -> ProviderResult<Option<Header>> {
+        self.http_provider.header_by_number(num)
+    }
+
+    fn last_block_number(&self) -> ProviderResult<BlockNumber> {
+        self.http_provider.last_block_number()
+    }
+
+    fn root_hasher(&self, _parent_num_hash: BlockNumHash) -> ProviderResult<Box<dyn RootHasher>> {
+        // For HTTP provider, we always use MockRootHasher since we can't calculate state roots
+        Ok(Box::new(MockRootHasher {}))
     }
 }

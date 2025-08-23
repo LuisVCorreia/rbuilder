@@ -169,36 +169,56 @@ enum NextStepAction {
 struct UsedStateEVMInspector<'a> {
     next_step_action: NextStepAction,
     used_state_trace: &'a mut UsedStateTrace,
+    frames: Vec<UsedStateTrace>,
 }
 
 impl<'a> UsedStateEVMInspector<'a> {
     fn new(used_state_trace: &'a mut UsedStateTrace) -> Self {
-        Self {
+        let mut s = Self {
             next_step_action: NextStepAction::None,
             used_state_trace,
-        }
+            frames: Vec::with_capacity(8),
+        };
+        s.frames.push(UsedStateTrace::default());
+        s
+    }
+
+    #[inline]
+    fn curr_mut(&mut self) -> &mut UsedStateTrace {
+        // always at least root
+        self.frames.last_mut().expect("frames non-empty")
+    }
+
+    /// Merge root frame into the external trace on drop.
+    fn flush_root_into_outer(&mut self) {
+        debug_assert_eq!(self.frames.len(), 1, "all child frames must be popped");
+        let root = self.frames.pop().unwrap();
+        self.used_state_trace.append_trace(&root);
     }
 
     /// This method is used to mark nonce change as a slot read / write.
     /// Txs with the same nonce are in conflict and origin address is EOA that does not have storage.
     /// We convert nonce change to the slot 0 read and write of the signer
     fn use_tx_nonce(&mut self, tx: &Recovered<TransactionSigned>) {
-        self.used_state_trace.read_slot_values.insert(
-            SlotKey {
-                address: tx.signer(),
-                key: Default::default(),
-            },
+        let frame = self.curr_mut();
+        frame.read_slot_values.insert(
+            SlotKey { address: tx.signer(), key: Default::default() },
             U256::from(tx.nonce()).into(),
         );
-        self.used_state_trace.written_slot_values.insert(
-            SlotKey {
-                address: tx.signer(),
-                key: Default::default(),
-            },
+        frame.written_slot_values.insert(
+            SlotKey { address: tx.signer(), key: Default::default() },
             U256::from(tx.nonce() + 1).into(),
         );
     }
 }
+
+// Flush at the end of execution.
+impl Drop for UsedStateEVMInspector<'_> {
+    fn drop(&mut self) {
+        self.flush_root_into_outer();
+    }
+}
+
 
 impl<CTX> Inspector<CTX> for UsedStateEVMInspector<'_>
 where
@@ -208,23 +228,13 @@ where
         match std::mem::take(&mut self.next_step_action) {
             NextStepAction::ReadSloadKeyResult(slot) => {
                 if let Ok(value) = interpreter.stack.peek(0) {
-                    let value = B256::from(value.to_be_bytes());
-                    let key = SlotKey {
-                        address: interpreter.input.target_address,
-                        key: slot,
-                    };
-                    self.used_state_trace
-                        .read_slot_values
-                        .entry(key)
-                        .or_insert(value);
+                    let key = SlotKey { address: interpreter.input.target_address, key: slot };
+                    self.curr_mut().read_slot_values.entry(key).or_insert(B256::from(value.to_be_bytes()));
                 }
             }
             NextStepAction::ReadBalanceResult(addr) => {
                 if let Ok(value) = interpreter.stack.peek(0) {
-                    self.used_state_trace
-                        .read_balances
-                        .entry(addr)
-                        .or_insert(value);
+                    self.curr_mut().read_balances.entry(addr).or_insert(value);
                 }
             }
             NextStepAction::None => {}
@@ -232,115 +242,102 @@ where
         match interpreter.bytecode.opcode() {
             opcode::SLOAD => {
                 if let Ok(slot) = interpreter.stack.peek(0) {
-                    let slot = B256::from(slot.to_be_bytes());
-                    self.next_step_action = NextStepAction::ReadSloadKeyResult(slot);
+                    self.next_step_action = NextStepAction::ReadSloadKeyResult(B256::from(slot.to_be_bytes()));
                 }
             }
             opcode::SSTORE => {
-                if let (Ok(slot), Ok(value)) =
-                    (interpreter.stack.peek(0), interpreter.stack.peek(1))
-                {
+                if let (Ok(slot), Ok(value)) = (interpreter.stack.peek(0), interpreter.stack.peek(1)) {
                     let written_value = B256::from(value.to_be_bytes());
-                    let key = SlotKey {
-                        address: interpreter.input.target_address,
-                        key: B256::from(slot.to_be_bytes()),
-                    };
+                    let key = SlotKey { address: interpreter.input.target_address, key: B256::from(slot.to_be_bytes()) };
+                    let f = self.curr_mut();
                     // if we write the same value that we read as the first read we don't have a write
-                    if let Some(read_value) = self.used_state_trace.read_slot_values.get(&key) {
+                    if let Some(read_value) = f.read_slot_values.get(&key) {
                         if read_value == &written_value {
-                            self.used_state_trace.written_slot_values.remove(&key);
+                            f.written_slot_values.remove(&key);
                             return;
                         }
                     }
-                    self.used_state_trace
-                        .written_slot_values
-                        .insert(key, written_value);
+                    f.written_slot_values.insert(key, written_value);
                 }
             }
             opcode::BALANCE => {
                 if let Ok(addr) = interpreter.stack.peek(0) {
-                    let addr = Address::from_word(B256::from(addr.to_be_bytes()));
-                    self.next_step_action = NextStepAction::ReadBalanceResult(addr);
+                    self.next_step_action = NextStepAction::ReadBalanceResult(Address::from_word(B256::from(addr.to_be_bytes())));
                 }
             }
             opcode::SELFBALANCE => {
                 let addr = interpreter.input.target_address;
                 self.next_step_action = NextStepAction::ReadBalanceResult(addr);
             }
-            _ => (),
+            _ => {}
         }
     }
 
-    fn call(&mut self, _context: &mut CTX, inputs: &mut CallInputs) -> Option<CallOutcome> {
-        if let Some(transfer_value) = inputs.transfer_value() {
-            if !transfer_value.is_zero() {
-                *self
-                    .used_state_trace
-                    .sent_amount
-                    .entry(inputs.transfer_from())
-                    .or_default() += transfer_value;
-                *self
-                    .used_state_trace
-                    .received_amount
-                    .entry(inputs.transfer_to())
-                    .or_default() += transfer_value;
-            }
-        }
+    fn call(&mut self, _context: &mut CTX, _inputs: &mut CallInputs) -> Option<CallOutcome> {
+        // New child frame
+        self.frames.push(UsedStateTrace::default());
         None
     }
 
-    // fn call_end(&mut self, _context: &mut CTX, inputs: &CallInputs, outcome: &mut CallOutcome) {
-    //     let succeeded = outcome.result.is_ok();
-    //     if !succeeded { return; }
+    fn call_end(&mut self, _context: &mut CTX, inputs: &CallInputs, outcome: &mut CallOutcome) {
+        let succeeded = outcome.result.is_ok();
 
-    //     if let Some(transfer_value) = inputs.transfer_value() {
-    //         if !transfer_value.is_zero() {
-    //             *self.used_state_trace
-    //                 .sent_amount
-    //                 .entry(inputs.transfer_from())
-    //                 .or_default() += transfer_value;
-    //             *self.used_state_trace
-    //                 .received_amount
-    //                 .entry(inputs.transfer_to())
-    //                 .or_default() += transfer_value;
-    //         }
-    //     }
-    // }
+        // ETH transfer only if call succeeded
+        if succeeded {
+            if let Some(transfer_value) = inputs.transfer_value() {
+                if !transfer_value.is_zero() {
+                    let parent = self.curr_mut(); // parent = current before popping child
+                    *parent.sent_amount.entry(inputs.transfer_from()).or_default() += transfer_value;
+                    *parent.received_amount.entry(inputs.transfer_to()).or_default() += transfer_value;
+                }
+            }
+        }
+
+        // Pop child frame and (conditionally) merge into parent
+        if let Some(child) = self.frames.pop() {
+            if succeeded {
+                self.curr_mut().append_trace(&child);
+            }
+            // else drop
+        }
+    }
+
+    fn create(&mut self, _context: &mut CTX, _inputs: &mut revm::interpreter::CreateInputs) -> Option<revm::interpreter::CreateOutcome> {
+        self.frames.push(UsedStateTrace::default());
+        None
+    }
 
     fn create_end(
         &mut self,
         _context: &mut CTX,
-        _: &revm::interpreter::CreateInputs,
+        _inputs: &revm::interpreter::CreateInputs,
         outcome: &mut revm::interpreter::CreateOutcome,
     ) {
-        if let Some(addr) = outcome.address {
-            self.used_state_trace.created_contracts.push(addr);
+        let succeeded = outcome.result.is_ok();
+        if succeeded {
+            if let Some(addr) = outcome.address {
+                self.curr_mut().created_contracts.push(addr);
+            }
+        }
+        if let Some(child) = self.frames.pop() {
+            if succeeded {
+                self.curr_mut().append_trace(&child);
+            }
         }
     }
 
     fn selfdestruct(&mut self, contract: Address, target: Address, value: U256) {
-        // selfdestruct can be called multiple times during transaction execution
-        if self
-            .used_state_trace
-            .destructed_contracts
-            .contains(&contract)
-        {
-            return;
-        }
-        self.used_state_trace.destructed_contracts.push(contract);
-        if !value.is_zero() {
-            *self
-                .used_state_trace
-                .sent_amount
-                .entry(contract)
-                .or_default() += value;
-            *self
-                .used_state_trace
-                .received_amount
-                .entry(target)
-                .or_default() += value;
+        // Buffer in current frame (dropped automatically if frame reverts)
+        let f = self.curr_mut();
+        if !f.destructed_contracts.contains(&contract) {
+            f.destructed_contracts.push(contract);
+            if !value.is_zero() {
+                *f.sent_amount.entry(contract).or_default() += value;
+                *f.received_amount.entry(target).or_default() += value;
+            }
         }
     }
+
 }
 
 #[derive(Debug)]
@@ -378,46 +375,46 @@ where
     CTX: ContextTr<Journal: JournalExt>,
     UsedStateEVMInspector<'a>: Inspector<CTX>,
 {
-    #[inline]
+    fn initialize_interp(&mut self, interp: &mut Interpreter, context: &mut CTX) {
+        self.access_list_inspector.initialize_interp(interp, context);
+        // no-op for used_state_inspector; root frame already created in new()
+    }
+
     fn step(&mut self, interp: &mut Interpreter, context: &mut CTX) {
         self.access_list_inspector.step(interp, context);
-        if let Some(used_state_inspector) = &mut self.used_state_inspector {
-            used_state_inspector.step(interp, context);
+        if let Some(i) = &mut self.used_state_inspector {
+            i.step(interp, context);
         }
     }
 
-    #[inline]
     fn call(&mut self, context: &mut CTX, inputs: &mut CallInputs) -> Option<CallOutcome> {
-        if let Some(used_state_inspector) = &mut self.used_state_inspector {
-            used_state_inspector.call(context, inputs)
-        } else {
-            None
-        }
+        if let Some(i) = &mut self.used_state_inspector {
+            i.call(context, inputs)
+        } else { None }
     }
 
-    #[inline]
     fn call_end(&mut self, context: &mut CTX, inputs: &CallInputs, outcome: &mut CallOutcome) {
-        if let Some(used_state_inspector) = &mut self.used_state_inspector {
-            used_state_inspector.call_end(context, inputs, outcome);
+        if let Some(i) = &mut self.used_state_inspector {
+            i.call_end(context, inputs, outcome);
         }
     }
 
-    #[inline]
-    fn create_end(
-        &mut self,
-        context: &mut CTX,
-        inputs: &revm::interpreter::CreateInputs,
-        outcome: &mut revm::interpreter::CreateOutcome,
-    ) {
-        if let Some(used_state_inspector) = &mut self.used_state_inspector {
-            used_state_inspector.create_end(context, inputs, outcome);
+    fn create(&mut self, context: &mut CTX, inputs: &mut revm::interpreter::CreateInputs) -> Option<revm::interpreter::CreateOutcome> {
+        if let Some(i) = &mut self.used_state_inspector {
+            i.create(context, inputs)
+        } else { None }
+    }
+
+    fn create_end(&mut self, context: &mut CTX, inputs: &revm::interpreter::CreateInputs, outcome: &mut revm::interpreter::CreateOutcome) {
+        if let Some(i) = &mut self.used_state_inspector {
+            i.create_end(context, inputs, outcome);
         }
     }
 
-    #[inline]
     fn selfdestruct(&mut self, contract: Address, target: Address, value: U256) {
-        if let Some(used_state_inspector) = &mut self.used_state_inspector {
-            used_state_inspector.selfdestruct(contract, target, value);
+        if let Some(i) = &mut self.used_state_inspector {
+            i.selfdestruct(contract, target, value);
         }
     }
 }
+

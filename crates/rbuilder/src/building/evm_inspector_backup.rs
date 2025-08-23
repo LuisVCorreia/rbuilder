@@ -271,41 +271,41 @@ where
         }
     }
 
-    fn call(&mut self, _context: &mut CTX, inputs: &mut CallInputs) -> Option<CallOutcome> {
-        if let Some(transfer_value) = inputs.transfer_value() {
-            if !transfer_value.is_zero() {
-                *self
-                    .used_state_trace
-                    .sent_amount
-                    .entry(inputs.transfer_from())
-                    .or_default() += transfer_value;
-                *self
-                    .used_state_trace
-                    .received_amount
-                    .entry(inputs.transfer_to())
-                    .or_default() += transfer_value;
-            }
-        }
-        None
-    }
-
-    // fn call_end(&mut self, _context: &mut CTX, inputs: &CallInputs, outcome: &mut CallOutcome) {
-    //     let succeeded = outcome.result.is_ok();
-    //     if !succeeded { return; }
-
+    // fn call(&mut self, _context: &mut CTX, inputs: &mut CallInputs) -> Option<CallOutcome> {
     //     if let Some(transfer_value) = inputs.transfer_value() {
     //         if !transfer_value.is_zero() {
-    //             *self.used_state_trace
+    //             *self
+    //                 .used_state_trace
     //                 .sent_amount
     //                 .entry(inputs.transfer_from())
     //                 .or_default() += transfer_value;
-    //             *self.used_state_trace
+    //             *self
+    //                 .used_state_trace
     //                 .received_amount
     //                 .entry(inputs.transfer_to())
     //                 .or_default() += transfer_value;
     //         }
     //     }
+    //     None
     // }
+
+    fn call_end(&mut self, _context: &mut CTX, inputs: &CallInputs, outcome: &mut CallOutcome) {
+        let succeeded = outcome.result.is_ok();
+        if !succeeded { return; }
+
+        if let Some(transfer_value) = inputs.transfer_value() {
+            if !transfer_value.is_zero() {
+                *self.used_state_trace
+                    .sent_amount
+                    .entry(inputs.transfer_from())
+                    .or_default() += transfer_value;
+                *self.used_state_trace
+                    .received_amount
+                    .entry(inputs.transfer_to())
+                    .or_default() += transfer_value;
+            }
+        }
+    }
 
     fn create_end(
         &mut self,
@@ -392,13 +392,6 @@ where
             used_state_inspector.call(context, inputs)
         } else {
             None
-        }
-    }
-
-    #[inline]
-    fn call_end(&mut self, context: &mut CTX, inputs: &CallInputs, outcome: &mut CallOutcome) {
-        if let Some(used_state_inspector) = &mut self.used_state_inspector {
-            used_state_inspector.call_end(context, inputs, outcome);
         }
     }
 

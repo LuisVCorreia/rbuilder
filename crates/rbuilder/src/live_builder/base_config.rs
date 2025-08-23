@@ -4,15 +4,10 @@ use crate::{
     building::builders::UnfinishedBlockBuildingSinkFactory,
     live_builder::{order_input::OrderInputConfig, LiveBuilder},
     provider::{
-        ipc_state_provider::{IpcProviderConfig, IpcStateProviderFactory},
-        StateProviderFactory,
+        http_state_provider::HttpStateProviderFactory, ipc_state_provider::{IpcProviderConfig, IpcStateProviderFactory}, StateProviderFactory
     },
     roothash::RootHashContext,
-    utils::tracing::{setup_tracing_subscriber, LoggerConfig},
-    utils::{
-        constants::{MINS_PER_HOUR, SECS_PER_MINUTE},
-        http_provider, ProviderFactoryReopener, Signer,
-    },
+    utils::{constants::{MINS_PER_HOUR, SECS_PER_MINUTE}, http_provider, tracing::{setup_tracing_subscriber, LoggerConfig}, ProviderFactoryReopener, Signer},
 };
 use alloy_primitives::{Address, B256};
 use alloy_provider::RootProvider;
@@ -311,6 +306,33 @@ impl BaseConfig {
             Duration::from_millis(ipc_provider_config.request_timeout_ms),
         ))
     }
+    
+    // Create http provider factory (similar to IPC but with a HTTP endpoint)
+    pub fn create_http_provider_factory(&self) -> eyre::Result<HttpStateProviderFactory> {
+        // Validate the URL, but pass the original string to new_with_url_and_cache
+        Url::parse(&self.backtest_fetch_eth_rpc_url)?;
+        // Ok(HttpStateProviderFactory::new_with_url(&self.backtest_fetch_eth_rpc_url))
+
+        // let cache_dir = dirs::home_dir()
+        //     .expect("Could not find home directory")
+        //     .join(".cache/rbuilder/");
+        // let cache_file = cache_dir.join("state_cache.sqlite");
+
+        // Ok(HttpStateProviderFactory::new_with_url_and_cache(&self.backtest_fetch_eth_rpc_url, cache_file))
+        Ok(HttpStateProviderFactory::new_with_url_and_cache(
+            &self.backtest_fetch_eth_rpc_url,
+            PathBuf::from("rbuilder_results_1/cache/state_cache.sqlite"),
+        ))
+        // Ok(HttpStateProviderFactory::new_with_url(&self.backtest_fetch_eth_rpc_url))
+    }
+
+    /// Create HTTP provider factory reopener for backtest compatibility
+    pub fn create_http_provider_factory_reopener(&self) -> eyre::Result<crate::utils::HttpProviderFactoryReopener> {
+        let http_provider = self.create_http_provider_factory()?;
+        println!("Creating HTTP provider factory reopener for backtest compatibility");
+        Ok(crate::utils::HttpProviderFactoryReopener::new(http_provider))
+    }
+
 
     /// live_root_hash_config creates a root hash thread pool
     /// so it should be called once on the startup and cloned if needed
