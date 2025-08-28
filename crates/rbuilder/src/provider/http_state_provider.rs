@@ -2,7 +2,7 @@ use super::{state_cache::*, StateProviderFactory};
 use alloy_network::Ethereum;
 use alloy_provider::{Provider, ProviderBuilder};
 use alloy_rpc_types::{BlockId, BlockNumberOrTag};
-use alloy_primitives::{Address, B256, Bytes, StorageKey, StorageValue, BlockNumber, BlockHash};
+use alloy_primitives::{Address, B256, Bytes, StorageKey, StorageValue, BlockNumber, BlockHash, keccak256};
 use reth_errors::ProviderResult;
 use reth_primitives::{Account, Bytecode, Header};
 use reth_provider::{
@@ -37,6 +37,22 @@ where
     }
 }
 
+pub fn key_account(hash: B256, addr: Address) -> String {
+    format!("account:{:#x}:{:#x}", hash, addr)
+}
+pub fn key_storage(hash: B256, addr: Address, slot: B256) -> String {
+    format!("storage:{:#x}:{:#x}:{:#x}", hash, addr, slot)
+}
+pub fn key_bytecode(hash: B256, code_hash: B256) -> String {
+    format!("bytecode:{:#x}:{:#x}", hash, code_hash)
+}
+pub fn key_block_hash(num: u64) -> String {
+    format!("block_hash:{}", num)
+}
+pub fn key_header(hash: B256) -> String {
+    format!("header:{:#x}", hash)
+}
+
 impl HttpStateProviderFactory {
     pub fn new_with_url_and_cache(url: &str, cache_path: PathBuf) -> Self {
         let provider = ProviderBuilder::new()
@@ -57,23 +73,21 @@ impl HttpStateProviderFactory {
 
 impl StateProviderFactory for HttpStateProviderFactory {
     fn history_by_block_number(&self, block_number: BlockNumber) -> ProviderResult<StateProviderBox> {
+        if let Some(h) = self.block_hash(block_number)? {
+            return Ok(HttpStateProvider::new(self.provider.clone(), h, self.cache_db.clone()));
+        }
         let provider = self.provider.clone();
         let res = block_on_compat(async {
-            provider
-                .get_block_by_number(BlockNumberOrTag::Number(block_number))
-                .await
+            provider.get_block_by_number(BlockNumberOrTag::Number(block_number)).await
         })
         .map_err(|e| ProviderError::Other(AnyError::new(e)))?
         .ok_or_else(|| ProviderError::Other(AnyError::new(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            "Block not found",
+            std::io::ErrorKind::Other, "Block not found",
         ))))?;
 
-        Ok(HttpStateProvider::new(
-            self.provider.clone(),
-            res.header.hash,
-            self.cache_db.clone(),
-        ))
+        let num_key = key_block_hash(block_number);
+        block_on_compat(self.cache_db.block_hashes.set(&num_key, &res.header.hash));
+        Ok(HttpStateProvider::new(self.provider.clone(), res.header.hash, self.cache_db.clone()))
     }
 
     fn latest(&self) -> ProviderResult<StateProviderBox> {
@@ -93,27 +107,29 @@ impl StateProviderFactory for HttpStateProviderFactory {
     }
 
     fn history_by_block_hash(&self, block_hash: B256) -> ProviderResult<StateProviderBox> {
-        let provider = self.provider.clone();
-        let res = block_on_compat(async { provider.get_block_by_hash(block_hash).await })
-            .map_err(|e| ProviderError::Other(AnyError::new(e)))?
-            .ok_or_else(|| ProviderError::Other(AnyError::new(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "Block not found",
-            ))))?;
-
-        Ok(HttpStateProvider::new(
-            self.provider.clone(),
-            res.header.hash,
-            self.cache_db.clone(),
-        ))
+        Ok(HttpStateProvider::new(self.provider.clone(), block_hash, self.cache_db.clone()))
     }
     
     fn header(&self, block_hash: &BlockHash) -> ProviderResult<Option<Header>> {
-        let block_hash = *block_hash;
+        let key = key_header(*block_hash);
         let provider = self.provider.clone();
-        let res = block_on_compat(async { provider.get_block_by_hash(block_hash).await })
-            .map_err(|e| ProviderError::Other(AnyError::new(e)))?;
-        Ok(res.map(|block| block.header.inner))
+        let hash = *block_hash;
+        block_on_compat(async move {
+            if let Some(h) = self.cache_db.headers.get(&key).await {
+                return Ok(Some(h));
+            }
+            let res = provider
+                .get_block_by_hash(hash)
+                .await
+                .map_err(|e| ProviderError::Other(AnyError::new(e)))?;
+            if let Some(block) = res {
+                let hdr = block.header.inner;
+                self.cache_db.headers.set(&key, &hdr).await;
+                Ok(Some(hdr))
+            } else {
+                Ok(None)
+            }
+        })
     }
 
     fn last_block_number(&self) -> ProviderResult<BlockNumber> {
@@ -139,14 +155,26 @@ impl StateProviderFactory for HttpStateProviderFactory {
     }
 
     fn header_by_number(&self, num: u64) -> ProviderResult<Option<Header>> {
+        if let Some(h) = self.block_hash(num)? {
+            if let Some(hdr) = block_on_compat(self.cache_db.headers.get(&format!("header:{:?}", h))) {
+                return Ok(Some(hdr));
+            }
+        }
         let provider = self.provider.clone();
-        let block = block_on_compat(async {
-            provider
-                .get_block_by_number(BlockNumberOrTag::Number(num))
-                .await
+        let res = block_on_compat(async {
+            provider.get_block_by_number(BlockNumberOrTag::Number(num)).await
         })
         .map_err(|e| ProviderError::Other(AnyError::new(e)))?;
-        Ok(block.map(|b| b.header.inner))
+
+        if let Some(block) = res {
+            let hash = block.header.hash;
+            let hdr = block.header.inner;
+            block_on_compat(self.cache_db.block_hashes.set(&format!("block_hash:{}", num), &hash));
+            block_on_compat(self.cache_db.headers.set(&format!("header:{:?}", hash), &hdr));
+            Ok(Some(hdr))
+        } else {
+            Ok(None)
+        }
     }
 
     fn root_hasher(&self, _parent_num_hash: BlockNumHash) -> ProviderResult<Box<dyn super::RootHasher>> {
@@ -175,7 +203,7 @@ impl HttpStateProvider {
 
 impl StateProvider for HttpStateProvider {
     fn storage(&self, address: Address, storage_key: StorageKey) -> ProviderResult<Option<StorageValue>> {
-        let cache_key = format!("storage:{:?}:{:?}:{:?}", self.hash, address, storage_key);
+        let cache_key = key_storage(self.hash, address, storage_key);
         block_on_compat(async {
             if let Some(cached_value) = self.cache_db.storage.get(&cache_key).await {
                 return Ok(Some(cached_value.into()));
@@ -192,11 +220,35 @@ impl StateProvider for HttpStateProvider {
     }
 
     fn bytecode_by_hash(&self, code_hash: &B256) -> ProviderResult<Option<Bytecode>> {
-        let cache_key = format!("bytecode:{:?}:{:?}", self.hash, code_hash);
+        let cache_key = key_bytecode(self.hash, *code_hash);
         block_on_compat(async {
-            Ok(self.cache_db.bytecode.get(&cache_key).await)
+            if let Some(cached_bytecode) = self.cache_db.bytecode.get(&cache_key).await {
+                return Ok(Some(cached_bytecode));
+            }
+
+            let block_id = BlockId::hash(self.hash);
+            let code_hash_val = *code_hash;
+
+            let req = self
+                .provider
+                .client()
+                .request::<_, Option<Bytes>>("debug_codeByHash", (code_hash_val, block_id))
+                .await;
+
+            match req {
+                Ok(Some(bytes)) if !bytes.is_empty() => {
+                    let bytecode = Bytecode::new_raw(bytes);
+                    self.cache_db.bytecode.set(&cache_key, &bytecode).await;
+                    Ok(Some(bytecode))
+                }
+                Ok(_) => Ok(None),
+                Err(_e) => {
+                    Ok(None)
+                }
+            }
         })
     }
+
     
     fn account_nonce(&self, address: &Address) -> ProviderResult<Option<u64>> {
         match self.basic_account(address)? {
@@ -208,7 +260,7 @@ impl StateProvider for HttpStateProvider {
 
 impl BlockHashReader for HttpStateProvider {
     fn block_hash(&self, number: BlockNumber) -> ProviderResult<Option<B256>> {
-        let cache_key = format!("block_hash:{}", number);
+        let cache_key = key_block_hash(number);
         block_on_compat(async {
             if let Some(cached_hash) = self.cache_db.block_hashes.get(&cache_key).await {
                 return Ok(Some(cached_hash));
@@ -237,10 +289,10 @@ impl BlockHashReader for HttpStateProvider {
 
 impl AccountReader for HttpStateProvider {
     fn basic_account(&self, address: &Address) -> ProviderResult<Option<Account>> {
-        let cache_key = format!("account:{:?}:{:?}", self.hash, address);
+        let cache_key = key_account(self.hash, *address);
         block_on_compat(async {
-            if let Some(cached_account) = self.cache_db.accounts.get(&cache_key).await {
-                return Ok(Some(cached_account));
+            if let Some(cached) = self.cache_db.accounts.get(&cache_key).await {
+                return Ok(Some(cached));
             }
             let block_id = BlockId::hash(self.hash);
             let (balance_res, nonce_res, code_res) = tokio::join!(
@@ -252,13 +304,13 @@ impl AccountReader for HttpStateProvider {
             let nonce   = nonce_res  .map_err(|e| ProviderError::Other(AnyError::new(e)))?;
             let code    = code_res   .map_err(|e| ProviderError::Other(AnyError::new(e)))?;
 
-            // If there is code, compute its hash and *store the bytecode by hash* in our cache.
+            // If there is code, compute its hash and store the bytecode by hash in our cache.
             let bytecode_hash = if code.is_empty() {
                 None
             } else {
-                let h = alloy_primitives::keccak256(&code);
+                let h = keccak256(&code);
                 let bytecode = Bytecode::new_raw(code.clone());
-                let bkey = format!("bytecode:{:?}:{:?}", self.hash, h);
+                let bkey = key_bytecode(self.hash, h);
                 self.cache_db.bytecode.set(&bkey, &bytecode).await;
                 Some(h)
             };

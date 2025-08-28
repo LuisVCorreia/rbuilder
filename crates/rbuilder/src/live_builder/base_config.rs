@@ -329,7 +329,6 @@ impl BaseConfig {
     /// Create HTTP provider factory reopener for backtest compatibility
     pub fn create_http_provider_factory_reopener(&self) -> eyre::Result<crate::utils::HttpProviderFactoryReopener> {
         let http_provider = self.create_http_provider_factory()?;
-        println!("Creating HTTP provider factory reopener for backtest compatibility");
         Ok(crate::utils::HttpProviderFactoryReopener::new(http_provider))
     }
 
