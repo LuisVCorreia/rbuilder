@@ -3,13 +3,20 @@ use alloy_primitives::{Address, U256};
 use derivative::Derivative;
 use eyre::Result;
 use itertools::Itertools;
-use rand::{seq::SliceRandom, SeedableRng};
+use rand::seq::SliceRandom;
 use reth::providers::StateProvider;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use tracing::trace;
-use rand::Rng;
+use rand::rngs::SmallRng;
+use rand::{Rng, SeedableRng};
 use std::time::Instant;
+
+use serde::Serialize;
+use std::cmp::Reverse;
+use std::fs::OpenOptions;
+use std::io::Write;
+
 
 use super::{
     simulation_cache::{CachedSimulationState, SharedSimulationCache},
@@ -26,6 +33,43 @@ use crate::{
 };
 const ALL_PERMS_INCLUDE_DUPLICATE_NONCE_CHOICES: bool = true;
 
+#[derive(Serialize)]
+struct ExhaustiveTopSeq {
+    seq: Vec<usize>,
+    profit: String,
+}
+
+#[derive(Serialize)]
+struct ExhaustiveJsonLine {
+    block_number: u64,
+    group_id: usize,
+    terminated_by_time: bool,
+    examined: u64,
+    baseline_profit: String,
+    top: Vec<ExhaustiveTopSeq>,
+}
+
+fn append_exhaustive_json_line(
+    out_dir: &str,
+    block_number: u64,
+    payload: &ExhaustiveJsonLine,
+) -> eyre::Result<()> {
+    let dir = std::path::Path::new(out_dir);
+    if !dir.exists() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let file_name = format!("exhaustive_block_{:0>8}.ndjson", block_number);
+    let path = dir.join(file_name);
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    let line = serde_json::to_string(payload)?;
+    writeln!(file, "{}", line)?;
+    Ok(())
+}
+
+
 #[derive(Clone, Copy, Debug)]
 struct GAParams {
     population: usize,
@@ -38,43 +82,15 @@ struct GAParams {
     seed: u64,
 }
 
-/// Compact wrapper over SenderNonceView with reverse index lookup.
-#[derive(Debug, Clone)]
-struct NonceBuckets {
-    /// chains_slots[c][s] = candidate order indices at chain c, slot s (same-nonce bucket)
-    chains_slots: Vec<Vec<Vec<usize>>>,
-    /// index -> (chain, slot)
-    idx_to_chain_slot: HashMap<usize, (usize, usize)>,
-    /// total number of slots across chains (length of a valid interleaving)
-    total_slots: usize,
-}
-
-fn build_nonce_buckets(task: &ConflictTask) -> Option<NonceBuckets> {
-    let view = build_sender_nonce_view(&task.group)?;
-    let mut idx_to_chain_slot: HashMap<usize, (usize, usize)> = HashMap::default();
-
-    let mut total_slots = 0usize;
-    for (ci, chain) in view.chains_slots.iter().enumerate() {
-        for (si, slot) in chain.iter().enumerate() {
-            total_slots += 1;
-            for &idx in slot {
-                idx_to_chain_slot.insert(idx, (ci, si));
-            }
-        }
-    }
-
-    Some(NonceBuckets {
-        chains_slots: view.chains_slots,
-        idx_to_chain_slot,
-        total_slots,
-    })
+fn build_nonce_layout(task: &ConflictTask) -> Option<NonceLayout> {
+    NonceLayout::from_group(&task.group)
 }
 
 #[inline]
-fn repair_to_nonce_valid(preferred: &[usize], buckets: &NonceBuckets) -> Vec<usize> {
+fn repair_to_nonce_valid(preferred: &[usize], layout: &NonceLayout) -> Vec<usize> {
     // Project a single preference list onto a valid interleaving.
     // Internally this uses the same ready-set selection as crossover.
-    ppx_build_child_from_parents(preferred, preferred, buckets)
+    ppx_build_child_from_parents_greedy(preferred, preferred, layout)
 }
 
 #[derive(Clone)]
@@ -85,39 +101,29 @@ struct Individual {
 
 fn seed_initial_population(
     task: &ConflictTask,
-    buckets: &NonceBuckets,
+    layout: &NonceLayout,
     population_size: usize,
-    rng: &mut rand::rngs::SmallRng,
+    rng: &mut SmallRng,
 ) -> Vec<Vec<usize>> {
+    use ahash::HashSet as AHashSet;
+
     let mut seeds: Vec<Vec<usize>> = Vec::new();
     let mut seen: AHashSet<Vec<usize>> = AHashSet::default();
 
-    // Generate Greedy and ReverseGreedy sequences
+    // Greedy and ReverseGreedy
     for &rev in &[false, true] {
         for seq in generate_greedy_sequence(task, rev) {
-            // Project the preference ordering into a valid interleaving.
-            let repaired = repair_to_nonce_valid(&seq, buckets);
-            if repaired.len() == buckets.total_slots && seen.insert(repaired.clone()) {
+            let repaired = repair_to_nonce_valid(&seq, layout);
+            if repaired.len() == layout.total_steps && seen.insert(repaired.clone()) {
                 seeds.push(repaired);
             }
         }
     }
 
-    // Fill rest with random candidates per slot + uniform interleaving
-    let view = build_sender_nonce_view(&task.group).expect("nonce view");
+    // Fill rest with random candidates per step + uniform interleaving
     while seeds.len() < population_size {
-        // pick 1 candidate per slot at random
-        let mut per_chain: Vec<Vec<usize>> = Vec::with_capacity(view.chains_slots.len());
-        for chain in &view.chains_slots {
-            let mut best_chain = Vec::with_capacity(chain.len());
-            for slot in chain {
-                let cand = slot[rng.gen_range(0..slot.len())];
-                best_chain.push(cand);
-            }
-            per_chain.push(best_chain);
-        }
-        let s = sample_one_uniform_interleaving(&per_chain, rng); // interleave across senders
-        if s.len() == buckets.total_slots && seen.insert(s.clone()) {
+        let s = random_interleaving_with_random_choices(layout, rng);
+        if s.len() == layout.total_steps && seen.insert(s.clone()) {
             seeds.push(s);
         }
     }
@@ -128,7 +134,7 @@ fn seed_initial_population(
 fn tournament_select<'p>(
     population: &'p [Individual],
     k: usize,
-    rng: &mut rand::rngs::SmallRng,
+    rng: &mut SmallRng,
 ) -> usize {
     debug_assert!(population.len() >= k);
     let mut best_idx = rng.gen_range(0..population.len());
@@ -136,10 +142,12 @@ fn tournament_select<'p>(
     for _ in 1..k {
         let i = rng.gen_range(0..population.len());
         let fit = population[i].fitness.expect("fitness must be set");
-        if fit > best_fit {
+        // Tie-break by random chance
+        if fit > best_fit || (fit == best_fit && rng.gen_bool(0.5)) {
             best_idx = i;
             best_fit = fit;
         }
+
     }
     best_idx
 }
@@ -150,15 +158,58 @@ fn tournament_select<'p>(
 /// - Priority = min(rank_in_parent_a, rank_in_parent_b), tie-break by sum then by idx.
 /// Build a nonce-valid child by precedence-preserving selection from the
 /// ready set (current slot of each chain), guided by ranks in both parents.
+fn ppx_build_child_from_parents_greedy(
+    parent_a: &[usize],
+    parent_b: &[usize],
+    layout: &NonceLayout,
+) -> Vec<usize> {
+    let total_steps = layout.total_steps;
+    let n_chains = layout.chains.len();
+    let mut next_step_per_chain = vec![0usize; n_chains];
+    let mut child = Vec::with_capacity(total_steps);
+
+    const LARGE_RANK: usize = usize::MAX / 4;
+    let mut rank_in_a: HashMap<usize, usize> = HashMap::default();
+    let mut rank_in_b: HashMap<usize, usize> = HashMap::default();
+    for (i, &idx) in parent_a.iter().enumerate() { rank_in_a.insert(idx, i); }
+    for (i, &idx) in parent_b.iter().enumerate() { rank_in_b.insert(idx, i); }
+
+    while child.len() < total_steps {
+        let mut best_choice: Option<(usize, (usize, usize, usize))> = None;
+        for chain_id in 0..n_chains {
+            let step = next_step_per_chain[chain_id];
+            if step >= layout.chains[chain_id].steps.len() { continue; }
+            for &cand in &layout.chains[chain_id].steps[step].candidates {
+                let ra = *rank_in_a.get(&cand).unwrap_or(&LARGE_RANK);
+                let rb = *rank_in_b.get(&cand).unwrap_or(&LARGE_RANK);
+                let key = (ra.min(rb), ra.saturating_add(rb), cand);
+                if let Some((_, best_key)) = &best_choice {
+                    if key < *best_key { best_choice = Some((cand, key)); }
+                } else {
+                    best_choice = Some((cand, key));
+                }
+            }
+        }
+        let (chosen_idx, _) = best_choice.expect("ready set non-empty");
+        let (chain_id, step_id) = layout.index_of[&chosen_idx];
+        debug_assert_eq!(next_step_per_chain[chain_id], step_id);
+        child.push(chosen_idx);
+        next_step_per_chain[chain_id] += 1;
+    }
+    child
+}
+
+/// Same as `ppx_build_child_from_parents_greedy`, but is not deterministic.
 fn ppx_build_child_from_parents(
     parent_a: &[usize],
     parent_b: &[usize],
-    buckets: &NonceBuckets,
+    layout: &NonceLayout,
+    rng: &mut SmallRng,
 ) -> Vec<usize> {
-    let total_slots = buckets.total_slots;
-    let n_chains = buckets.chains_slots.len();
-    let mut next_slot_per_chain = vec![0usize; n_chains];
-    let mut child = Vec::with_capacity(total_slots);
+    let total_steps = layout.total_steps;
+    let n_chains = layout.chains.len();
+    let mut next_step_per_chain = vec![0usize; n_chains];
+    let mut child = Vec::with_capacity(total_steps);
 
     // Rank maps: position in each parent gives priority (lower is better).
     // If a candidate doesn't appear in a parent, assign a large (bad) rank.
@@ -168,94 +219,181 @@ fn ppx_build_child_from_parents(
     for (i, &idx) in parent_a.iter().enumerate() { rank_in_a.insert(idx, i); }
     for (i, &idx) in parent_b.iter().enumerate() { rank_in_b.insert(idx, i); }
 
-    while child.len() < total_slots {
-        // Consider only ready candidates: current slot for each chain.
-        let mut best_choice: Option<(usize, (usize, usize, usize))> = None;
-        // tuple = (candidate_idx, (best_of_parent_ranks, sum_of_ranks, tie_idx))
+    let alpha = 1.0;
+    let beta = 0.25;
 
+    while child.len() < total_steps {
+        // Build ready set and compute a score for each candidate
+        let mut cands: Vec<(usize, f64)> = Vec::new();
         for chain_id in 0..n_chains {
-            let slot = next_slot_per_chain[chain_id];
-            if slot >= buckets.chains_slots[chain_id].len() {
-                continue;
-            }
-            // All candidates that share this (chain, slot) (same-nonce duplicates).
-            for &cand in &buckets.chains_slots[chain_id][slot] {
+            let step = next_step_per_chain[chain_id];
+            if step >= layout.chains[chain_id].steps.len() { continue; }
+            for &cand in &layout.chains[chain_id].steps[step].candidates {
                 let ra = *rank_in_a.get(&cand).unwrap_or(&LARGE_RANK);
                 let rb = *rank_in_b.get(&cand).unwrap_or(&LARGE_RANK);
-                let key = (ra.min(rb), ra.saturating_add(rb), cand);
 
-                if let Some((_, best_key)) = &best_choice {
-                    if key < *best_key {
-                        best_choice = Some((cand, key));
-                    }
-                } else {
-                    best_choice = Some((cand, key));
-                }
+                // TODO: Tweak alpha and beta
+                let score = alpha * (ra.min(rb) as f64) + beta * ((ra + rb) as f64);
+                cands.push((cand, score));
             }
         }
 
-        // Pick and advance its chain.
-        let (chosen_idx, _) = best_choice.expect("non-empty ready set until all slots are filled");
-        let (chain_id, slot_id) = buckets.idx_to_chain_slot[&chosen_idx];
-        debug_assert_eq!(next_slot_per_chain[chain_id], slot_id);
+        let chosen_idx = if cands.len() == 1 {
+            cands[0].0
+        } else {
+            // Convert scores to probabilities via softmax
+            let temperature = 0.5_f64; // higher = more random, lower = greedier
+            // Numerical stability: subtract max of (-score/T)
+            let max_term = cands.iter().map(|(_,s)| -s / temperature).fold(f64::NEG_INFINITY, f64::max);
 
+            let mut weights: Vec<f64> = cands.iter()
+                .map(|(_,s)| ((-s / temperature) - max_term).exp())
+                .collect();
+
+            // normalize
+            let sumw: f64 = weights.iter().sum();
+            if sumw <= 0.0 {
+                // fallback to uniform if all weights underflowed
+                let i = rng.gen_range(0..cands.len());
+                cands[i].0
+            } else {
+                for w in &mut weights { *w /= sumw; }
+
+                // Sample one candidate from the categorical distribution
+                let r = rng.gen::<f64>();
+                let mut acc = 0.0;
+                let mut pick = cands[0].0;
+                for ((cand, _), w) in cands.into_iter().zip(weights.into_iter()) {
+                    acc += w;
+                    if r <= acc { pick = cand; break; }
+                }
+                pick
+            }
+        };
+
+        // Place the chosen index and advance its chain
+        let (chain_id, step_id) = layout.index_of[&chosen_idx];
+        debug_assert_eq!(next_step_per_chain[chain_id], step_id);
         child.push(chosen_idx);
-        next_slot_per_chain[chain_id] += 1;
+        next_step_per_chain[chain_id] += 1;
     }
 
     child
 }
 
-fn mutation_inter_sender_swap(
-    seq: &mut Vec<usize>,
-    buckets: &NonceBuckets,
-    rng: &mut rand::rngs::SmallRng,
-) {
+
+// Mutation functions
+fn mut_adjacent_interchain_swap(seq: &mut [usize], layout: &NonceLayout, rng: &mut SmallRng) -> bool {
+    if seq.len() < 2 { return false; }
+    let mut edges: Vec<usize> = Vec::new();
+    for i in 0..seq.len()-1 {
+        let (c1, _) = layout.index_of[&seq[i]];
+        let (c2, _) = layout.index_of[&seq[i+1]];
+        if c1 != c2 { edges.push(i); }
+    }
+    if edges.is_empty() { return false; }
+    let i = rng.gen_range(0..edges.len());
+    let j = edges[i];
+    seq.swap(j, j+1);
+    true
+}
+
+fn mut_bubble_move(seq: &mut [usize], layout: &NonceLayout, rng: &mut SmallRng, max_steps: usize) -> bool {
+    if seq.is_empty() { return false; }
+    use rand::Rng;
+    let mut p = rng.gen_range(0..seq.len());
+    let left = rng.gen_bool(0.5);
+    let steps = rng.gen_range(1..=max_steps);
+    let mut changed = false;
+    for _ in 0..steps {
+        if left {
+            if p == 0 { break; }
+            let (c1, _) = layout.index_of[&seq[p-1]];
+            let (c2, _) = layout.index_of[&seq[p]];
+            if c1 == c2 { break; }
+            seq.swap(p-1, p);
+            p -= 1;
+        } else {
+            if p+1 >= seq.len() { break; }
+            let (c1, _) = layout.index_of[&seq[p]];
+            let (c2, _) = layout.index_of[&seq[p+1]];
+            if c1 == c2 { break; }
+            seq.swap(p, p+1);
+            p += 1;
+        }
+        changed = true;
+    }
+    changed
+}
+
+fn mutation_inter_sender_swap(seq: &mut Vec<usize>, layout: &NonceLayout, rng: &mut SmallRng) {
     if seq.is_empty() { return; }
-    // Sample up to a few tries to find two positions from different chains
+    use rand::Rng;
     for _ in 0..5 {
         let i = rng.gen_range(0..seq.len());
         let j = rng.gen_range(0..seq.len());
         if i == j { continue; }
         let (a, b) = if i < j { (i, j) } else { (j, i) };
-        let (ca, _sa) = buckets.idx_to_chain_slot[&seq[a]];
-        let (cb, _sb) = buckets.idx_to_chain_slot[&seq[b]];
-        if ca != cb {
-            seq.swap(a, b);
-            return;
-        }
+        let (ca, _) = layout.index_of[&seq[a]];
+        let (cb, _) = layout.index_of[&seq[b]];
+        if ca != cb { seq.swap(a, b); return; }
     }
 }
 
-fn mutation_same_nonce_flip(
-    seq: &mut Vec<usize>,
-    buckets: &NonceBuckets,
-    rng: &mut rand::rngs::SmallRng,
-) {
+fn mutation_same_nonce_flip(seq: &mut Vec<usize>, layout: &NonceLayout, rng: &mut SmallRng) {
     if seq.is_empty() { return; }
-    // pick a random position, if bucket has >1 candidates, flip to a different one
+    use rand::Rng;
+    // pick a random position, if that (chain, step) has >1 candidates, flip to a different one
     let p = rng.gen_range(0..seq.len());
-    let (c, s) = buckets.idx_to_chain_slot[&seq[p]];
-    let bucket = &buckets.chains_slots[c][s];
+    let (c, s) = layout.index_of[&seq[p]];
+    let bucket = &layout.chains[c].steps[s].candidates;
     if bucket.len() <= 1 { return; }
 
-    // pick alternative different from current
-    // tiny guard to avoid duplicates in seq (shouldn't exist for same slot)
     let cur = seq[p];
     let alts: Vec<usize> = bucket.iter().copied().filter(|&x| x != cur).collect();
     if alts.is_empty() { return; }
     let alt = alts[rng.gen_range(0..alts.len())];
-
-    // replace
     seq[p] = alt;
 }
 
+fn mut_same_nonce_flip(seq: &mut [usize], layout: &NonceLayout, multi: &[(usize,usize)], rng: &mut SmallRng) -> bool {
+    if multi.is_empty() { return false; }
+    use rand::Rng;
+    let (c, s) = multi[rng.gen_range(0..multi.len())];
+    let bucket = &layout.chains[c].steps[s].candidates;
+    if bucket.len() <= 1 { return false; }
+    // find current gene for this (c,s)
+    let cur_idx = *bucket.iter().find(|&&idx| seq.contains(&idx)).expect("must exist");
+    let pos = seq.iter().position(|&x| x == cur_idx).unwrap();
+    let alts: Vec<usize> = bucket.iter().copied().filter(|&x| x != cur_idx).collect();
+    let alt = alts[rng.gen_range(0..alts.len())];
+    seq[pos] = alt;
+    true
+}
+
+fn mutate(seq: &mut Vec<usize>, layout: &NonceLayout, rng: &mut SmallRng, multi: &[(usize,usize)]) {
+    use rand::Rng;
+    for _ in 0..5 {
+        let picked = rng.gen_range(0..100);
+        let changed = if !multi.is_empty() && picked < 35 {
+            mut_same_nonce_flip(seq, layout, multi, rng)
+        } else if picked < 65 {
+            mut_adjacent_interchain_swap(seq, layout, rng)
+        } else {
+            let max_steps = rng.gen_range(2..5);
+            mut_bubble_move(seq, layout, rng, max_steps)
+        };
+        if changed { return; }
+    }
+    // last resort: uniform fresh random
+    *seq = random_interleaving_with_random_choices(layout, rng);
+}
 
 
 /// Build one uniformly random nonce-respecting ordering.
 /// Weighted choice: at each step pick chain i with probability
 /// remaining_i / total_remaining, then take its next tx.
-fn sample_one_uniform_interleaving(chains: &[Vec<usize>], rng: &mut rand::rngs::SmallRng) -> Vec<usize> {
+fn sample_one_uniform_interleaving(chains: &[Vec<usize>], rng: &mut SmallRng) -> Vec<usize> {
     let k = chains.len();
     let total: usize = chains.iter().map(|c| c.len()).sum();
     let mut cursors = vec![0usize; k];
@@ -286,6 +424,117 @@ fn sample_one_uniform_interleaving(chains: &[Vec<usize>], rng: &mut rand::rngs::
 
     seq
 }
+
+/// Streaming enumerator of all nonce-valid interleavings with per-slot choices.
+/// Memory-light: no per-depth ready vectors are stored.
+struct InterleaveStreamer<'a> {
+    layout: &'a NonceLayout,
+    cursors: Vec<usize>,     // next slot per chain
+    seq: Vec<usize>,         // current path (indices)
+    stack: Vec<Frame>,       // DFS frames
+}
+
+struct Frame {
+    next_i: usize,           // which "nth ready choice" to try at this depth
+    applied_chain: Option<usize>, // which chain we advanced to reach this depth (for undo)
+}
+
+impl<'a> InterleaveStreamer<'a> {
+    fn new(layout: &'a NonceLayout) -> Self {
+        let mut it = Self {
+            layout,
+            cursors: vec![0; layout.chains.len()],
+            seq: Vec::with_capacity(layout.total_steps),
+            stack: Vec::new(),
+        };
+        // root frame
+        it.stack.push(Frame { next_i: 0, applied_chain: None });
+        it
+    }
+
+    #[inline]
+    fn ready_count(&self) -> usize {
+        let mut tot = 0usize;
+        for c in 0..self.cursors.len() {
+            let s = self.cursors[c];
+            if s < self.layout.chains[c].steps.len() {
+                tot += self.layout.chains[c].steps[s].candidates.len();
+            }
+        }
+        tot
+    }
+
+    /// Map nth ready option (0-based) to (chain, cand_pos_in_bucket).
+    #[inline]
+    fn nth_ready(&self, mut n: usize) -> (usize, usize) {
+        for c in 0..self.cursors.len() {
+            let s = self.cursors[c];
+            if s >= self.layout.chains[c].steps.len() {
+                continue;
+            }
+            let len = self.layout.chains[c].steps[s].candidates.len();
+            if n < len {
+                return (c, n);
+            }
+            n -= len;
+        }
+        unreachable!("nth_ready called with n >= ready_count()");
+    }
+
+    fn next(&mut self) -> Option<Vec<usize>> {
+        let total_slots = self.layout.total_steps;
+
+        loop {
+            // Done?
+            if self.stack.is_empty() {
+                return None;
+            }
+
+            // Take the frame by value so we don't hold a borrow on self.stack
+            let mut frame = self.stack.pop().unwrap();
+
+            // These only need &self, and no frame is borrowed now.
+            let total_ready = self.ready_count();
+
+            // No more options at this depth → backtrack
+            if frame.next_i >= total_ready {
+                if let Some(chain) = frame.applied_chain {
+                    self.seq.pop();
+                    self.cursors[chain] -= 1;
+                }
+                // do not push this exhausted frame back
+                continue;
+            }
+
+            // Figure out which ready option to try next (still only &self)
+            let (chain, cand_pos) = self.nth_ready(frame.next_i);
+            frame.next_i += 1;
+
+            // We will come back to this depth; put the updated frame back first.
+            self.stack.push(frame);
+
+            // Apply choice
+            let slot = self.cursors[chain];
+            let cand = self.layout.chains[chain].steps[slot].candidates[cand_pos];
+            self.seq.push(cand);
+            self.cursors[chain] += 1;
+
+            if self.seq.len() == total_slots {
+                // Leaf: emit and undo immediately
+                let out = self.seq.clone();
+                self.seq.pop();
+                self.cursors[chain] -= 1;
+                return Some(out);
+            } else {
+                // Go deeper
+                self.stack.push(Frame { next_i: 0, applied_chain: Some(chain) });
+                // continue the loop
+            }
+        }
+    }
+
+}
+
 
 /// Context for resolving conflicts in merging tasks.
 
@@ -372,6 +621,15 @@ impl<'a> ResolverContext<'a> {
                 );
                 Ok(res)
             }
+            Algorithm::ExhaustiveStreaming { time_ms, top_k } => {
+                let res = self.run_exhaustive_streaming(&task, time_ms, top_k)?;
+                trace!(
+                    "Resolved ExhaustiveStreaming task {:?} with profit: {:?}",
+                    task.group.id,
+                    res.total_profit
+                );
+                Ok(res)
+            }
             _ => {
                 let sequence_to_try = generate_sequences_of_orders_to_try(&task);
 
@@ -436,9 +694,13 @@ impl<'a> ResolverContext<'a> {
         let full_sequence_of_orders = self.initialize_full_order_ids_vec(&sequence_of_orders, task);
 
         // Check for cached simulation state
-        let (cached_state_option, cached_up_to_index) = self
-            .simulation_cache
-            .get_cached_state(&full_sequence_of_orders);
+        let use_cache = !matches!(task.algorithm, Algorithm::ExhaustiveStreaming { .. });
+        let (cached_state_option, cached_up_to_index) = if use_cache {
+            self.simulation_cache.get_cached_state(&full_sequence_of_orders)
+        } else {
+            (None, 0)
+        };
+
 
         // Initialize state and partial block
         let mut partial_block = PartialBlock::new(true);
@@ -472,11 +734,11 @@ impl<'a> ResolverContext<'a> {
 
         let mut pending_orders: HashMap<(Address, u64), usize> = HashMap::default();
 
-        let mut prefix_ids: Vec<OrderId> = if let Some(c) = &cached_state_option {
-            c.per_order_profits.iter().map(|(oid, _)| oid.clone()).collect()
-        } else {
-            Vec::with_capacity(sequence_of_orders.len())
-        };
+        // let mut prefix_ids: Vec<OrderId> = if let Some(c) = &cached_state_option {
+        //     c.per_order_profits.iter().map(|(oid, _)| oid.clone()).collect()
+        // } else {
+        //     Vec::with_capacity(sequence_of_orders.len())
+        // };
 
         // Processing loop
         while let Some(order_idx) = remaining_orders.pop() {
@@ -503,20 +765,20 @@ impl<'a> ResolverContext<'a> {
                         &mut total_profit,
                         &mut per_order_profits,
                     );
-                    let order_id = sim_order.order.id();
-                    prefix_ids.push(order_id.clone());
+                    // let order_id = sim_order.order.id();
+                    // prefix_ids.push(order_id.clone());
 
-                    let _inserted = self.simulation_cache.ensure_cached_with(&prefix_ids, || {
-                    let bundle_state = state.clone_bundle();
-                    CachedSimulationState {
-                        bundle_state,
-                        total_profit,
-                        per_order_profits: per_order_profits.clone(),
-                        cumulative_gas_used: partial_block.gas_used,
-                        cumulative_blob_gas_used: partial_block.blob_gas_used,
-                        coinbase_profit: partial_block.coinbase_profit,
-                    }
-                });
+                    // let _inserted = self.simulation_cache.ensure_cached_with(&prefix_ids, || {
+                        // let bundle_state = state.clone_bundle();
+                        // CachedSimulationState {
+                        //     bundle_state,
+                        //     total_profit,
+                        //     per_order_profits: per_order_profits.clone(),
+                        //     cumulative_gas_used: partial_block.gas_used,
+                        //     cumulative_blob_gas_used: partial_block.blob_gas_used,
+                        //     coinbase_profit: partial_block.coinbase_profit,
+                        // }
+                    // });
                 }
                 Err(err) => self.handle_err(&err, sim_order, &mut pending_orders, order_idx),
             }
@@ -653,34 +915,161 @@ impl<'a> ResolverContext<'a> {
 
     fn evaluate_fitness(
         &mut self,
-        seq: &Vec<usize>,
+        seq: &[usize],
         task: &ConflictTask,
     ) -> eyre::Result<ResolutionResult> {
-        let (res, _state) = self.process_sequence_of_orders(seq.clone(), task, self.state.clone())?;
+        let (res, _state) = self.process_sequence_of_orders(seq.to_vec(), task, self.state.clone())?;
         Ok(res)
     }
 
-    fn run_genetic(&mut self, task: &ConflictTask, params: GAParams) -> eyre::Result<ResolutionResult> {
-        if task.group.id == 4 {
-            println!("Running Genetic Algorithm with params: {:?}", params);
+    /// Compute baseline profit using current implementation tasks:
+    /// Greedy, ReverseGreedy, Length, and a random task.
+    fn compute_baseline_profit(&mut self, task: &ConflictTask) -> eyre::Result<U256> {
+        let mut best = U256::ZERO;
+
+        // Greedy and ReverseGreedy
+        for &rev in &[false, true] {
+            for seq in generate_greedy_sequence(task, rev) {
+                let res = self.evaluate_fitness(&seq, task)?;
+                if res.total_profit > best { best = res.total_profit; }
+            }
         }
-        // Precompute nonce buckets
-        let Some(buckets) = build_nonce_buckets(task) else {
-            // Fallback: if we somehow get here without nonce view, evaluate Greedy once
-            let greedy = generate_greedy_sequence(task, false).into_iter().next().unwrap_or_default();
-            let (res, _) = self.process_sequence_of_orders(greedy, task, self.state.clone())?;
-            return Ok(res);
+
+        // Length
+        for seq in generate_length_based_sequence(task) {
+            let res = self.evaluate_fitness(&seq, task)?;
+            if res.total_profit > best { best = res.total_profit; }
+        }
+
+        // Random
+        let rnd = generate_random_permutations(
+            &ConflictTask { algorithm: Algorithm::Random { seed: task.group.id as u64, count: 50 }, ..task.clone() },
+            task.group.id as u64,
+            50,
+        );
+        for seq in rnd {
+            let res = self.evaluate_fitness(&seq, task)?;
+            if res.total_profit > best { best = res.total_profit; }
+        }
+
+        Ok(best)
+    }
+
+
+    fn run_exhaustive_streaming(
+        &mut self,
+        task: &ConflictTask,
+        time_ms: u64,
+        top_k: usize,
+    ) -> eyre::Result<ResolutionResult> {
+        let Some(layout) = build_nonce_layout(task) else {
+            // Fallback when we can’t derive (sender, nonce)
+            return Ok(ResolutionResult { total_profit: U256::ZERO, sequence_of_orders: vec![] });
         };
+
+        // Baseline first (so we can compare later)
+        let baseline = self.compute_baseline_profit(task)?;
+
+        // Stream all sequences; simulate each immediately.
+        let start = Instant::now();
+        let deadline = start + std::time::Duration::from_millis(time_ms);
+        let mut streamer = InterleaveStreamer::new(&layout);
+
+        // Keep Top-K via a min-heap on profit
+        let mut heap: std::collections::BinaryHeap<(Reverse<U256>, Vec<usize>)> =
+            std::collections::BinaryHeap::new();
+        let mut examined: u64 = 0;
+        let mut terminated_by_time = false;
+
+        // Track best ResolutionResult (so we can return a full record with per-order profits)
+        let mut best_res: Option<ResolutionResult> = None;
+
+        while let Some(seq) = streamer.next() {
+            if Instant::now() >= deadline {
+                terminated_by_time = true;
+                break;
+            }
+            if self.cancellation_token.is_cancelled() {
+                return Err(eyre::eyre!("Cancelled"));
+            }
+
+            // Evaluate and update Top-K
+            let res = self.evaluate_fitness(&seq, task)?;
+            examined += 1;
+
+            if heap.len() < top_k {
+                heap.push((Reverse(res.total_profit), seq.clone()));
+            } else if let Some(&(Reverse(curr_min), _)) = heap.peek() {
+                if res.total_profit > curr_min {
+                    heap.pop();
+                    heap.push((Reverse(res.total_profit), seq.clone()));
+                }
+            }
+
+            // Track the global best (so we don't need to re-run later)
+            match &best_res {
+                Some(b) if res.total_profit > b.total_profit => best_res = Some(res),
+                None => best_res = Some(res),
+                _ => {}
+            }
+        }
+
+        // Serialize Top-K to JSON (sorted descending)
+        let mut top: Vec<(U256, Vec<usize>)> = heap
+            .into_sorted_vec()
+            .into_iter()
+            .map(|(Reverse(p), s)| (p, s))
+            .collect();
+        top.reverse(); // now descending by profit
+
+        let json_top: Vec<ExhaustiveTopSeq> = top
+            .iter()
+            .map(|(p, s)| ExhaustiveTopSeq {
+                seq: s.clone(),
+                profit: p.to_string(),
+            })
+            .collect();
+
+        let payload = ExhaustiveJsonLine {
+            block_number: self.ctx.evm_env.block_env.number,
+            group_id: task.group.id,
+            terminated_by_time,
+            examined,
+            baseline_profit: baseline.to_string(),
+            top: json_top,
+        };
+
+        let _ = append_exhaustive_json_line(
+            "performance_testing/exhaustive_streaming",
+            self.ctx.evm_env.block_env.number,
+            &payload,
+        );
+
+        // Return the best result we saw (if none, return zero)
+        Ok(best_res.unwrap_or(ResolutionResult {
+            total_profit: U256::ZERO,
+            sequence_of_orders: vec![],
+        }))
+    }
+
+    fn run_genetic(&mut self, task: &ConflictTask, params: GAParams) -> eyre::Result<ResolutionResult> {
+        let Some(layout) = build_nonce_layout(task) else {
+            // Fallback when we can’t derive (sender, nonce)
+            return Ok(ResolutionResult { total_profit: U256::ZERO, sequence_of_orders: vec![] });
+        };
+
+        // Identify multi-candidate buckets for mutation
+        let multi_steps: Vec<(usize, usize)> = layout.multi_steps();
 
         let start = Instant::now();
         let deadline = start + std::time::Duration::from_millis(params.time_ms);
-        let mut rng = rand::rngs::SmallRng::seed_from_u64(params.seed);
+        let mut rng = SmallRng::seed_from_u64(params.seed);
 
         // 1) Seed population
-        let seed_seqs = seed_initial_population(task, &buckets, params.population, &mut rng);
+        let seed_seqs = seed_initial_population(task, &layout, params.population, &mut rng);
         let mut population: Vec<Individual> = seed_seqs.into_iter().map(|seq| Individual { seq, fitness: None }).collect();
 
-        println!("Task {} Initial population sequences:", task.group.id);
+        println!("Group {} Initial population sequences:", task.group.id);
         for (i, individual) in population.iter().enumerate() {
             println!("  Population[{}]: {:?}", i, individual.seq);
         }
@@ -691,8 +1080,6 @@ impl<'a> ResolverContext<'a> {
             if self.cancellation_token.is_cancelled() { return Err(eyre::eyre!("Cancelled")); }
             let fit_res = self.evaluate_fitness(&population[i].seq, task)?;
             population[i].fitness = Some(fit_res.total_profit);
-            
-            println!("  Population[{}] fitness: {}", i, fit_res.total_profit);
             
             if let Some((_bi, bres)) = &best {
                 if fit_res.total_profit > bres.total_profit { best = Some((i, fit_res)); }
@@ -709,9 +1096,6 @@ impl<'a> ResolverContext<'a> {
         // 3) GA loop
         let mut generation = 0usize;
         while generation < params.max_generations && Instant::now() < deadline {
-            if task.group.id == 4 {
-                println!("Task {} Generation {}: Population size: {}", task.group.id, generation, population.len());
-            }
             if self.cancellation_token.is_cancelled() {
                 return Err(eyre::eyre!("Cancelled"));
             }
@@ -723,15 +1107,15 @@ impl<'a> ResolverContext<'a> {
                 fb.cmp(&fa)
             });
 
-            println!("  Best sequences after sorting:");
-            for i in 0..3.min(population.len()) {
-                println!("    Rank[{}]: seq={:?}, fitness={}", 
-                            i, population[i].seq, population[i].fitness.unwrap_or(U256::ZERO));
-            }
+            // println!("  Best sequences after sorting:");
+            // for i in 0..3.min(population.len()) {
+            //     println!("    Rank[{}]: seq={:?}, fitness={}", 
+            //                 i, population[i].seq, population[i].fitness.unwrap_or(U256::ZERO));
+            // }
 
-            println!("Worst sequence: {:?}, fitness=[]={}", 
-                population[population.len() - 1].seq, 
-                population[population.len() - 1].fitness.unwrap_or(U256::ZERO));
+            // println!("Worst sequence: {:?}, fitness=[]={}", 
+            //     population[population.len() - 1].seq, 
+            //     population[population.len() - 1].fitness.unwrap_or(U256::ZERO));
 
             // Next population with elites
             let mut next_population: Vec<Individual> = Vec::with_capacity(params.population);
@@ -740,17 +1124,32 @@ impl<'a> ResolverContext<'a> {
                 next_population.push(population[i].clone()); // carry over
             }
 
+            // Track seen sequences to avoid duplicates
+            let mut seen_next: AHashSet<Vec<usize>> = AHashSet::default();
+            // mark elites
+            for i in 0..elites {
+                seen_next.insert(population[i].seq.clone());
+            }
+
             // Fill the rest
             while next_population.len() < params.population && Instant::now() < deadline {
                 // Parents
                 let p1_idx = tournament_select(&population, params.tourn_k, &mut rng);
-                let p2_idx = tournament_select(&population, params.tourn_k, &mut rng);
+                let mut p2_idx = tournament_select(&population, params.tourn_k, &mut rng);
+
+                // avoid identical parents (by index or by sequence)
+                for _ in 0..4 {
+                    if p2_idx != p1_idx && population[p2_idx].seq != population[p1_idx].seq {
+                        break;
+                    }
+                    p2_idx = tournament_select(&population, params.tourn_k, &mut rng);
+                }
                 let p1 = &population[p1_idx];
                 let p2 = &population[p2_idx];
 
-                // Crossover?
+                // Crossover
                 let mut child_seq = if rng.gen::<f64>() < params.crossover_rate {
-                    let child = ppx_build_child_from_parents(&p1.seq, &p2.seq, &buckets);
+                    let child = ppx_build_child_from_parents(&p1.seq, &p2.seq, &layout, &mut rng);
 
                     println!("    Crossover: P1[{}]={:?} + P2[{}]={:?} -> Child={:?}", 
                                 p1_idx, p1.seq, p2_idx, p2.seq, child);
@@ -763,21 +1162,39 @@ impl<'a> ResolverContext<'a> {
                     } else {
                         p2.seq.clone()
                     };
-                    println!("    Clone parent: {:?}", parent_seq);
 
                     parent_seq
                 };
 
-                // Mutations (independent)
+                // Mutations
                 let pre_mutation = child_seq.clone();
                 if rng.gen::<f64>() < params.mutation_rate {
-                    mutation_inter_sender_swap(&mut child_seq, &buckets, &mut rng);
+                    mutate(&mut child_seq, &layout, &mut rng, &multi_steps);
+                    // println!("    Mutated: {:?} -> {:?}", pre_mutation, child_seq);
                 }
-                if rng.gen::<f64>() < params.mutation_rate {
-                    mutation_same_nonce_flip(&mut child_seq, &buckets, &mut rng);
-                    child_seq = repair_to_nonce_valid(&child_seq, &buckets);
+
+                // ensure uniqueness in next_population
+                if !seen_next.insert(child_seq.clone()) {
+                    // try mutating again a couple of times
+                    let mut accepted = false;
+                    for _ in 0..2 {
+                        let mut candidate_child = child_seq.clone();
+                        mutate(&mut candidate_child, &layout, &mut rng, &multi_steps);
+                        if seen_next.insert(candidate_child.clone()) {
+                            child_seq = candidate_child;
+                            accepted = true;
+                            break;
+                        }
+                    }
+                    if !accepted {
+                        // last resort: insert a new random individual
+                        child_seq = random_interleaving_with_random_choices(&layout, &mut rng);
+                        // extremely unlikely to still collide, but just in case:
+                        if !seen_next.insert(child_seq.clone()) {
+                            continue; // skip and let the while loop create another child
+                        }
+                    }
                 }
-                println!("    Mutation: {:?} -> {:?}", pre_mutation, child_seq);
 
                 next_population.push(Individual { seq: child_seq, fitness: None });
             }
@@ -808,13 +1225,18 @@ impl<'a> ResolverContext<'a> {
             }
             let spent = Instant::now().saturating_duration_since(start).as_millis() as u64;
             if gens_since_improve >= plateau_patience && spent >= params.time_ms / 2 {
-                println!("Task {} stopping early at generation {} due to plateau", task.group.id, generation);
+                println!("Group {} stopping early at generation {} due to plateau", task.group.id, generation);
                 println!("Plateau patience: {}, spent {}ms / {}ms", plateau_patience, spent, params.time_ms);
                 break;
             }
 
             population = next_population;
             generation += 1;
+        }
+
+        println!("GA finished after {} generations for group {}", generation, task.group.id);
+        for individual in &population {
+            println!("Final individual: seq={:?}, fitness={:?}", individual.seq, individual.fitness);
         }
 
         // Return best resolution result (recompute if needed)
@@ -848,6 +1270,10 @@ pub fn generate_sequences_of_orders_to_try(task: &ConflictTask) -> Vec<Vec<usize
             // Genetic algorithm is handled separately in ResolverContext::run_genetic
             vec![]
         }
+        Algorithm::ExhaustiveStreaming { .. } => {
+            // Exhaustive streaming is handled separately in ResolverContext::run_exhaustive_streaming
+            vec![]
+        }
     }
 }
 
@@ -864,43 +1290,41 @@ pub fn generate_sequences_of_orders_to_try(task: &ConflictTask) -> Vec<Vec<usize
 /// # Returns
 ///
 /// A vector of randomly generated sequences of order indices.
-fn generate_random_permutations(task: &ConflictTask, seed: u64, count: usize) -> Vec<Vec<usize>> {
-    let mut sequences_of_orders = vec![];
-
-    let order_group = &task.group;
-    let mut indexes = (0..order_group.orders.len()).collect::<Vec<_>>();
-    let mut rng = rand::rngs::SmallRng::seed_from_u64(seed);
-    for _ in 0..count {
-        indexes.shuffle(&mut rng);
-        sequences_of_orders.push(indexes.clone());
-    }
-
-    sequences_of_orders
-}
-
 // fn generate_random_permutations(task: &ConflictTask, seed: u64, count: usize) -> Vec<Vec<usize>> {
+//     let mut sequences_of_orders = vec![];
+
 //     let order_group = &task.group;
-
-//     if let Some(view) = build_sender_nonce_view(order_group) {
-//         let chains = build_sender_chains_best(&view, order_group);
-//         let mut rng = rand::rngs::SmallRng::seed_from_u64(seed);
-//         let mut out = Vec::with_capacity(count);
-//         for _ in 0..count {
-//             out.push(sample_one_uniform_interleaving(&chains, &mut rng));
-//         }
-//         return out;
-//     }
-
-//     // Fallback: bundles/multi-tx orders where we can't derive nonce chains
-//     let mut rng = rand::rngs::SmallRng::seed_from_u64(seed);
-//     let mut indexes: Vec<usize> = (0..order_group.orders.len()).collect();
-//     let mut out = Vec::with_capacity(count);
+//     let mut indexes = (0..order_group.orders.len()).collect::<Vec<_>>();
+//     let mut rng = SmallRng::seed_from_u64(seed);
 //     for _ in 0..count {
 //         indexes.shuffle(&mut rng);
-//         out.push(indexes.clone());
+//         sequences_of_orders.push(indexes.clone());
 //     }
-//     out
+
+//     sequences_of_orders
 // }
+
+fn generate_random_permutations(task: &ConflictTask, seed: u64, count: usize) -> Vec<Vec<usize>> {
+    // if let Some(layout) = build_nonce_layout(task) {
+    //     let mut rng = SmallRng::seed_from_u64(seed);
+    //     let mut out = Vec::with_capacity(count);
+    //     for _ in 0..count {
+    //         out.push(random_interleaving_with_random_choices(&layout, &mut rng));
+    //     }
+
+    //     return out;
+    // }
+
+    // Fallback: bundles/multi-tx orders where we can't derive nonce chains
+    let mut rng = SmallRng::seed_from_u64(seed);
+    let mut indexes: Vec<usize> = (0..task.group.orders.len()).collect();
+    let mut out = Vec::with_capacity(count);
+    for _ in 0..count {
+        indexes.shuffle(&mut rng);
+        out.push(indexes.clone());
+    }
+    out
+}
 
 
 /// Generates all possible permutations of sequences of order indices.
@@ -913,23 +1337,19 @@ fn generate_random_permutations(task: &ConflictTask, seed: u64, count: usize) ->
 ///
 /// A vector of all possible sequences of order indices.
 fn generate_all_permutations(task: &ConflictTask) -> Vec<Vec<usize>> {
-    let order_group = &task.group;
+    // if let Some(layout) = build_nonce_layout(task) {
+    //     if ALL_PERMS_INCLUDE_DUPLICATE_NONCE_CHOICES {
+    //         return enumerate_all_interleavings_with_choices(&layout, ALL_PERMS_CAP);
+    //     } else {
+    //         let per_chain = build_chains_best(&layout, &task.group);
+    //         return enumerate_all_interleavings_best(&per_chain, ALL_PERMS_CAP);
+    //     }
+    // }
 
-    if let Some(view) = build_sender_nonce_view(order_group) {
-        if ALL_PERMS_INCLUDE_DUPLICATE_NONCE_CHOICES {
-            // Interleave across nonce slots AND branch per-slot over all candidates
-            return enumerate_all_interleavings_with_choices(&view, ALL_PERMS_CAP);
-        } else {
-            // Previous behavior: pick best per slot, then interleave the chains
-            let chains = build_sender_chains_best(&view, order_group);
-            return enumerate_all_interleavings_best(&chains, ALL_PERMS_CAP);
-        }
-    }
-
-    let sequences_of_orders = (0..order_group.orders.len()).collect::<Vec<_>>();
+    let sequences_of_orders = (0..task.group.orders.len()).collect::<Vec<_>>();
     sequences_of_orders
         .into_iter()
-        .permutations(order_group.orders.len())
+        .permutations(task.group.orders.len())
         .collect()
 }
 
@@ -943,135 +1363,135 @@ fn generate_all_permutations(task: &ConflictTask) -> Vec<Vec<usize>> {
 /// # Returns
 ///
 /// A vector of static sequences of order indices, sorted by coinbase profit and mev_gas_price.
-// fn generate_greedy_sequence(task: &ConflictTask, reverse: bool) -> Vec<Vec<usize>> {
-//     let order_group = &task.group;
-
-//     let create_sequence = |value_extractor: fn(&SimulatedOrder) -> U256| {
-//         let mut ids_and_value: Vec<_> = order_group
-//             .orders
-//             .iter()
-//             .enumerate()
-//             .map(|(idx, order)| (idx, value_extractor(order)))
-//             .collect();
-
-//         ids_and_value.sort_by(|a, b| {
-//             if reverse {
-//                 a.1.cmp(&b.1)
-//             } else {
-//                 b.1.cmp(&a.1)
-//             }
-//         });
-//         ids_and_value.into_iter().map(|(idx, _)| idx).collect()
-//     };
-
-//     vec![
-//         create_sequence(|sim_order| sim_order.sim_value.coinbase_profit),
-//         create_sequence(|sim_order| sim_order.sim_value.mev_gas_price),
-//     ]
-// }
-
-
 fn generate_greedy_sequence(task: &ConflictTask, reverse: bool) -> Vec<Vec<usize>> {
-    let group = &task.group;
+    let order_group = &task.group;
 
-    // Build a single greedy preference list for the given key, filtered by
-    // key-aware per-slot dedup.
-    let build_for = |key: GreedyKey| {
-        // Only keep best-per-slot candidates according to this key+reverse.
-        let allowed = allowed_indices_after_nonce_dedup(group, key, reverse);
-
-        // Collect indices with both metrics so we can do a stable secondary tie-break.
-        let mut rows: Vec<(usize, U256, U256)> = group
+    let create_sequence = |value_extractor: fn(&SimulatedOrder) -> U256| {
+        let mut ids_and_value: Vec<_> = order_group
             .orders
             .iter()
             .enumerate()
-            .filter(|(idx, _)| allowed.as_ref().map_or(true, |set| set.contains(idx)))
-            .map(|(idx, o)| (idx, o.sim_value.coinbase_profit, o.sim_value.mev_gas_price))
+            .map(|(idx, order)| (idx, value_extractor(order)))
             .collect();
 
-        rows.sort_by(|a, b| {
-            // a: (idx, profit, gas), b: (idx, profit, gas)
-            let (pa, sa) = match key {
-                GreedyKey::Profit     => (a.1, a.2),
-                GreedyKey::MevGasPrice=> (a.2, a.1),
-            };
-            let (pb, sb) = match key {
-                GreedyKey::Profit     => (b.1, b.2),
-                GreedyKey::MevGasPrice=> (b.2, b.1),
-            };
-
-            let ord1 = if reverse { pa.cmp(&pb) } else { pb.cmp(&pa) };
-            if ord1 != std::cmp::Ordering::Equal { return ord1; }
-
-            let ord2 = if reverse { sa.cmp(&sb) } else { sb.cmp(&sa) };
-            if ord2 != std::cmp::Ordering::Equal { return ord2; }
-
-            a.0.cmp(&b.0)
+        ids_and_value.sort_by(|a, b| {
+            if reverse {
+                a.1.cmp(&b.1)
+            } else {
+                b.1.cmp(&a.1)
+            }
         });
-
-        rows.into_iter().map(|(idx, _, _)| idx).collect::<Vec<_>>()
+        ids_and_value.into_iter().map(|(idx, _)| idx).collect()
     };
 
     vec![
-        build_for(GreedyKey::Profit),
-        build_for(GreedyKey::MevGasPrice),
+        create_sequence(|sim_order| sim_order.sim_value.coinbase_profit),
+        create_sequence(|sim_order| sim_order.sim_value.mev_gas_price),
     ]
 }
 
-/// Generates length based sequences of order indices based on the length of the orders.
-/// e.g. prioritizes longer bundles first
-///
-/// # Arguments
-///
-/// * `task` - The current conflict task.
-///
-/// # Returns
-///
-/// A vector of length based sequences of order indices.
-// fn generate_length_based_sequence(task: &ConflictTask) -> Vec<Vec<usize>> {
-//     let mut sequences_of_orders = vec![];
-//     let order_group = &task.group;
 
-//     let mut order_data: Vec<(usize, usize, U256)> = order_group
-//         .orders
-//         .iter()
-//         .enumerate()
-//         .map(|(idx, order)| {
-//             (
-//                 idx,
-//                 order.order.list_txs().len(),
-//                 order.sim_value.coinbase_profit,
-//             )
-//         })
-//         .collect();
+// fn generate_greedy_sequence(task: &ConflictTask, reverse: bool) -> Vec<Vec<usize>> {
+//     let group = &task.group;
 
-//     // Sort by length (descending) and then by profit (descending) as a tie-breaker
-//     order_data.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| b.2.cmp(&a.2)));
+//     // Build a single greedy preference list for the given key, filtered by
+//     // key-aware per-slot dedup.
+//     let build_for = |key: GreedyKey| {
+//         // Only keep best-per-slot candidates according to this key+reverse.
+//         let allowed = allowed_indices_after_nonce_dedup(group, key, reverse);
 
-//     // Extract the sorted indices
-//     let length_based_sequence: Vec<usize> = order_data.into_iter().map(|(idx, _, _)| idx).collect();
+//         // Collect indices with both metrics so we can do a stable secondary tie-break.
+//         let mut rows: Vec<(usize, U256, U256)> = group
+//             .orders
+//             .iter()
+//             .enumerate()
+//             .filter(|(idx, _)| allowed.as_ref().map_or(true, |set| set.contains(idx)))
+//             .map(|(idx, o)| (idx, o.sim_value.coinbase_profit, o.sim_value.mev_gas_price))
+//             .collect();
 
-//     sequences_of_orders.push(length_based_sequence);
-//     sequences_of_orders
+//         rows.sort_by(|a, b| {
+//             // a: (idx, profit, gas), b: (idx, profit, gas)
+//             let (pa, sa) = match key {
+//                 GreedyKey::Profit     => (a.1, a.2),
+//                 GreedyKey::MevGasPrice=> (a.2, a.1),
+//             };
+//             let (pb, sb) = match key {
+//                 GreedyKey::Profit     => (b.1, b.2),
+//                 GreedyKey::MevGasPrice=> (b.2, b.1),
+//             };
+
+//             let ord1 = if reverse { pa.cmp(&pb) } else { pb.cmp(&pa) };
+//             if ord1 != std::cmp::Ordering::Equal { return ord1; }
+
+//             let ord2 = if reverse { sa.cmp(&sb) } else { sb.cmp(&sa) };
+//             if ord2 != std::cmp::Ordering::Equal { return ord2; }
+
+//             a.0.cmp(&b.0)
+//         });
+
+//         rows.into_iter().map(|(idx, _, _)| idx).collect::<Vec<_>>()
+//     };
+
+//     vec![
+//         build_for(GreedyKey::Profit),
+//         build_for(GreedyKey::MevGasPrice),
+//     ]
 // }
 
-
+// / Generates length based sequences of order indices based on the length of the orders.
+// / e.g. prioritizes longer bundles first
+// /
+// / # Arguments
+// /
+// / * `task` - The current conflict task.
+// /
+// / # Returns
+// /
+// / A vector of length based sequences of order indices.
 fn generate_length_based_sequence(task: &ConflictTask) -> Vec<Vec<usize>> {
+    let mut sequences_of_orders = vec![];
     let order_group = &task.group;
-    let allowed = allowed_indices_after_nonce_dedup(order_group, GreedyKey::Profit, false);
 
     let mut order_data: Vec<(usize, usize, U256)> = order_group
         .orders
         .iter()
         .enumerate()
-        .filter(|(idx, _)| allowed.as_ref().map_or(true, |set| set.contains(idx)))
-        .map(|(idx, order)| (idx, order.order.list_txs().len(), order.sim_value.coinbase_profit))
+        .map(|(idx, order)| {
+            (
+                idx,
+                order.order.list_txs().len(),
+                order.sim_value.coinbase_profit,
+            )
+        })
         .collect();
 
+    // Sort by length (descending) and then by profit (descending) as a tie-breaker
     order_data.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| b.2.cmp(&a.2)));
-    let seq: Vec<usize> = order_data.into_iter().map(|(idx, _, _)| idx).collect();
-    vec![seq]
+
+    // Extract the sorted indices
+    let length_based_sequence: Vec<usize> = order_data.into_iter().map(|(idx, _, _)| idx).collect();
+
+    sequences_of_orders.push(length_based_sequence);
+    sequences_of_orders
 }
+
+
+// fn generate_length_based_sequence(task: &ConflictTask) -> Vec<Vec<usize>> {
+//     let order_group = &task.group;
+//     let allowed = allowed_indices_after_nonce_dedup(order_group, GreedyKey::Profit, false);
+
+//     let mut order_data: Vec<(usize, usize, U256)> = order_group
+//         .orders
+//         .iter()
+//         .enumerate()
+//         .filter(|(idx, _)| allowed.as_ref().map_or(true, |set| set.contains(idx)))
+//         .map(|(idx, order)| (idx, order.order.list_txs().len(), order.sim_value.coinbase_profit))
+//         .collect();
+
+//     order_data.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| b.2.cmp(&a.2)));
+//     let seq: Vec<usize> = order_data.into_iter().map(|(idx, _, _)| idx).collect();
+//     vec![seq]
+// }
 
 
 #[cfg(test)]
@@ -1259,25 +1679,25 @@ mod tests {
     /// - length == total_slots
     /// - uses exactly one candidate per (chain, slot)
     /// - per-chain slot order strictly increasing by slot index
-    fn assert_nonce_valid(seq: &[usize], buckets: &NonceBuckets) {
-        assert_eq!(seq.len(), buckets.total_slots, "length mismatch");
+    fn assert_nonce_valid(seq: &[usize], layout: &NonceLayout) {
+        assert_eq!(seq.len(), layout.total_steps, "length mismatch");
 
-        let _k = buckets.chains_slots.len();
-        let mut expected_slot: Vec<usize> = buckets.chains_slots.iter().map(|_ch| 0usize).collect();
+        let _k = layout.chains.len();
+        let mut expected_slot: Vec<usize> = layout.chains.iter().map(|_ch| 0usize).collect();
         let mut seen: HashSet<usize> = HashSet::default();
 
         for &idx in seq {
             assert!(seen.insert(idx), "duplicate index in sequence");
-            let (c, s) = buckets.idx_to_chain_slot[&idx];
+            let (c, s) = layout.index_of[&idx];
             // Must be the next expected slot for this chain
             assert_eq!(s, expected_slot[c], "slot order broken for chain {}", c);
             // idx must belong to that bucket
-            assert!(buckets.chains_slots[c][s].contains(&idx), "idx not in its bucket");
+            assert!(layout.chains[c].steps[s].candidates.contains(&idx), "idx not in its bucket");
             expected_slot[c] += 1;
         }
 
         for (c, exp) in expected_slot.into_iter().enumerate() {
-            assert_eq!(exp, buckets.chains_slots[c].len(), "did not cover all slots for chain {}", c);
+            assert_eq!(exp, layout.chains[c].steps.len(), "did not cover all slots for chain {}", c);
         }
     }
 
@@ -1416,13 +1836,12 @@ mod tests {
         );
 
         // Buckets
-        let buckets = build_nonce_buckets(&task).expect("nonce view present");
-        assert_eq!(buckets.total_slots, 4);
+        let layout = build_nonce_layout(&task).expect("nonce view present");
+        assert_eq!(layout.total_steps, 4);
 
         // Create two valid parents manually:
         // First, pick "best per slot" via helper to get one candidate per nonce.
-        let view = build_sender_nonce_view(&group).unwrap();
-        let chains_best = build_sender_chains_best(&view, &group);
+        let chains_best = build_chains_best(&layout, &group);
 
         // Parent A interleaving: A0, B0, A1, B1
         let parent_a = vec![chains_best[0][0], chains_best[1][0], chains_best[0][1], chains_best[1][1]];
@@ -1430,33 +1849,32 @@ mod tests {
         let parent_b = vec![chains_best[1][0], chains_best[0][0], chains_best[1][1], chains_best[0][1]];
 
         // Child from PPX-style builder
-        let child = ppx_build_child_from_parents(&parent_a, &parent_b, &buckets);
-        assert_nonce_valid(&child, &buckets);
+        let child = ppx_build_child_from_parents_greedy(&parent_a, &parent_b, &layout);
+        assert_nonce_valid(&child, &layout);
     }
 
     #[test]
     fn test_same_nonce_flip_mutation_preserves_validity_and_changes_candidate() {
         let group = make_group_with_duplicate_buckets();
         let task = create_mock_task(0, group.clone(), Algorithm::Greedy, TaskPriority::Low, Instant::now());
-        let buckets = build_nonce_buckets(&task).expect("nonce view present");
 
         // Start from a valid interleaving (best-per-slot, simple A0,B0,A1,B1)
-        let view = build_sender_nonce_view(&group).unwrap();
-        let chains_best = build_sender_chains_best(&view, &group);
+        let layout = NonceLayout::from_group(&group).unwrap();
+        let chains_best = build_chains_best(&layout, &group);
         let seq = vec![chains_best[0][0], chains_best[1][0], chains_best[0][1], chains_best[1][1]];
-        assert_nonce_valid(&seq, &buckets);
+        assert_nonce_valid(&seq, &layout);
 
         // There are at least two slots with multiple candidates (A:nonce0, B:nonce1).
-        let mut rng = rand::rngs::SmallRng::seed_from_u64(12345);
+        let mut rng = SmallRng::seed_from_u64(12345);
 
         // Try flipping until we observe a change (bounded attempts to avoid flakiness).
         let original = seq.clone();
         let mut changed = false;
         for _ in 0..20 {
             let mut tmp = seq.clone();
-            mutation_same_nonce_flip(&mut tmp, &buckets, &mut rng);
+            mutation_same_nonce_flip(&mut tmp, &layout, &mut rng);
             if tmp != original {
-                assert_nonce_valid(&tmp, &buckets);
+                assert_nonce_valid(&tmp, &layout);
                 changed = true;
                 break;
             }
@@ -1468,39 +1886,34 @@ mod tests {
     fn test_inter_sender_swap_mutation_preserves_validity() {
         let group = make_group_with_duplicate_buckets();
         let task = create_mock_task(0, group.clone(), Algorithm::Greedy, TaskPriority::Low, Instant::now());
-        let buckets = build_nonce_buckets(&task).expect("nonce view present");
+        let layout = NonceLayout::from_group(&group).unwrap();
+        let chains_best = build_chains_best(&layout, &group);
 
-        // Build an initial valid sequence
-        let view = build_sender_nonce_view(&group).unwrap();
-        let chains_best = build_sender_chains_best(&view, &group);
         let mut seq = vec![chains_best[0][0], chains_best[1][0], chains_best[0][1], chains_best[1][1]];
-        assert_nonce_valid(&seq, &buckets);
+        assert_nonce_valid(&seq, &layout);
 
-        let mut rng = rand::rngs::SmallRng::seed_from_u64(777);
+        let mut rng = SmallRng::seed_from_u64(777);
         let before = seq.clone();
-        mutation_inter_sender_swap(&mut seq, &buckets, &mut rng);
+        mutation_inter_sender_swap(&mut seq, &layout, &mut rng);
 
         // Must remain valid
-        assert_nonce_valid(&seq, &buckets);
-        // It may or may not change (depends on ranks); accept both, but at least it's valid.
-        // If you want to enforce change, you could run multiple attempts here.
-        let _maybe_changed = seq != before;
+        assert_nonce_valid(&seq, &layout);
     }
 
     #[test]
     fn test_seed_initial_population_validity_and_uniqueness() {
         let group = make_group_with_duplicate_buckets();
         let task = create_mock_task(0, group.clone(), Algorithm::Greedy, TaskPriority::Low, Instant::now());
-        let buckets = build_nonce_buckets(&task).expect("nonce view present");
+        let layout = NonceLayout::from_group(&group).unwrap();
 
-        let mut rng = rand::rngs::SmallRng::seed_from_u64(999);
+        let mut rng = SmallRng::seed_from_u64(999);
         let population_size = 2;
-        let seeds = seed_initial_population(&task, &buckets, population_size, &mut rng);
+        let seeds = seed_initial_population(&task, &layout, population_size, &mut rng);
 
         assert_eq!(seeds.len(), population_size);
         let mut uniq: HashSet<Vec<usize>> = HashSet::default();
         for s in &seeds {
-            assert_nonce_valid(s, &buckets);
+            assert_nonce_valid(s, &layout);
             assert!(uniq.insert(s.clone()), "duplicate initial individual");
         }
     }

@@ -28,7 +28,6 @@ impl StateCache {
     pub async fn new(db_path: &Path) -> Result<Self, sqlx::Error> {
         // Ensure the parent directory exists.
         if let Some(parent) = db_path.parent() {
-            // Use tokio's async fs operation.
             tokio::fs::create_dir_all(parent).await.map_err(sqlx::Error::Io)?;
         }
 
@@ -77,9 +76,7 @@ impl StateCache {
         }
     }
 
-    /// Serializes and sets a value in the cache using an "upsert".
     pub async fn set<T: Serialize>(&self, key: &str, value: &T) -> Result<(), sqlx::Error> {
-        // FIX: Map the bincode error to a valid sqlx::Error variant, like Protocol.
         let blob = bincode::serialize(value).map_err(|e| sqlx::Error::Protocol(e.to_string()))?;
 
         sqlx::query(
@@ -104,19 +101,16 @@ pub struct CacheAccessor<T> {
 
 impl<T> CacheAccessor<T>
 where
-    // Add `Send` bound because it's used across await points.
     T: Serialize + DeserializeOwned + Send,
 {
     pub fn new(cache: StateCache) -> Self {
         Self { cache, _phantom: PhantomData }
     }
 
-    /// Gets a value from the cache. This is now an async operation.
     pub async fn get(&self, key: &str) -> Option<T> {
         self.cache.get(key).await.unwrap_or(None)
     }
 
-    /// Sets a value in the cache. This is now an async operation.
     pub async fn set(&self, key: &str, value: &T) {
         if let Err(e) = self.cache.set(key, value).await {
             eprintln!("Failed to write to cache: {}", e);
@@ -124,19 +118,19 @@ where
     }
 }
 
-// Type aliases for different cache accessors remain the same for readability.
 pub type AccountCache = CacheAccessor<Account>;
 pub type StorageCache = CacheAccessor<U256>;
 pub type BytecodeCache = CacheAccessor<Bytecode>;
 pub type BlockHashCache = CacheAccessor<B256>;
+pub type HeaderCache = CacheAccessor<reth_primitives::Header>;
 
-/// A convenient container for all cache accessors.
 #[derive(Clone)]
 pub struct CacheDB {
     pub accounts: AccountCache,
     pub storage: StorageCache,
     pub bytecode: BytecodeCache,
     pub block_hashes: BlockHashCache,
+    pub headers: HeaderCache,
 }
 
 impl CacheDB {
@@ -146,7 +140,8 @@ impl CacheDB {
             accounts: AccountCache::new(cache.clone()),
             storage: StorageCache::new(cache.clone()),
             bytecode: BytecodeCache::new(cache.clone()),
-            block_hashes: BlockHashCache::new(cache),
+            block_hashes: BlockHashCache::new(cache.clone()),
+            headers: HeaderCache::new(cache.clone()),
         }
     }
 }

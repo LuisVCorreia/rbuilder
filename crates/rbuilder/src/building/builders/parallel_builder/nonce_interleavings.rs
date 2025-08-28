@@ -1,15 +1,27 @@
-use ahash::HashMap;
+//! Nonce-aware interleaving utilities.
+//!
+//! Terminology:
+//! - A SenderChain is all transactions from one sender, ordered by nonce ascending.
+//! - A NonceStep is a single nonce position within a SenderChain.
+//!   If a sender submitted multiple distinct txs with the same nonce, that step has multiple candidates.
+//!
+//! We interleave steps from different chains while preserving per-chain order (nonce increases).
+//! When duplicate-nonce candidates exist, we may either:
+//!   - pick one candidate per step (best-by metric or random), then interleave (enumerate_best),
+//!   - or branch across all per-step candidates as we interleave (enumerate_with_choices).
+
+use ahash::{HashMap, HashSet as AHashSet};
 use alloy_primitives::{Address, U256};
+use libc::group;
 use std::collections::BTreeMap;
 
 use crate::primitives::SimulatedOrder;
-
 use super::ConflictGroup;
 
 pub const ALL_PERMS_CAP: usize = 120;
 
-/// (sender, nonce) extraction from a single-tx order.
-/// Returns None for bundles / multi-tx orders.
+/// (sender, nonce) extraction from a single-tx order
+/// Returns None for bundles / multi-tx orders
 pub fn sender_and_nonce(order: &SimulatedOrder) -> Option<(Address, u64)> {
     let txs = order.order.list_txs();
     if txs.len() != 1 {
@@ -19,55 +31,93 @@ pub fn sender_and_nonce(order: &SimulatedOrder) -> Option<(Address, u64)> {
     Some((tx.signer(), tx.nonce()))
 }
 
-/// For each sender, we keep a chain of "nonce slots", and each slot has
-/// the list of candidate order indices (duplicate nonces -> multiple candidates).
 #[derive(Debug, Clone)]
-pub struct SenderNonceView {
-    /// chains_slots[sender_idx][slot_idx] = Vec<order_idx> (candidates at that nonce)
-    pub chains_slots: Vec<Vec<Vec<usize>>>,
+pub struct NonceStep {
+    /// The nonce value at this step (asc for each chain)
+    pub nonce: u64,
+    /// Candidate order indices for this (sender, nonce)
+    pub candidates: Vec<usize>,
 }
 
-impl SenderNonceView {
+#[derive(Debug, Clone)]
+pub struct SenderChain {
+    /// Sender address for this chain
+    pub sender: Address,
+    /// Ascending sequence of nonce steps
+    pub steps: Vec<NonceStep>,
+}
+
+#[derive(Debug, Clone)]
+pub struct NonceLayout {
+    /// All sender chains in this group (order of chains is arbitrary)
+    pub chains: Vec<SenderChain>,
+    /// Reverse lookup: order index -> (chain_id, step_id)
+    pub index_of: HashMap<usize, (usize, usize)>,
+    /// Total number of steps across all chains (i.e., length of any valid interleaving)
+    pub total_steps: usize,
+}
+
+impl NonceLayout {
+    /// Build from `ConflictGroup`. Returns None when we cannot derive (sender,nonce) for some order
+    pub fn from_group(group: &ConflictGroup) -> Option<Self> {
+        let mut by_sender: HashMap<Address, BTreeMap<u64, Vec<usize>>> = HashMap::default();
+        for (idx, o) in group.orders.iter().enumerate() {
+            let (sender, nonce) = sender_and_nonce(o)?;
+            by_sender.entry(sender).or_default().entry(nonce).or_default().push(idx);
+        }
+
+        let mut chains = Vec::with_capacity(by_sender.len());
+        let mut index_of: HashMap<usize, (usize, usize)> = HashMap::default();
+
+        for (sender, by_nonce) in by_sender {
+            let mut steps = Vec::with_capacity(by_nonce.len());
+            for (nonce, indices) in by_nonce {
+                steps.push(NonceStep { nonce, candidates: indices.clone() });
+            }
+            chains.push(SenderChain { sender, steps });
+        }
+
+        let mut total_steps = 0usize;
+        for (ci, ch) in chains.iter().enumerate() {
+            for (si, st) in ch.steps.iter().enumerate() {
+                total_steps += 1;
+                for &idx in &st.candidates {
+                    index_of.insert(idx, (ci, si));
+                }
+            }
+        }
+
+        Some(Self { chains, index_of, total_steps })
+    }
+
+    #[inline]
     pub fn chain_lengths(&self) -> Vec<usize> {
-        self.chains_slots.iter().map(|c| c.len()).collect()
+        self.chains.iter().map(|c| c.steps.len()).collect()
     }
-    pub fn total_slots(&self) -> usize {
-        self.chains_slots.iter().map(|c| c.len()).sum()
-    }
-    /// Multiplicity of each slot across all senders (for counting "with choice").
-    pub fn slot_multiplicities(&self) -> Vec<usize> {
-        let mut v = Vec::new();
-        for chain in &self.chains_slots {
-            for slot in chain {
-                v.push(slot.len());
+
+    #[inline]
+    pub fn multiplicities(&self) -> Vec<usize> {
+        let mut v = Vec::with_capacity(self.total_steps);
+        for ch in &self.chains {
+            for st in &ch.steps {
+                v.push(st.candidates.len());
             }
         }
         v
     }
-}
 
-/// Build a full (sender -> nonce -> [indices]) view, with nonces sorted asc per sender.
-/// Returns None when we cannot derive (sender, nonce) for any order.
-pub fn build_sender_nonce_view(group: &ConflictGroup) -> Option<SenderNonceView> {
-    // sender -> (nonce -> Vec<idx>)
-    let mut by_sender: HashMap<Address, BTreeMap<u64, Vec<usize>>> = HashMap::default();
-
-    for (idx, o) in group.orders.iter().enumerate() {
-        let (sender, nonce) = sender_and_nonce(o)?;
-        by_sender.entry(sender).or_default().entry(nonce).or_default().push(idx);
-    }
-
-    let mut chains_slots: Vec<Vec<Vec<usize>>> = Vec::with_capacity(by_sender.len());
-    for (_sender, by_nonce) in by_sender {
-        // BTreeMap keeps keys ordered by nonce asc
-        let mut chain: Vec<Vec<usize>> = Vec::with_capacity(by_nonce.len());
-        for (_nonce, indices) in by_nonce {
-            chain.push(indices);
+    /// Return all (chain_id, step_id) where there are duplicate-nonce choices (multiplicity > 1)
+    pub fn multi_steps(&self) -> Vec<(usize, usize)> {
+        let mut out = Vec::new();
+        for (ci, ch) in self.chains.iter().enumerate() {
+            for (si, st) in ch.steps.iter().enumerate() {
+                if st.candidates.len() > 1 {
+                    out.push((ci, si));
+                }
+            }
         }
-        chains_slots.push(chain);
+        out
     }
-
-    Some(SenderNonceView { chains_slots })
 }
 
 
@@ -82,11 +132,12 @@ pub fn value_for(key: GreedyKey, o: &SimulatedOrder) -> U256 {
     }
 }
 
-/// Choose one candidate per (sender,nonce) slot using the given metric and direction.
+
+/// Choose one candidate per (sender,nonce) step using the given metric and direction.
 /// Primary key = `key` (max by default, min if `reverse`), secondary = the other metric
 /// (same direction), then stable tie-break by lowest index.
-pub fn build_sender_chains_best_by(
-    view: &SenderNonceView,
+pub fn build_chains_best_by(
+    layout: &NonceLayout,
     group: &ConflictGroup,
     key: GreedyKey,
     reverse: bool,
@@ -115,42 +166,36 @@ pub fn build_sender_chains_best_by(
         }
     };
 
-    let mut out: Vec<Vec<usize>> = Vec::with_capacity(view.chains_slots.len());
-    for chain in &view.chains_slots {
-        let mut best_chain: Vec<usize> = Vec::with_capacity(chain.len());
-        for slot in chain {
-            let mut best_idx = slot[0];
-            for &cand in slot.iter().skip(1) {
-                if better(cand, best_idx) {
-                    best_idx = cand;
-                }
+    let mut out: Vec<Vec<usize>> = Vec::with_capacity(layout.chains.len());
+    for ch in &layout.chains {
+        let mut picks: Vec<usize> = Vec::with_capacity(ch.steps.len());
+        for st in &ch.steps {
+            let mut best = st.candidates[0];
+            for &cand in st.candidates.iter().skip(1) {
+                if better(cand, best) { best = cand; }
             }
-            best_chain.push(best_idx);
+            picks.push(best);
         }
-        out.push(best_chain);
+        out.push(picks);
     }
     out
 }
 
 #[inline]
-pub fn build_sender_chains_best(
-    view: &SenderNonceView,
-    group: &ConflictGroup,
-) -> Vec<Vec<usize>> {
-    build_sender_chains_best_by(view, group, GreedyKey::Profit, false)
+pub fn build_chains_best(layout: &NonceLayout, group: &ConflictGroup) -> Vec<Vec<usize>> {
+    build_chains_best_by(layout, group, GreedyKey::Profit, false)
 }
 
-
-/// HashSet of all indices that survive the best-per-slot dedup (useful for Greedy filters).
-pub fn allowed_indices_after_nonce_dedup(group: &ConflictGroup, key: GreedyKey, reverse: bool) -> Option<ahash::HashSet<usize>> {
-    let view = build_sender_nonce_view(group)?;
-    let chains = build_sender_chains_best_by(&view, group, key, reverse);
-    let mut set = ahash::HashSet::default();
-    for ch in chains {
-        for i in ch {
-            set.insert(i);
-        }
-    }
+/// HashSet of all indices that survive the best-per-step dedup (useful for Greedy filters).
+pub fn allowed_indices_after_nonce_dedup(
+    group: &ConflictGroup,
+    key: GreedyKey,
+    reverse: bool,
+) -> Option<AHashSet<usize>> {
+    let layout = NonceLayout::from_group(group)?;
+    let chains = build_chains_best_by(&layout, group, key, reverse);
+    let mut set = AHashSet::default();
+    for ch in chains { for i in ch { set.insert(i); } }
     Some(set)
 }
 
@@ -168,11 +213,10 @@ pub fn interleavings_leq_cap(lengths: &[usize], cap: usize) -> bool {
     ln_mult <= (cap as f64).ln() + 1e-12
 }
 
-/// Compact stats for dedupbed interleavings and "with duplicate choices".
 #[derive(Debug, Clone)]
 pub struct InterleavingStats {
     pub chain_lengths: Vec<usize>,
-    pub n_slots: usize,
+    pub n_steps: usize,
     pub ln_multinomial: f64,
     pub ln_with_choice: f64,
     pub multiplicities: Vec<usize>,
@@ -180,20 +224,20 @@ pub struct InterleavingStats {
 
 /// Compute interleavings stats from the group (nonce-aware).
 pub fn compute_interleaving_stats(group: &ConflictGroup) -> Option<InterleavingStats> {
-    let view = build_sender_nonce_view(group)?;
-    let chain_lengths = view.chain_lengths();
-    let n_slots = chain_lengths.iter().sum();
-    let ln_n = ln_fact(n_slots);
+    let layout = NonceLayout::from_group(group)?;
+    let chain_lengths = layout.chain_lengths();
+    let n_steps = chain_lengths.iter().sum();
+    let ln_n = ln_fact(n_steps);
     let ln_den: f64 = chain_lengths.iter().map(|&l| ln_fact(l)).sum();
     let ln_multinomial = ln_n - ln_den;
 
-    let multiplicities = view.slot_multiplicities();
+    let multiplicities = layout.multiplicities();
     let ln_with_choice = ln_multinomial
         + multiplicities.iter().map(|&m| (m as f64).ln()).sum::<f64>();
 
     Some(InterleavingStats {
         chain_lengths,
-        n_slots,
+        n_steps,
         ln_multinomial,
         ln_with_choice,
         multiplicities,
@@ -215,18 +259,16 @@ pub fn format_approx_from_ln(ln_count: f64) -> String {
     format!("{:.3}e{:+.0}", mant, expo)
 }
 
-/// Enumerate all interleavings (dedupbed: 1 best candidate per slot).
-/// `chains` is the result of `build_sender_chains_best`.
-pub fn enumerate_all_interleavings_best(chains: &[Vec<usize>], cap: usize) -> Vec<Vec<usize>> {
-    let k = chains.len();
+pub fn enumerate_all_interleavings_best(per_chain: &[Vec<usize>], cap: usize) -> Vec<Vec<usize>> {
+    let k = per_chain.len();
     if k == 0 { return vec![]; }
-    let total: usize = chains.iter().map(|c| c.len()).sum();
+    let total: usize = per_chain.iter().map(|c| c.len()).sum();
     let mut cursors = vec![0usize; k];
     let mut cur: Vec<usize> = Vec::with_capacity(total);
     let mut out: Vec<Vec<usize>> = Vec::new();
 
     fn dfs(
-        chains: &[Vec<usize>],
+        per_chain: &[Vec<usize>],
         cursors: &mut [usize],
         cur: &mut Vec<usize>,
         total: usize,
@@ -237,68 +279,147 @@ pub fn enumerate_all_interleavings_best(chains: &[Vec<usize>], cap: usize) -> Ve
             out.push(cur.clone());
             return;
         }
-        for ci in 0..chains.len() {
-            if cursors[ci] < chains[ci].len() {
-                let x = chains[ci][cursors[ci]];
+        for ci in 0..per_chain.len() {
+            if cursors[ci] < per_chain[ci].len() {
+                let x = per_chain[ci][cursors[ci]];
                 cursors[ci] += 1;
                 cur.push(x);
-                dfs(chains, cursors, cur, total, out, cap);
+                dfs(per_chain, cursors, cur, total, out, cap);
                 cur.pop();
                 cursors[ci] -= 1;
-
-                if out.len() >= cap {
-                    return;
-                }
+                if out.len() >= cap { return; }
             }
         }
     }
 
-    dfs(chains, &mut cursors, &mut cur, total, &mut out, cap);
+    dfs(per_chain, &mut cursors, &mut cur, total, &mut out, cap);
     out
 }
 
-/// Enumerate all interleavings with choices per duplicate nonce slot.
-/// Each time we take the next slot from some sender, we branch over all candidates in that slot.
-pub fn enumerate_all_interleavings_with_choices(view: &SenderNonceView, cap: usize) -> Vec<Vec<usize>> {
-    let k = view.chains_slots.len();
-    if k == 0 { return vec![]; }
-    let total: usize = view.total_slots();
-    let mut pos = vec![0usize; k]; // which slot index we are on for each sender
-    let mut cur: Vec<usize> = Vec::with_capacity(total);
+/// Build one uniformly random nonce-respecting interleaving from `per_chain`
+/// (one chosen candidate per step already).
+pub fn sample_one_uniform_interleaving(per_chain: &[Vec<usize>], rng: &mut rand::rngs::SmallRng) -> Vec<usize> {
+    use rand::Rng;
+    let k = per_chain.len();
+    let total: usize = per_chain.iter().map(|c| c.len()).sum();
+    let mut cursors = vec![0usize; k];
+    let mut remains: Vec<usize> = per_chain.iter().map(|c| c.len()).collect();
+    let mut seq: Vec<usize> = Vec::with_capacity(total);
+
+    for _ in 0..total {
+        let total_rem: usize = remains.iter().sum();
+        debug_assert!(total_rem > 0);
+
+        let mut r = rng.gen_range(0..total_rem);
+        let mut chosen = 0usize;
+        for i in 0..k {
+            let w = remains[i];
+            if w == 0 { continue; }
+            if r < w { chosen = i; break; }
+            r -= w;
+        }
+
+        let idx = per_chain[chosen][cursors[chosen]];
+        cursors[chosen] += 1;
+        remains[chosen] -= 1;
+        seq.push(idx);
+    }
+
+    seq
+}
+
+/// Enumerate all interleavings with per-step choices (branches on duplicate-nonce steps).
+pub fn enumerate_all_interleavings_with_choices(layout: &NonceLayout, cap: usize) -> Vec<Vec<usize>> {
+    struct Frame { next_i: usize, applied_chain: Option<usize> }
+
+    let n_chains = layout.chains.len();
+    if n_chains == 0 { return vec![]; }
+    let total = layout.total_steps;
+
+    let mut cursors = vec![0usize; n_chains]; // next step per chain
+    let mut seq: Vec<usize> = Vec::with_capacity(total);
+    let mut stack: Vec<Frame> = vec![Frame { next_i: 0, applied_chain: None }];
     let mut out: Vec<Vec<usize>> = Vec::new();
 
-    fn dfs(
-        view: &SenderNonceView,
-        pos: &mut [usize],
-        cur: &mut Vec<usize>,
-        total: usize,
-        out: &mut Vec<Vec<usize>>,
-        cap: usize,
-    ) {
-        if cur.len() == total {
-            out.push(cur.clone());
-            return;
+    let ready_count = |cursors: &[usize], layout: &NonceLayout| -> usize {
+        let mut tot = 0usize;
+        for (ci, ch) in layout.chains.iter().enumerate() {
+            let s = cursors[ci];
+            if s < ch.steps.len() { tot += ch.steps[s].candidates.len(); }
         }
-        for ci in 0..view.chains_slots.len() {
-            let p = pos[ci];
-            if p < view.chains_slots[ci].len() {
-                // we can take this sender's next slot; branch on all candidates in that slot
-                let candidates = &view.chains_slots[ci][p];
-                for &idx in candidates {
-                    pos[ci] += 1;
-                    cur.push(idx);
-                    dfs(view, pos, cur, total, out, cap);
-                    cur.pop();
-                    pos[ci] -= 1;
+        tot
+    };
 
-                    if out.len() >= cap {
-                        return;
-                    }
-                }
+    let nth_ready = |mut n: usize, cursors: &[usize], layout: &NonceLayout| -> (usize, usize) {
+        for (ci, ch) in layout.chains.iter().enumerate() {
+            let s = cursors[ci];
+            if s >= ch.steps.len() { continue; }
+            let len = ch.steps[s].candidates.len();
+            if n < len { return (ci, n); }
+            n -= len;
+        }
+        unreachable!("nth_ready called with n >= ready_count()");
+    };
+
+    loop {
+        if stack.is_empty() { break; }
+        let mut frame = stack.pop().unwrap();
+        let tot_ready = ready_count(&cursors, layout);
+
+        if frame.next_i >= tot_ready {
+            if let Some(chain) = frame.applied_chain {
+                seq.pop();
+                cursors[chain] -= 1;
             }
+            continue;
+        }
+
+        let (chain, pos_in_bucket) = nth_ready(frame.next_i, &cursors, layout);
+        frame.next_i += 1;
+        stack.push(frame);
+
+        let step = cursors[chain];
+        let cand = layout.chains[chain].steps[step].candidates[pos_in_bucket];
+        seq.push(cand);
+        cursors[chain] += 1;
+
+        if seq.len() == total {
+            out.push(seq.clone());
+            seq.pop();
+            cursors[chain] -= 1;
+            if out.len() >= cap { break; }
+        } else {
+            stack.push(Frame { next_i: 0, applied_chain: Some(chain) });
         }
     }
 
-    dfs(view, &mut pos, &mut cur, total, &mut out, cap);
     out
+}
+
+
+/// Pick 1 random candidate per step, then interleave uniformly across chains
+pub fn random_interleaving_with_random_choices(
+    layout: &NonceLayout,
+    rng: &mut rand::rngs::SmallRng,
+) -> Vec<usize> {
+    use rand::Rng;
+    let mut per_chain: Vec<Vec<usize>> = Vec::with_capacity(layout.chains.len());
+    for ch in &layout.chains {
+        let mut picks = Vec::with_capacity(ch.steps.len());
+        for st in &ch.steps {
+            let cand = st.candidates[rng.gen_range(0..st.candidates.len())];
+            picks.push(cand);
+        }
+        per_chain.push(picks);
+    }
+    sample_one_uniform_interleaving(&per_chain, rng)
+}
+
+
+pub fn is_simple_chain(group: &ConflictGroup) -> bool {
+    if let Some(layout) = NonceLayout::from_group(group) {
+        layout.chains.len() == 1 && group.orders.len() == layout.chains[0].steps.len()
+    } else {
+        false
+    }
 }

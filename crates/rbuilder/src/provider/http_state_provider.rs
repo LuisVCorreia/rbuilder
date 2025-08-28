@@ -194,24 +194,7 @@ impl StateProvider for HttpStateProvider {
     fn bytecode_by_hash(&self, code_hash: &B256) -> ProviderResult<Option<Bytecode>> {
         let cache_key = format!("bytecode:{:?}:{:?}", self.hash, code_hash);
         block_on_compat(async {
-            if let Some(cached_bytecode) = self.cache_db.bytecode.get(&cache_key).await {
-                return Ok(Some(cached_bytecode));
-            }
-            let block_id = BlockId::hash(self.hash);
-            let code_hash_val = *code_hash;
-            let code: Option<Bytes> = self.provider
-                .client()
-                .request("debug_codeByHash", (code_hash_val, block_id))
-                .await
-                .map_err(|e| ProviderError::Other(AnyError::new(e)))?;
-            match code {
-                Some(bytes) if !bytes.is_empty() => {
-                    let bytecode = Bytecode::new_raw(bytes);
-                    self.cache_db.bytecode.set(&cache_key, &bytecode).await;
-                    Ok(Some(bytecode))
-                }
-                _ => Ok(None),
-            }
+            Ok(self.cache_db.bytecode.get(&cache_key).await)
         })
     }
     
@@ -263,12 +246,23 @@ impl AccountReader for HttpStateProvider {
             let (balance_res, nonce_res, code_res) = tokio::join!(
                 self.provider.get_balance(*address).block_id(block_id),
                 self.provider.get_transaction_count(*address).block_id(block_id),
-                self.provider.get_code_at(*address).block_id(block_id)
+                self.provider.get_code_at(*address).block_id(block_id),
             );
             let balance = balance_res.map_err(|e| ProviderError::Other(AnyError::new(e)))?;
-            let nonce = nonce_res.map_err(|e| ProviderError::Other(AnyError::new(e)))?;
-            let code = code_res.map_err(|e| ProviderError::Other(AnyError::new(e)))?;
-            let bytecode_hash = if code.is_empty() { None } else { Some(alloy_primitives::keccak256(&code)) };
+            let nonce   = nonce_res  .map_err(|e| ProviderError::Other(AnyError::new(e)))?;
+            let code    = code_res   .map_err(|e| ProviderError::Other(AnyError::new(e)))?;
+
+            // If there is code, compute its hash and *store the bytecode by hash* in our cache.
+            let bytecode_hash = if code.is_empty() {
+                None
+            } else {
+                let h = alloy_primitives::keccak256(&code);
+                let bytecode = Bytecode::new_raw(code.clone());
+                let bkey = format!("bytecode:{:?}:{:?}", self.hash, h);
+                self.cache_db.bytecode.set(&bkey, &bytecode).await;
+                Some(h)
+            };
+
             let result = Account { balance, nonce, bytecode_hash };
             self.cache_db.accounts.set(&cache_key, &result).await;
             Ok(Some(result))
