@@ -461,107 +461,141 @@ pub fn get_tasks_for_group(group: &ConflictGroup, priority: TaskPriority) -> Vec
     let mut tasks = vec![];
     let created_at = Instant::now();
 
-    // if let Some(_layout) = NonceLayout::from_group(&group) {
-    //     if is_simple_chain(&group) {
-    //         // Single sender: only AllPermutations (no need for Greedy/others)
-    //         tasks.push(ConflictTask {
-    //             group_idx: group.id,
-    //             algorithm: Algorithm::AllPermutations,
-    //             priority,
-    //             group: group.clone(),
-    //             created_at,
-    //         });
-    //         return tasks;
-    //     }
+    if let Some(_layout) = NonceLayout::from_group(&group) {
+        if is_simple_chain(&group) {
+            // Single sender: only AllPermutations (no need for Greedy/others)
+            tasks.push(ConflictTask {
+                group_idx: group.id,
+                algorithm: Algorithm::AllPermutations,
+                priority,
+                group: group.clone(),
+                created_at,
+            });
+            return tasks;
+        }
 
-    //     // Always try Greedy first (fast baseline)
-    //     tasks.push(ConflictTask {
-    //         group_idx: group.id,
-    //         algorithm: Algorithm::Greedy,
-    //         priority,
-    //         group: group.clone(),
-    //         created_at,
-    //     });
+        // Always try Greedy first (fast baseline)
+        tasks.push(ConflictTask {
+            group_idx: group.id,
+            algorithm: Algorithm::Greedy,
+            priority,
+            group: group.clone(),
+            created_at,
+        });
 
-    //     if let Some(stats) = compute_interleaving_stats(group) {
-    //         let ln_cap = (MULTINOMIAL_ALL_PERMS_THRESHOLD as f64).ln();
-    //         let small = stats.ln_with_choice <= ln_cap + 1e-12;
+        if let Some(stats) = compute_interleaving_stats(group) {
+            let ln_cap = (MULTINOMIAL_ALL_PERMS_THRESHOLD as f64).ln();
+            let small = stats.ln_with_choice <= ln_cap + 1e-12;
 
-    //         println!("Group {}: {} orders, multinomial {}, ln={}{}",
-    //             group.id,
-    //             group.orders.len(),
-    //             stats.ln_multinomial,
-    //             stats.ln_with_choice,
-    //             if small { "" } else { " (too large)" }
-    //         );
+            println!("Group {}: {} orders, multinomial {}, ln={}{}",
+                group.id,
+                group.orders.len(),
+                stats.ln_multinomial,
+                stats.ln_with_choice,
+                if small { "" } else { " (too large)" }
+            );
 
-    //         if small {
-    //             tasks.push(ConflictTask {
-    //                 group_idx: group.id,
-    //                 algorithm: Algorithm::AllPermutations,
-    //                 priority,
-    //                 group: group.clone(),
-    //                 created_at,
-    //             });
-    //         } else {
-    //             // Add Genetic algorithm task
-    //             // tasks.push(ConflictTask {
-    //             //     group_idx: group.id,
-    //             //     algorithm: Algorithm::Genetic {
-    //             //         population: 20,
-    //             //         elitism: 2,
-    //             //         crossover_rate: 0.9,
-    //             //         mutation_rate: 0.4,
-    //             //         tourn_k: 2,
-    //             //         max_generations: 100,
-    //             //         time_ms: 3000,
-    //             //         seed: group.id as u64,
-    //             //     },
-    //             //     priority: TaskPriority::Medium,
-    //             //     group: group.clone(),
-    //             //     created_at,
-    //             // });
+            if small {
+                tasks.push(ConflictTask {
+                    group_idx: group.id,
+                    algorithm: Algorithm::AllPermutations,
+                    priority,
+                    group: group.clone(),
+                    created_at,
+                });
+            } else {
+                // if group.id == 223 {
+                //     println!("Special group 223: adding Genetic tasks");
+                //     tasks.push(ConflictTask {
+                //         group_idx: group.id,
+                //         algorithm: Algorithm::Genetic {
+                //             population: 50,
+                //             elitism: 3,
+                //             crossover_rate: 0.9,
+                //             mutation_rate: 0.4,
+                //             tourn_k: 3,
+                //             max_generations: 20,
+                //             time_ms: 30000,
+                //             seed: group.id as u64,
+                //         },
+                //         priority: TaskPriority::Medium,
+                //         group: group.clone(),
+                //         created_at,
+                //     });
+                // }
+                // Add Genetic algorithm task
+                tasks.push(ConflictTask {
+                    group_idx: group.id,
+                    algorithm: Algorithm::Genetic {
+                        population: 20,
+                        crossover_rate: 0.9,
+                        mutation_rate: 0.4,
+                        tourn_k: 2,
+                        max_generations: 50,
+                        time_ms: 60000,
+                        seed: group.id as u64,
+                    },
+                    priority: TaskPriority::Medium,
+                    group: group.clone(),
+                    created_at,
+                });
 
-    //             // tasks.push(ConflictTask {
-    //             //         group_idx: group.id,
-    //             //         algorithm: Algorithm::ExhaustiveStreaming {
-    //             //             time_ms: 5_000, // 1 hour
-    //             //             top_k: 20,
-    //             //         },
-    //             //         priority: TaskPriority::Low,
-    //             //         group: group.clone(),
-    //             //         created_at,
-    //             //     });
+                // tasks.push(ConflictTask {
+                //     group_idx: group.id,
+                //     algorithm: Algorithm::Genetic {
+                //         population: 20,
+                //         crossover_rate: 0.9,
+                //         mutation_rate: 0.4,
+                //         tourn_k: 2,
+                //         max_generations: 100,
+                //         time_ms: 3000,
+                //         seed: group.id as u64,
+                //     },
+                //     priority: TaskPriority::Medium,
+                //     group: group.clone(),
+                //     created_at,
+                // });
 
-    //             tasks.push(ConflictTask {
-    //                 group_idx: group.id,
-    //                 algorithm: Algorithm::Random {
-    //                     seed: group.id as u64,
-    //                     count: NUMBER_OF_RANDOM_TASKS,
-    //                 },
-    //                 priority: TaskPriority::Low,
-    //                 group: group.clone(),
-    //                 created_at,
-    //             });
+                // tasks.push(ConflictTask {
+                //         group_idx: group.id,
+                //         algorithm: Algorithm::ExhaustiveStreaming {
+                //             time_ms: 5_000, // 1 hour
+                //             top_k: 20,
+                //         },
+                //         priority: TaskPriority::Low,
+                //         group: group.clone(),
+                //         created_at,
+                //     });
+
+                tasks.push(ConflictTask {
+                    group_idx: group.id,
+                    algorithm: Algorithm::Random {
+                        seed: group.id as u64,
+                        count: NUMBER_OF_RANDOM_TASKS,
+                    },
+                    priority: TaskPriority::Low,
+                    group: group.clone(),
+                    created_at,
+                });
                 
-    //             tasks.push(ConflictTask {
-    //                 group_idx: group.id,
-    //                 algorithm: Algorithm::Length,
-    //                 priority: TaskPriority::Low,
-    //                 group: group.clone(),
-    //                 created_at,
-    //             });
-    //             tasks.push(ConflictTask {
-    //                 group_idx: group.id,
-    //                 algorithm: Algorithm::ReverseGreedy,
-    //                 priority: TaskPriority::Low,
-    //                 group: group.clone(),
-    //                 created_at,
-    //             });
-    //         }
-    //         return tasks;
-    //     }
-    // }
+                tasks.push(ConflictTask {
+                    group_idx: group.id,
+                    algorithm: Algorithm::Length,
+                    priority: TaskPriority::Low,
+                    group: group.clone(),
+                    created_at,
+                });
+                tasks.push(ConflictTask {
+                    group_idx: group.id,
+                    algorithm: Algorithm::ReverseGreedy,
+                    priority: TaskPriority::Low,
+                    group: group.clone(),
+                    created_at,
+                });
+            }
+            return tasks;
+        }
+    }
 
     // Fallback: legacy policy (bundles/multi-tx orders / cannot extract sender+nonce)
     tasks.push(ConflictTask {

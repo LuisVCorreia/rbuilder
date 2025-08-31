@@ -10,11 +10,11 @@ pub mod task;
 pub use groups::*;
 pub mod nonce_interleavings;
 pub mod metrics;
+pub mod genetic_algo;
 pub use conflict_task_generator::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use std::sync::mpsc::RecvTimeoutError;
-
 
 use ahash::HashMap;
 use conflict_resolving_pool::{ConflictResolvingPool, TaskQueue};
@@ -543,7 +543,6 @@ where
         Arc::clone(&simulation_cache),
     ).with_outstanding_counter(outstanding.clone());
 
-    // NOTE: don't start workers yet; generate tasks first.
     let setup_duration = setup_start.elapsed();
 
     let block_state: Arc<dyn StateProvider> = input
@@ -618,6 +617,13 @@ where
         .collect();
     let collection_duration = collection_start.elapsed();
 
+    // Log best results for groups 223, 47, 27
+    for special_group in [223, 47, 27] {
+        if let Some((result, group)) = best_results.get(&special_group) {
+            println!("Best result for group {}: profit {}", special_group, result.total_profit);
+        }
+    }
+
     // Block building
     let building_start = Instant::now();
     let block_building_helper = block_building_result_assembler
@@ -675,7 +681,7 @@ where
     };
 
     let _ = write_perf_json(
-        "performance_testing/better_permutations",
+        "performance_testing/genetic_sample",
         format!("block_{:0>8}.json", perf.block_number),
         &perf,
     );

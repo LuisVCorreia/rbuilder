@@ -220,33 +220,8 @@ impl StateProvider for HttpStateProvider {
     }
 
     fn bytecode_by_hash(&self, code_hash: &B256) -> ProviderResult<Option<Bytecode>> {
-        let cache_key = key_bytecode(self.hash, *code_hash);
-        block_on_compat(async {
-            if let Some(cached_bytecode) = self.cache_db.bytecode.get(&cache_key).await {
-                return Ok(Some(cached_bytecode));
-            }
-
-            let block_id = BlockId::hash(self.hash);
-            let code_hash_val = *code_hash;
-
-            let req = self
-                .provider
-                .client()
-                .request::<_, Option<Bytes>>("debug_codeByHash", (code_hash_val, block_id))
-                .await;
-
-            match req {
-                Ok(Some(bytes)) if !bytes.is_empty() => {
-                    let bytecode = Bytecode::new_raw(bytes);
-                    self.cache_db.bytecode.set(&cache_key, &bytecode).await;
-                    Ok(Some(bytecode))
-                }
-                Ok(_) => Ok(None),
-                Err(_e) => {
-                    Ok(None)
-                }
-            }
-        })
+        let cache_key = format!("bytecode:{}:{}", self.hash, code_hash);
+        block_on_compat(async { Ok(self.cache_db.bytecode.get(&cache_key).await) })
     }
 
     

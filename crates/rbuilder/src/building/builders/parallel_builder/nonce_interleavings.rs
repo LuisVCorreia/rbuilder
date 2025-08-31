@@ -12,7 +12,7 @@
 
 use ahash::{HashMap, HashSet as AHashSet};
 use alloy_primitives::{Address, U256};
-use libc::group;
+use rand::Rng;
 use std::collections::BTreeMap;
 
 use crate::primitives::SimulatedOrder;
@@ -60,10 +60,14 @@ pub struct NonceLayout {
 impl NonceLayout {
     /// Build from `ConflictGroup`. Returns None when we cannot derive (sender,nonce) for some order
     pub fn from_group(group: &ConflictGroup) -> Option<Self> {
-        let mut by_sender: HashMap<Address, BTreeMap<u64, Vec<usize>>> = HashMap::default();
+        // sender -> (nonce -> [order indices])
+        let mut by_sender: BTreeMap<Address, BTreeMap<u64, Vec<usize>>> = BTreeMap::new();
+
         for (idx, o) in group.orders.iter().enumerate() {
             let (sender, nonce) = sender_and_nonce(o)?;
-            by_sender.entry(sender).or_default().entry(nonce).or_default().push(idx);
+            by_sender.entry(sender).or_default()
+                     .entry(nonce).or_default()
+                     .push(idx);
         }
 
         let mut chains = Vec::with_capacity(by_sender.len());
@@ -71,8 +75,9 @@ impl NonceLayout {
 
         for (sender, by_nonce) in by_sender {
             let mut steps = Vec::with_capacity(by_nonce.len());
-            for (nonce, indices) in by_nonce {
-                steps.push(NonceStep { nonce, candidates: indices.clone() });
+            for (nonce, mut indices) in by_nonce {
+                indices.sort_unstable(); // canonical per-bucket order
+                steps.push(NonceStep { nonce, candidates: indices });
             }
             chains.push(SenderChain { sender, steps });
         }
@@ -298,8 +303,10 @@ pub fn enumerate_all_interleavings_best(per_chain: &[Vec<usize>], cap: usize) ->
 
 /// Build one uniformly random nonce-respecting interleaving from `per_chain`
 /// (one chosen candidate per step already).
-pub fn sample_one_uniform_interleaving(per_chain: &[Vec<usize>], rng: &mut rand::rngs::SmallRng) -> Vec<usize> {
-    use rand::Rng;
+pub fn sample_one_uniform_interleaving<R: Rng + ?Sized>(
+    per_chain: &[Vec<usize>],
+    rng: &mut R,
+) -> Vec<usize> {
     let k = per_chain.len();
     let total: usize = per_chain.iter().map(|c| c.len()).sum();
     let mut cursors = vec![0usize; k];
@@ -308,8 +315,6 @@ pub fn sample_one_uniform_interleaving(per_chain: &[Vec<usize>], rng: &mut rand:
 
     for _ in 0..total {
         let total_rem: usize = remains.iter().sum();
-        debug_assert!(total_rem > 0);
-
         let mut r = rng.gen_range(0..total_rem);
         let mut chosen = 0usize;
         for i in 0..k {
@@ -318,13 +323,11 @@ pub fn sample_one_uniform_interleaving(per_chain: &[Vec<usize>], rng: &mut rand:
             if r < w { chosen = i; break; }
             r -= w;
         }
-
         let idx = per_chain[chosen][cursors[chosen]];
         cursors[chosen] += 1;
         remains[chosen] -= 1;
         seq.push(idx);
     }
-
     seq
 }
 
@@ -398,11 +401,10 @@ pub fn enumerate_all_interleavings_with_choices(layout: &NonceLayout, cap: usize
 
 
 /// Pick 1 random candidate per step, then interleave uniformly across chains
-pub fn random_interleaving_with_random_choices(
+pub fn random_interleaving_with_random_choices<R: Rng + ?Sized>(
     layout: &NonceLayout,
-    rng: &mut rand::rngs::SmallRng,
+    rng: &mut R,
 ) -> Vec<usize> {
-    use rand::Rng;
     let mut per_chain: Vec<Vec<usize>> = Vec::with_capacity(layout.chains.len());
     for ch in &layout.chains {
         let mut picks = Vec::with_capacity(ch.steps.len());
@@ -414,6 +416,7 @@ pub fn random_interleaving_with_random_choices(
     }
     sample_one_uniform_interleaving(&per_chain, rng)
 }
+
 
 
 pub fn is_simple_chain(group: &ConflictGroup) -> bool {
