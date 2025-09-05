@@ -233,6 +233,10 @@ impl BlockBuildingHelperFromProvider {
         })
     }
 
+    pub fn get_gas_used(&self) -> u64 {
+        self.partial_block.gas_used
+    }
+
     /// Trace and telemetry
     fn trace_finalized_block(
         finalized_block: &FinalizeResult,
@@ -388,6 +392,7 @@ impl BlockBuildingHelper for BlockBuildingHelperFromProvider {
                 .partial_block
                 .get_proposer_payout_tx_value(payout_tx_gas, &self.building_ctx)?)
         } else {
+            println!("True block value called with no payout tx gas");
             Ok(self.partial_block.coinbase_profit)
         }
     }

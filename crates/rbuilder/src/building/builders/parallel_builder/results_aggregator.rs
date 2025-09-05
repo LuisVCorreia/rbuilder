@@ -128,7 +128,10 @@ impl ResultsAggregator {
                 (sequence_of_orders.clone(), order_group.clone())
             });
 
-            if sequence_of_orders.total_profit > entry.value().0.total_profit {
+            // Update if new sequence has better profit or same profit and uses less gas
+            if sequence_of_orders.total_profit > entry.value().0.total_profit || 
+                    (sequence_of_orders.total_profit == entry.value().0.total_profit && 
+                    sequence_of_orders.gas_used < entry.value().0.gas_used) {
                 old_profit = entry.value().0.total_profit;
                 *entry.value_mut() = (sequence_of_orders, order_group);
                 best_result_updated = true;
@@ -254,10 +257,7 @@ mod tests {
 
     // Helper function to create a simple ResolutionResult
     fn create_sequence_of_orders(profit: u64) -> ResolutionResult {
-        ResolutionResult {
-            total_profit: U256::from(profit),
-            sequence_of_orders: vec![],
-        }
+        ResolutionResult::new(U256::from(profit), 0, vec![])
     }
 
     fn create_results_aggregator(best_results: Option<Arc<BestResults>>) -> Arc<ResultsAggregator> {

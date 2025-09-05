@@ -1,8 +1,9 @@
 use ahash::HashMap;
+use std::collections::{HashSet, HashMap as StdHashMap};
 use alloy_primitives::U256;
 use rand::rngs::SmallRng;
 use rand::Rng;
-use super::nonce_interleavings::*;
+use super::nonce_handling::*;
 
 #[derive(Clone, Copy, Debug)]
 pub struct GAParams {
@@ -24,7 +25,18 @@ pub fn repair_to_nonce_valid(preferred: &[usize], layout: &NonceLayout) -> Vec<u
 #[derive(Clone)]
 pub struct Individual {
     pub seq: Vec<usize>,
-    pub fitness: Option<U256>,
+    pub profit: U256,
+    pub gas: u64,
+    pub rank: u32,  // Pareto front index (1 = best)
+    pub crowding: f64,  // crowding distance
+}
+
+pub fn dominates(a: &Individual, b: &Individual) -> bool {
+    // let a_better_or_equal = a.profit >= b.profit && a.gas <= b.gas;
+    // let a_strictly_better = a.profit >  b.profit ||  a.gas  <  b.gas;
+    // a_better_or_equal && a_strictly_better
+
+    a.profit > b.profit || (a.profit == b.profit && a.gas < b.gas)
 }
 
 pub fn tournament_select<'p>(
@@ -32,20 +44,15 @@ pub fn tournament_select<'p>(
     k: usize,
     rng: &mut SmallRng,
 ) -> usize {
-    debug_assert!(population.len() >= k);
-    let mut best_idx = rng.gen_range(0..population.len());
-    let mut best_fit = population[best_idx].fitness.expect("fitness must be set");
+    let mut best = rng.gen_range(0..population.len());
     for _ in 1..k {
         let i = rng.gen_range(0..population.len());
-        let fit = population[i].fitness.expect("fitness must be set");
-        // Tie-break by random chance
-        if fit > best_fit || (fit == best_fit && rng.gen_bool(0.5)) {
-            best_idx = i;
-            best_fit = fit;
-        }
-
+        let a = &population[i];
+        let b = &population[best];
+        let better = (a.rank < b.rank) || (a.rank == b.rank && a.crowding > b.crowding);
+        if better { best = i; }
     }
-    best_idx
+    best
 }
 
 /// Count inversions via mergesort; returns inversions count.
@@ -298,6 +305,131 @@ pub fn ppx_build_child_from_parents(
     child
 }
 
+/// Performs an Order Crossover (OX1) that is adapted to respect precedence constraints.
+///
+/// This operator copies a random contiguous slice from `parent_a` and then fills the
+/// remaining slots using the relative order of transactions from `parent_b`, ensuring
+/// that all nonce dependencies are satisfied.
+pub fn adapted_order_crossover(
+    parent_a: &[usize],
+    parent_b: &[usize],
+    layout: &NonceLayout,
+    rng: &mut SmallRng,
+) -> Vec<usize> {
+    let n = parent_a.len();
+    if n == 0 {
+        return Vec::new();
+    }
+
+    let p1 = rng.gen_range(0..n);
+    let mut p2 = rng.gen_range(0..n);
+    while p1 == p2 {
+        p2 = rng.gen_range(0..n);
+    }
+    let (start, end) = (p1.min(p2), p1.max(p2));
+
+    let mut child = vec![usize::MAX; n];
+    let mut in_child = HashSet::with_capacity(n);
+    let mut filled_steps: HashSet<(usize, usize)> = HashSet::with_capacity(n);
+
+    let predecessor_map = build_predecessor_map(layout);
+
+    // Copy the slice from Parent A and mark the steps as filled.
+    for i in start..=end {
+        let val = parent_a[i];
+        child[i] = val;
+        in_child.insert(val);
+        if let Some(&(chain_id, step_id)) = layout.index_of.get(&val) {
+            filled_steps.insert((chain_id, step_id));
+        }
+    }
+
+    // Collect all candidates from Parent B that need to be placed.
+    let mut candidates_from_b: Vec<usize> = parent_b
+        .iter()
+        .filter(|&&tx| !in_child.contains(&tx))
+        .cloned()
+        .collect();
+
+    let mut fill_idx = 0;
+
+    let mut progress_made = true;
+    while !candidates_from_b.is_empty() && progress_made {
+        progress_made = false;
+        let mut remaining_candidates = Vec::with_capacity(candidates_from_b.len());
+
+        for tx in candidates_from_b {
+            // Check if the nonce step for this tx is already taken by another candidate
+            if let Some(&(chain_id, step_id)) = layout.index_of.get(&tx) {
+                if filled_steps.contains(&(chain_id, step_id)) {
+                    // This candidate is for a filled slot, so we discard it permanently
+                    progress_made = true; 
+                    continue;
+                }
+            }
+
+            if is_ready(&tx, &predecessor_map, &in_child) {
+                place_in_next_slot(&mut child, tx, &mut fill_idx, start, end);
+                in_child.insert(tx);
+                if let Some(&(chain_id, step_id)) = layout.index_of.get(&tx) {
+                    filled_steps.insert((chain_id, step_id));
+                }
+                progress_made = true;
+            } else {
+                // Not ready yet, keep it for the next iteration
+                remaining_candidates.push(tx);
+            }
+        }
+        candidates_from_b = remaining_candidates;
+    }
+
+    assert!(candidates_from_b.is_empty(), "Crossover failed: could not place all pending transactions.");
+    assert!(!child.iter().any(|&x| x == usize::MAX), "Crossover failed: child has unfilled slots.");
+
+    child
+}
+
+/// Helper to build the predecessor map from the nonce layout.
+/// This version correctly handles multiple candidates per nonce.
+fn build_predecessor_map(layout: &NonceLayout) -> StdHashMap<usize, Vec<usize>> {
+    let mut map: StdHashMap<usize, Vec<usize>> = StdHashMap::new();
+    for chain in &layout.chains {
+        for i in 1..chain.steps.len() {
+            let predecessors = &chain.steps[i - 1].candidates;
+            let successors = &chain.steps[i].candidates;
+            
+            if !predecessors.is_empty() {
+                for &succ_idx in successors {
+                    map.insert(succ_idx, predecessors.clone());
+                }
+            }
+        }
+    }
+    map
+}
+
+/// Helper to check if a transaction is ready to be placed.
+/// This version checks against a list of possible predecessors.
+fn is_ready(tx: &usize, predecessor_map: &StdHashMap<usize, Vec<usize>>, in_child: &HashSet<usize>) -> bool {
+    match predecessor_map.get(tx) {
+        Some(preds) => preds.iter().any(|pred| in_child.contains(pred)),
+        // If it has no predecessors, it's the start of a chain and is always ready.
+        None => true,
+    }
+}
+
+/// Helper to place a value in the next available slot of the child array.
+fn place_in_next_slot(child: &mut [usize], val: usize, fill_idx: &mut usize, slice_start: usize, slice_end: usize) {
+    while *fill_idx < child.len() {
+        if *fill_idx >= slice_start && *fill_idx <= slice_end {
+            *fill_idx += 1;
+            continue;
+        }
+        child[*fill_idx] = val;
+        *fill_idx += 1;
+        return;
+    }
+}
 
 // Mutation functions
 pub fn mut_adjacent_interchain_swap(seq: &mut [usize], layout: &NonceLayout, rng: &mut SmallRng) -> bool {
@@ -343,43 +475,13 @@ pub fn mut_bubble_move(seq: &mut [usize], layout: &NonceLayout, rng: &mut SmallR
     changed
 }
 
-pub fn mutation_inter_sender_swap(seq: &mut Vec<usize>, layout: &NonceLayout, rng: &mut SmallRng) {
-    if seq.is_empty() { return; }
-    use rand::Rng;
-    for _ in 0..5 {
-        let i = rng.gen_range(0..seq.len());
-        let j = rng.gen_range(0..seq.len());
-        if i == j { continue; }
-        let (a, b) = if i < j { (i, j) } else { (j, i) };
-        let (ca, _) = layout.index_of[&seq[a]];
-        let (cb, _) = layout.index_of[&seq[b]];
-        if ca != cb { seq.swap(a, b); return; }
-    }
-}
-
-pub fn mutation_same_nonce_flip(seq: &mut Vec<usize>, layout: &NonceLayout, rng: &mut SmallRng) {
-    if seq.is_empty() { return; }
-    use rand::Rng;
-    // pick a random position, if that (chain, step) has >1 candidates, flip to a different one
-    let p = rng.gen_range(0..seq.len());
-    let (c, s) = layout.index_of[&seq[p]];
-    let bucket = &layout.chains[c].steps[s].candidates;
-    if bucket.len() <= 1 { return; }
-
-    let cur = seq[p];
-    let alts: Vec<usize> = bucket.iter().copied().filter(|&x| x != cur).collect();
-    if alts.is_empty() { return; }
-    let alt = alts[rng.gen_range(0..alts.len())];
-    seq[p] = alt;
-}
-
 pub fn mut_same_nonce_flip(seq: &mut [usize], layout: &NonceLayout, multi: &[(usize,usize)], rng: &mut SmallRng) -> bool {
     if multi.is_empty() { return false; }
-    use rand::Rng;
     let (c, s) = multi[rng.gen_range(0..multi.len())];
     let bucket = &layout.chains[c].steps[s].candidates;
     if bucket.len() <= 1 { return false; }
-    // find current gene for this (c,s)
+
+    // find current gene for this (chain,step)
     let cur_idx = *bucket.iter().find(|&&idx| seq.contains(&idx)).expect("must exist");
     let pos = seq.iter().position(|&x| x == cur_idx).unwrap();
     let alts: Vec<usize> = bucket.iter().copied().filter(|&x| x != cur_idx).collect();
@@ -397,7 +499,7 @@ pub fn mutate(seq: &mut Vec<usize>, layout: &NonceLayout, rng: &mut SmallRng, mu
         } else if picked < 65 {
             mut_adjacent_interchain_swap(seq, layout, rng)
         } else {
-            let max_steps = rng.gen_range(2..5);
+            let max_steps = rng.gen_range(2..10);
             mut_bubble_move(seq, layout, rng, max_steps)
         };
         if changed { return; }
@@ -406,6 +508,408 @@ pub fn mutate(seq: &mut Vec<usize>, layout: &NonceLayout, rng: &mut SmallRng, mu
     *seq = random_interleaving_with_random_choices(layout, rng);
 }
 
+
+/// Convert num/den (U256 / U256) into a stable f64 in [0,1], by
+/// right-shifting both until they fit into u128, then dividing as f64.
+/// Scale-invariant and avoids 256-bit overflow
+fn ratio_u256_to_f64(mut num: U256, mut den: U256) -> f64 {
+    if den.is_zero() || num.is_zero() { return 0.0; }
+    let u128_max = U256::from(u128::MAX);
+
+    // Reduce both by powers of two until both <= u128::MAX (preserves ratio)
+    while num > u128_max || den > u128_max {
+        num >>= 1;
+        den >>= 1;
+    }
+    let n = num.to::<u128>();
+    let d = den.to::<u128>();
+    if d == 0 { 0.0 } else { (n as f64) / (d as f64) }
+}
+
+/// Fast non-dominated sort (Deb et al. 2002).
+/// Returns fronts as vectors of indices and also writes `rank` back to `population`.
+pub fn fast_non_dominated_sort(population: &mut [Individual]) -> Vec<Vec<usize>> {
+    let n = population.len();
+    let mut s: Vec<Vec<usize>> = vec![Vec::new(); n];  // for each i, set of j dominated by i
+    let mut n_dom: Vec<usize> = vec![0; n];  // for each i, number of solutions dominating i
+    let mut fronts: Vec<Vec<usize>> = Vec::new();
+    let mut f1: Vec<usize> = Vec::new();
+
+    for i in 0..n {
+        for j in 0..n {
+            if i == j { continue; }
+            if dominates(&population[i], &population[j]) {
+                s[i].push(j);
+            } else if dominates(&population[j], &population[i]) {
+                n_dom[i] += 1;
+            }
+        }
+        if n_dom[i] == 0 {
+            population[i].rank = 1;
+            f1.push(i);
+        }
+    }
+    fronts.push(f1);
+
+    let mut k = 0;
+    while k < fronts.len() {
+        let mut q = Vec::new();
+        for &i in &fronts[k] {
+            for &j in &s[i] {
+                if n_dom[j] > 0 {
+                    n_dom[j] -= 1;
+                    if n_dom[j] == 0 {
+                        population[j].rank = (k as u32) + 2;
+                        q.push(j);
+                    }
+                }
+            }
+        }
+        if q.is_empty() { break; }
+        fronts.push(q);
+        k += 1;
+    }
+
+    fronts
+}
+
+/// Assign crowding distance on one front (classic NSGA-2).
+/// Extremes get +inf; interior sums normalised gaps per objective.
+pub fn assign_crowding_distance(pop: &mut [Individual], front: &[usize]) {
+    for &i in front { pop[i].crowding = 0.0; }
+    if front.len() == 0 { return; }
+    if front.len() == 1 { pop[front[0]].crowding = f64::INFINITY; return; }
+    if front.len() == 2 {
+        pop[front[0]].crowding = f64::INFINITY;
+        pop[front[1]].crowding = f64::INFINITY;
+        return;
+    }
+
+    // Profit objective: maximise
+    {
+      let mut idxs = front.to_vec();
+      idxs.sort_by(|&i, &j| pop[j].profit.cmp(&pop[i].profit)); // desc by profit
+      let min_p = pop[*idxs.last().unwrap()].profit;
+      let max_p = pop[idxs[0]].profit;
+      let range_p = if max_p > min_p { max_p - min_p } else { U256::ZERO };
+
+      pop[idxs[0]].crowding = f64::INFINITY;
+      pop[*idxs.last().unwrap()].crowding = f64::INFINITY;
+
+      if !range_p.is_zero() {
+          for w in 1..(idxs.len()-1) {
+              let prev = pop[idxs[w-1]].profit;
+              let next = pop[idxs[w+1]].profit;
+              // normalized gap in [0,1]
+              let gap = if next >= prev {
+                  ratio_u256_to_f64(next - prev, range_p)
+              } else {
+                  0.0
+              };
+              if pop[idxs[w]].crowding.is_finite() {
+                  pop[idxs[w]].crowding += gap;
+              }
+          }
+      }
+    }
+
+    // Gas objective: minimise
+    {
+      let mut idxs = front.to_vec();
+      idxs.sort_by(|&i, &j| pop[i].gas.cmp(&pop[j].gas)); // asc by gas
+      let min_g = pop[idxs[0]].gas as f64;
+      let max_g = pop[*idxs.last().unwrap()].gas as f64;
+      let range_g = (max_g - min_g).max(0.0);
+
+      pop[idxs[0]].crowding = f64::INFINITY;
+      pop[*idxs.last().unwrap()].crowding = f64::INFINITY;
+
+      if range_g > 0.0 {
+          for w in 1..(idxs.len()-1) {
+              let prev = pop[idxs[w-1]].gas as f64;
+              let next = pop[idxs[w+1]].gas as f64;
+              let gap = ((next - prev) / range_g).max(0.0);
+              if pop[idxs[w]].crowding.is_finite() {
+                  pop[idxs[w]].crowding += gap;
+              }
+          }
+      }
+    }
+}
+
+/// Environmental selection: from combined pool (parents ∪ children),
+/// build next population of size `mu` by taking whole fronts, then
+/// crowding-sorting the last partial front.
+pub fn nsga2_environmental_selection(mut pool: Vec<Individual>, mu: usize) -> Vec<Individual> {
+    let fronts = {
+        // We need ranks & crowding only to tie-break during selection.
+        let mut tmp = pool; // move, but we’ll get it back with `pool = tmp`
+        let f = fast_non_dominated_sort(&mut tmp);
+        pool = tmp;
+        f
+    };
+
+    let mut next = Vec::with_capacity(mu);
+    let mut remaining = mu;
+
+    for (fi, front) in fronts.iter().enumerate() {
+        if front.len() <= remaining {
+            // Assign crowding for completeness (useful for parent selection next gen)
+            assign_crowding_distance(&mut pool, front);
+            for &i in front { next.push(pool[i].clone()); }
+            remaining -= front.len();
+            if remaining == 0 { break; }
+        } else {
+            // Need only a slice of this front
+            assign_crowding_distance(&mut pool, front);
+            // Take the remaining highest crowding first
+            let mut idxs = front.clone();
+            idxs.sort_by(|&i, &j| {
+                pool[j].crowding
+                    .partial_cmp(&pool[i].crowding)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            for &i in idxs.iter().take(remaining) {
+                next.push(pool[i].clone());
+            }
+            remaining = 0;
+            break;
+        }
+
+        // if we’re at last front and still have room, stop
+        if fi == fronts.len() - 1 { break; }
+    }
+
+    next
+}
+
+
+use serde::Serialize;
+use std::fs::OpenOptions;
+use std::io::Write;
+
+#[derive(Serialize)]
+pub struct NSGA2GenLine {
+    pub block_number: u64,
+    pub group_id: usize,
+    pub gen: usize,
+    pub elapsed_ms: u64,
+    pub evals_cum: u64,
+
+    // best-so-far (profit↑, gas↓)
+    pub best_profit: String,
+    pub best_gas: u64,
+
+    // Pareto-front metrics (front 1)
+    pub pareto_size: usize,
+    pub hv2d: f64,
+    pub spacing_s: f64,
+    pub crowding_front1_min: f64,
+    pub crowding_front1_med: f64,
+    pub crowding_front1_max: f64,
+
+    // diversity in genotype space
+    pub avg_dc: f64,
+    pub min_dc: f64,
+    pub max_dc: f64,
+    pub std_dc: f64,
+    pub uniq_seqs: usize,
+    pub uniq_slot_orders: usize,
+    pub niche_sizes: Vec<usize>, // connected components under distance threshold
+
+    // flow/effectiveness
+    pub fronts: Vec<usize>,  // sizes of all fronts
+    pub new_best_hits: u32,  // strict improvements found this generation
+    pub child_accept_rate: f64,
+    pub child_non_dominated_vs_parents: f64,
+}
+
+pub fn append_nsga2_debug_line(
+    out_dir: &str,
+    block_number: u64,
+    payload: &NSGA2GenLine,
+) -> eyre::Result<()> {
+    let dir = std::path::Path::new(out_dir);
+    if !dir.exists() { let _ = std::fs::create_dir_all(dir); }
+    let file_name = format!("nsga2_block_{:0>8}.ndjson", block_number);
+    let path = dir.join(file_name);
+    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+    let line = serde_json::to_string(payload)?;
+    writeln!(file, "{}", line)?;
+    Ok(())
+}
+
+pub fn u256_norm01(x: U256, min: U256, max: U256) -> f64 {
+    if max <= min { return 0.0; }
+    let scale = max - min; // > 0
+    let num = x.saturating_sub(min);
+    // Compute floor( (num/scale) * 1e9 ) with integer arithmetic to avoid overflow/float:
+    let num_scaled = num.saturating_mul(U256::from(1_000_000_000u64));
+    let q = num_scaled / scale; // <= 1e9
+    let bytes: [u8; 32] = q.to_le_bytes();
+    let lo = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
+    (lo as f64) / 1e9
+}
+
+// For gas we can use u64 directly; normalize linearly:
+pub fn u64_norm01(x: u64, min: u64, max: u64) -> f64 {
+    if max <= min { return 0.0; }
+    (x - min) as f64 / (max - min) as f64
+}
+
+// Build normalized points where both axes are "maximize":
+// x = profit_norm in [0,1], y = (1 - gas_norm) in [0,1]
+pub fn normalize_points_2d(points: &[(U256, u64)]) -> Vec<(f64, f64)> {
+    if points.is_empty() { return vec![]; }
+    let min_p = points.iter().map(|(p,_)| *p).min().unwrap();
+    let max_p = points.iter().map(|(p,_)| *p).max().unwrap();
+    let min_g = points.iter().map(|(_,g)| *g).min().unwrap();
+    let max_g = points.iter().map(|(_,g)| *g).max().unwrap();
+
+    points.iter().map(|(p,g)| {
+        let xn = u256_norm01(*p, min_p, max_p);
+        let gn = u64_norm01(*g, min_g, max_g);
+        (xn, 1.0 - gn)
+    }).collect()
+}
+
+// Hypervolume in [0,1]^2 w.r.t ref=(0,0), assuming input is a non-dominated set.
+pub fn hv2d(points: &[(U256, u64)]) -> f64 {
+    let mut pts = normalize_points_2d(points);
+    if pts.is_empty() { return 0.0; }
+    // Sort by x desc (profit), tie-break y desc
+    pts.sort_by(|a,b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal)
+        .then_with(|| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)));
+    let mut hv = 0.0;
+    let mut x_next = 0.0;
+    for (i, &(x,y)) in pts.iter().enumerate() {
+        let dx = if i+1 < pts.len() { x - pts[i+1].0 } else { x - 0.0 };
+        let yi = y;
+        if dx > 0.0 && yi > 0.0 { hv += dx * yi; }
+        x_next = x;
+    }
+    hv.clamp(0.0, 1.0)
+}
+
+// Schott's spacing metric (using L1 in normalized (profit_norm, 1 - gas_norm) space)
+pub fn spacing_s(points: &[(U256, u64)]) -> f64 {
+    let pts = normalize_points_2d(points);
+    let n = pts.len();
+    if n <= 1 { return 0.0; }
+    let mut d: Vec<f64> = Vec::with_capacity(n);
+    for i in 0..n {
+        let mut best = f64::INFINITY;
+        for j in 0..n {
+            if i == j { continue; }
+            let dij = (pts[i].0 - pts[j].0).abs() + (pts[i].1 - pts[j].1).abs();
+            if dij < best { best = dij; }
+        }
+        d.push(best);
+    }
+    let mean = d.iter().sum::<f64>() / n as f64;
+    let var = d.iter().map(|v| (v - mean)*(v - mean)).sum::<f64>() / n.max(2) as f64;
+    var.sqrt()
+}
+
+pub fn pairwise_dc_stats(pop: &[Individual], layout: &NonceLayout) -> (f64,f64,f64,f64) {
+    if pop.len() <= 1 { return (0.0,0.0,0.0,0.0); }
+    let offs = chain_offsets(layout);
+    let mut sum = 0.0; let mut minv = f64::INFINITY; let mut maxv = 0.0; let mut c = 0usize;
+    let mut acc: Vec<f64> = Vec::new();
+    for i in 0..pop.len() {
+        for j in (i+1)..pop.len() {
+            let d = dc_distance(&pop[i].seq, &pop[j].seq, layout, &offs, 0.8, 0.2);
+            sum += d; c += 1; if d < minv { minv = d; } if d > maxv { maxv = d; }
+            acc.push(d);
+        }
+    }
+    let mean = sum / c as f64;
+    let var = acc.iter().map(|v| (v-mean)*(v-mean)).sum::<f64>() / c as f64;
+    (mean, minv, maxv, var.sqrt())
+}
+
+pub fn uniq_counts(pop: &[Individual], layout: &NonceLayout) -> (usize, usize) {
+    use ahash::AHashSet;
+    let mut seqs = AHashSet::default();
+    let mut slots = AHashSet::default();
+    let offs = chain_offsets(layout);
+    for ind in pop {
+        seqs.insert(ind.seq.clone());
+        let sig = seq_to_slot_ids(&ind.seq, layout, &offs);
+        slots.insert(sig);
+    }
+    (seqs.len(), slots.len())
+}
+
+// Naive connected components under threshold tau in genotype space.
+pub fn niche_components(pop: &[Individual], layout: &NonceLayout, tau: f64) -> Vec<usize> {
+    let n = pop.len(); if n==0 { return vec![]; }
+    let offs = chain_offsets(layout);
+    let mut adj: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for i in 0..n {
+        for j in (i+1)..n {
+            let d = dc_distance(&pop[i].seq, &pop[j].seq, layout, &offs, 0.8, 0.2);
+            if d < tau {
+                adj[i].push(j); adj[j].push(i);
+            }
+        }
+    }
+    let mut vis = vec![false; n];
+    let mut sizes = Vec::new();
+    for i in 0..n {
+        if vis[i] { continue; }
+        let mut stack = vec![i]; vis[i] = true; let mut sz=0usize;
+        while let Some(u) = stack.pop() {
+            sz += 1;
+            for &v in &adj[u] { if !vis[v] { vis[v]=true; stack.push(v); } }
+        }
+        sizes.push(sz);
+    }
+    sizes.sort_unstable_by(|a,b| b.cmp(a)); // big niches first
+    sizes
+}
+
+
+/// Competition rule for Multi-Objective Deterministic Crowding.
+/// Returns the winner of the competition between a parent and a child.
+/// A more balanced competition rule for Multi-Objective Deterministic Crowding.
+pub fn compete(
+    parent: &Individual, 
+    child: &Individual, 
+    rng: &mut SmallRng
+) -> Individual {
+    let child_dominates = dominates(child, parent);
+    let parent_dominates = dominates(parent, child);
+
+    if child_dominates {
+        return child.clone();
+    } 
+    
+    if parent_dominates {
+        return parent.clone();
+    }
+
+    if rng.gen_bool(0.5) {
+        child.clone()
+    } else {
+        parent.clone()
+    }
+}
+
+
+/// Represents an isolated population in the Island Model.
+pub struct Island {
+    pub population: Vec<Individual>,
+    pub rng: SmallRng,
+}
+
+
+/// Log metrics calculated during a single DC generation.
+pub struct DCGenerationResult {
+    pub new_best_hits: u32,
+    pub children_who_won: usize,
+    pub evals: u64,
+}
 
 
 #[cfg(test)]
@@ -565,55 +1069,11 @@ mod tests {
     }
 
     #[test]
-    fn test_same_nonce_flip_mutation_preserves_validity_and_changes_candidate() {
-        let group = make_group_with_duplicate_buckets();
-
-        // Start from a valid interleaving (best-per-slot, simple A0,B0,A1,B1)
-        let layout = NonceLayout::from_group(&group).unwrap();
-        let chains_best = build_chains_best(&layout, &group);
-        let seq = vec![chains_best[0][0], chains_best[1][0], chains_best[0][1], chains_best[1][1]];
-        assert_nonce_valid(&seq, &layout);
-
-        // There are at least two slots with multiple candidates (A:nonce0, B:nonce1).
-        let mut rng = SmallRng::seed_from_u64(12345);
-
-        // Try flipping until we observe a change
-        let original = seq.clone();
-        let mut changed = false;
-        for _ in 0..20 {
-            let mut tmp = seq.clone();
-            mutation_same_nonce_flip(&mut tmp, &layout, &mut rng);
-            if tmp != original {
-                assert_nonce_valid(&tmp, &layout);
-                changed = true;
-                break;
-            }
-        }
-        assert!(changed, "same-nonce flip did not change any gene after several tries");
-    }
-
-    #[test]
-    fn test_inter_sender_swap_mutation_preserves_validity() {
-        let group = make_group_with_duplicate_buckets();
-        let layout = NonceLayout::from_group(&group).unwrap();
-        let chains_best = build_chains_best(&layout, &group);
-
-        let mut seq = vec![chains_best[0][0], chains_best[1][0], chains_best[0][1], chains_best[1][1]];
-        assert_nonce_valid(&seq, &layout);
-
-        let mut rng = SmallRng::seed_from_u64(777);
-        mutation_inter_sender_swap(&mut seq, &layout, &mut rng);
-
-        // Must remain valid
-        assert_nonce_valid(&seq, &layout);
-    }
-
-    #[test]
     fn test_seq_to_slot_ids_same_order_different_candidates_maps_equal() {
         let group = make_group_with_duplicate_buckets();
         let layout = NonceLayout::from_group(&group).unwrap();
 
-        // Build two sequences with the SAME slot order but different candidates where possible:
+        // Build two sequences with the same slot order but different candidates where possible:
         // Slots: A0(2 choices), B0(1), A1(1), B1(2)
         let chains_best = build_chains_best(&layout, &group);
         // seq1: A0(alt1), B0, A1, B1(alt1)
@@ -808,4 +1268,38 @@ mod tests {
         assert!(changed_once, "bubble move did not produce any change across attempts");
     }
 
+    #[test]
+    fn test_adapted_order_crossover_logic() {
+        let group = make_group_with_duplicate_buckets();
+        let layout = NonceLayout::from_group(&group).unwrap();
+        let mut rng = SmallRng::seed_from_u64(1337); // Use a fixed seed for reproducible tests.
+
+        let chains_best = build_chains_best(&layout, &group);
+        let (chain_a, chain_b) = (&chains_best[0], &chains_best[1]);
+
+        // Parent A interleaves A, B, A, B...
+        let parent_a = vec![chain_a[0], chain_b[0], chain_a[1], chain_b[1]];
+        // Parent B interleaves B, A, B, A...
+        let parent_b = vec![chain_b[0], chain_a[0], chain_b[1], chain_a[1]];
+        
+        let parent_elements: HashSet<usize> = parent_a.iter().cloned().collect();
+
+        for i in 0..100 {
+            let child = adapted_order_crossover(&parent_a, &parent_b, &layout, &mut rng);
+            assert_nonce_valid(&child, &layout);
+
+            assert_eq!(
+                child.len(),
+                parent_a.len(),
+                "Child length mismatch on iteration {}",
+                i
+            );
+            let child_elements: HashSet<usize> = child.iter().cloned().collect();
+            assert_eq!(
+                child_elements, parent_elements,
+                "Child elements do not match parent elements on iteration {}",
+                i
+            );
+        }
+    }
 }

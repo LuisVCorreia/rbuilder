@@ -7,7 +7,7 @@ use super::{
     ConflictGroup,
     task::{ConflictTask, Algorithm},
     conflict_resolvers::generate_sequences_of_orders_to_try,
-    nonce_interleavings::NonceLayout,
+    nonce_handling::NonceLayout,
 };
 
 #[derive(Serialize)]
@@ -27,7 +27,7 @@ pub struct GroupMetrics {
     pub group_id: usize,
     pub group_size: usize,
     pub num_senders: usize,
-    pub sender_chain_lengths: Vec<usize>, // per-sender number of nonce steps (dedup’d)
+    pub sender_chain_lengths: Vec<usize>, // per-sender number of nonce steps (deduped)
     multinomial_permutations: MultinomialStat, // interleavings of nonce steps only (no per-step choices)
     pub rbuilder_total_sequences_planned: usize,
     pub rbuilder_unique_input_sequences: usize,
@@ -66,6 +66,8 @@ fn algo_name(a: &Algorithm) -> &'static str {
         Algorithm::Random { .. } => "Random",
         Algorithm::Genetic { .. } => "Genetic",
         Algorithm::ExhaustiveStreaming { .. } => "ExhaustiveStreaming",
+        Algorithm::RandomImproved { .. } => "RandomImproved",
+        Algorithm::RandomChain { .. } => "RandomChain",
     }
 }
 

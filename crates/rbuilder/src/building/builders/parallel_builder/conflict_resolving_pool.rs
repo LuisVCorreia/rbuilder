@@ -137,7 +137,6 @@ where
         let mut merging_context = ResolverContext::new(
             state,
             ctx.clone(),
-            local_ctx,
             cancellation_token.clone(),
             simulation_cache,
         );
@@ -145,7 +144,7 @@ where
         let task_group = task.group.clone();
         let task_algo = task.algorithm;
 
-        match merging_context.run_conflict_task(task) {
+        match merging_context.run_conflict_task(task, local_ctx) {
             Ok(sequence_of_orders) => {
                 trace!(
                     task_type = ?task_algo,

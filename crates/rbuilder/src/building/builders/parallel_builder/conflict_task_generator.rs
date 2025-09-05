@@ -5,7 +5,7 @@ use crossbeam_queue::SegQueue;
 use itertools::Itertools;
 use std::{sync::Arc, time::Instant};
 use tracing::trace;
-use super::nonce_interleavings::{
+use super::nonce_handling::{
     compute_interleaving_stats, NonceLayout, is_simple_chain,
     ALL_PERMS_CAP as MULTINOMIAL_ALL_PERMS_THRESHOLD,
 };
@@ -181,10 +181,11 @@ impl ConflictTaskGenerator {
     /// * `group_id` - The ID of the group to process.
     /// * `group` - The `ConflictGroup` to process.
     fn process_single_order_group(&mut self, group_id: GroupId, group: &ConflictGroup) {
-        let sequence_of_orders = ResolutionResult {
-            total_profit: group.orders[0].sim_value.coinbase_profit,
-            sequence_of_orders: vec![(0, group.orders[0].sim_value.coinbase_profit)],
-        };
+        let sequence_of_orders = ResolutionResult::new(
+            group.orders[0].sim_value.coinbase_profit,
+            group.orders[0].sim_value.gas_used,
+            vec![(0, group.orders[0].sim_value.coinbase_profit, group.orders[0].sim_value.gas_used)],
+        );
         // We ignore the error since it means "receiver disconnected" and we expect the caller will detect the cancellation and stop calling us.
         let _ = self
             .group_result_sender
@@ -504,41 +505,23 @@ pub fn get_tasks_for_group(group: &ConflictGroup, priority: TaskPriority) -> Vec
                     created_at,
                 });
             } else {
-                // if group.id == 223 {
-                //     println!("Special group 223: adding Genetic tasks");
-                //     tasks.push(ConflictTask {
-                //         group_idx: group.id,
-                //         algorithm: Algorithm::Genetic {
-                //             population: 50,
-                //             elitism: 3,
-                //             crossover_rate: 0.9,
-                //             mutation_rate: 0.4,
-                //             tourn_k: 3,
-                //             max_generations: 20,
-                //             time_ms: 30000,
-                //             seed: group.id as u64,
-                //         },
-                //         priority: TaskPriority::Medium,
-                //         group: group.clone(),
-                //         created_at,
-                //     });
-                // }
-                // Add Genetic algorithm task
-                tasks.push(ConflictTask {
-                    group_idx: group.id,
-                    algorithm: Algorithm::Genetic {
-                        population: 20,
-                        crossover_rate: 0.9,
-                        mutation_rate: 0.4,
-                        tourn_k: 2,
-                        max_generations: 50,
-                        time_ms: 60000,
-                        seed: group.id as u64,
-                    },
-                    priority: TaskPriority::Medium,
-                    group: group.clone(),
-                    created_at,
-                });
+                if group.id == 107 {
+                    tasks.push(ConflictTask {
+                        group_idx: group.id,
+                        algorithm: Algorithm::Genetic {
+                            population: 30,
+                            crossover_rate: 0.9,
+                            mutation_rate: 0.2,
+                            tourn_k: 3,
+                            max_generations: 50,
+                            time_ms: 6000,
+                            seed: group.id as u64,
+                        },
+                        priority: TaskPriority::Medium,
+                        group: group.clone(),
+                        created_at,
+                    });
+                }
 
                 // tasks.push(ConflictTask {
                 //     group_idx: group.id,
@@ -577,21 +560,43 @@ pub fn get_tasks_for_group(group: &ConflictGroup, priority: TaskPriority) -> Vec
                     group: group.clone(),
                     created_at,
                 });
-                
+
+                // tasks.push(ConflictTask {
+                //     group_idx: group.id,
+                //     algorithm: Algorithm::RandomChain {
+                //         seed: group.id as u64,
+                //         count: NUMBER_OF_RANDOM_TASKS,
+                //     },
+                //     priority: TaskPriority::Low,
+                //     group: group.clone(),
+                //     created_at,
+                // });
+
                 tasks.push(ConflictTask {
                     group_idx: group.id,
-                    algorithm: Algorithm::Length,
+                    algorithm: Algorithm::RandomImproved {
+                        seed: group.id as u64,
+                        count: NUMBER_OF_RANDOM_TASKS,
+                    },
                     priority: TaskPriority::Low,
                     group: group.clone(),
                     created_at,
                 });
-                tasks.push(ConflictTask {
-                    group_idx: group.id,
-                    algorithm: Algorithm::ReverseGreedy,
-                    priority: TaskPriority::Low,
-                    group: group.clone(),
-                    created_at,
-                });
+
+                // tasks.push(ConflictTask {
+                //     group_idx: group.id,
+                //     algorithm: Algorithm::Length,
+                //     priority: TaskPriority::Low,
+                //     group: group.clone(),
+                //     created_at,
+                // });
+                // tasks.push(ConflictTask {
+                //     group_idx: group.id,
+                //     algorithm: Algorithm::ReverseGreedy,
+                //     priority: TaskPriority::Low,
+                //     group: group.clone(),
+                //     created_at,
+                // });
             }
             return tasks;
         }

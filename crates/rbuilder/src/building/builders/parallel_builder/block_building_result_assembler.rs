@@ -1,14 +1,16 @@
 use super::{
     results_aggregator::BestResults, ConflictGroup, GroupId, ParallelBuilderConfig,
-    ResolutionResult,
+    ResolutionResult, BuildMode,
 };
 use ahash::HashMap;
-use alloy_primitives::utils::format_ether;
+use alloy_primitives::{utils::format_ether, U256};
+use ethereum_consensus::deneb::NEXT_SYNC_COMMITTEE_INDEX;
 use reth_provider::StateProvider;
 use std::{sync::Arc, time::Instant, cmp::Ordering};
 use time::OffsetDateTime;
 use tokio_util::sync::CancellationToken;
 use tracing::{info_span, trace};
+use std::collections::BinaryHeap;
 
 use crate::{
     building::{
@@ -22,6 +24,153 @@ use crate::{
     },
     telemetry::mark_builder_considers_order,
 };
+
+#[derive(Copy, Clone)]
+enum CandidateOrd {
+    ByMgp,    // score = rem_profit / rem_gas
+    ByProfit, // score = rem_profit / rem_len
+}
+
+#[derive(Clone)]
+struct Candidate {
+    group_idx: usize,
+    // score as fraction num/den (comparison via cross-multiplication)
+    num: U256,
+    den: u128, // gas or length; always >= 1
+    ord: CandidateOrd,
+    // deterministic tie-breakers
+    tiebreak_gid: GroupId,
+    next_pos: usize,
+}
+
+impl Eq for Candidate {}
+impl PartialEq for Candidate {
+    fn eq(&self, other: &Self) -> bool {
+        (self.num * U256::from(other.den) == other.num * U256::from(self.den))
+            && self.tiebreak_gid == other.tiebreak_gid
+            && self.next_pos == other.next_pos
+    }
+}
+
+impl Ord for Candidate {
+    fn cmp(&self, other: &Self) -> Ordering {
+        let lhs = self.num * U256::from(other.den);
+        let rhs = other.num * U256::from(self.den);
+        match lhs.cmp(&rhs) {
+            Ordering::Equal => match self.tiebreak_gid.cmp(&other.tiebreak_gid) {
+                Ordering::Equal => self.next_pos.cmp(&other.next_pos).reverse(),
+                ord => ord.reverse(), // prefer smaller gid in max-heap
+            },
+            ord => ord,
+        }
+    }
+}
+
+impl PartialOrd for Candidate {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> { Some(self.cmp(other)) }
+}
+
+struct GroupCursor {
+    group_id: GroupId,
+    group: ConflictGroup,
+    // (order_idx, per-tx profit, per-tx gas)
+    seq: Vec<(usize, U256, u64)>,
+    next_pos: usize,
+
+    // moving aggregates for the remaining suffix
+    rem_profit: U256,
+    rem_gas: u64,
+    rem_len: usize,
+}
+
+fn make_candidate(i: usize, group_cursor: &GroupCursor, ord: CandidateOrd) -> Option<Candidate> {
+    if group_cursor.next_pos >= group_cursor.seq.len() || group_cursor.rem_len == 0 {
+        return None;
+    }
+    let (num, den) = match ord {
+        CandidateOrd::ByProfit => (group_cursor.rem_profit, group_cursor.rem_len as u128),
+        CandidateOrd::ByMgp => (group_cursor.rem_profit, u128::from(group_cursor.rem_gas.max(1))),
+    };
+    Some(Candidate {
+        group_idx: i,
+        num,
+        den: den.max(1),
+        ord,
+        tiebreak_gid: group_cursor.group_id,
+        next_pos: group_cursor.next_pos,
+    })
+}
+
+fn pack_with_heap<H: BlockBuildingHelper + ?Sized>(
+    helper: &mut H,
+    groups: &mut Vec<GroupCursor>,
+    ord: CandidateOrd,
+    gas_limit: u64,
+    local_ctx: &mut ThreadBlockBuildingContext,
+) -> eyre::Result<()> {
+    let mut gas_used_accounted: u64 = 0;
+    let mut heap = BinaryHeap::<Candidate>::new();
+
+    // seed heap
+    for i in 0..groups.len() {
+        if let Some(c) = make_candidate(i, &groups[i], ord) {
+            heap.push(c);
+        }
+    }
+
+    while let Some(cand) = heap.pop() {
+        if cand.next_pos != groups[cand.group_idx].next_pos {
+            continue;
+        }
+
+        let pos = groups[cand.group_idx].next_pos;
+        if pos >= groups[cand.group_idx].seq.len() {
+            continue;
+        }
+
+        let (order_idx, per_profit, per_gas) = groups[cand.group_idx].seq[pos];
+
+        // TODO: Check if we want to keep this or rely on commit_order
+        if per_gas > gas_limit.saturating_sub(gas_used_accounted) {
+            {
+                let group_cursor = &mut groups[cand.group_idx];
+                group_cursor.next_pos += 1;
+                group_cursor.rem_profit = group_cursor.rem_profit.saturating_sub(per_profit);
+                group_cursor.rem_gas = group_cursor.rem_gas.saturating_sub(per_gas);
+                group_cursor.rem_len = group_cursor.rem_len.saturating_sub(1);
+            }
+            if let Some(c) = make_candidate(cand.group_idx, &groups[cand.group_idx], ord) {
+                heap.push(c);
+            }
+            continue;
+        }
+
+        let sim_order = &groups[cand.group_idx].group.orders[order_idx];
+        match helper.commit_order(local_ctx, sim_order, &|_| Ok(()))? {
+            Ok(res) => {
+                gas_used_accounted = gas_used_accounted.saturating_add(res.gas_used);
+
+                {
+                    let group_cursor = &mut groups[cand.group_idx];
+                    group_cursor.next_pos += 1;
+                    group_cursor.rem_profit = group_cursor.rem_profit.saturating_sub(per_profit);
+                    group_cursor.rem_gas = group_cursor.rem_gas.saturating_sub(per_gas);
+                    group_cursor.rem_len = group_cursor.rem_len.saturating_sub(1);
+                }
+                if let Some(c) = make_candidate(cand.group_idx, &groups[cand.group_idx], ord) {
+                    heap.push(c);
+                }
+            }
+            Err(_err) => {
+                let group_cursor = &mut groups[cand.group_idx];
+                group_cursor.next_pos = group_cursor.seq.len();
+                group_cursor.rem_len = 0;
+            }
+        }
+    }
+
+    Ok(())
+}
 
 /// Assembles block building results from the best orderings of order groups.
 pub struct BlockBuildingResultAssembler {
@@ -220,7 +369,7 @@ impl BlockBuildingResultAssembler {
 
             if let Some((sequence_of_orders, order_group)) = group_with_orders {
                 // Get the next order from this group
-                let (order_idx, _) = sequence_of_orders.sequence_of_orders.remove(0);
+                let (order_idx, _, _) = sequence_of_orders.sequence_of_orders.remove(0);
                 let sim_order = &order_group.orders[order_idx];
 
                 mark_builder_considers_order(
@@ -260,10 +409,98 @@ impl BlockBuildingResultAssembler {
         Ok(Box::new(block_building_helper))
     }
 
+    // pub fn build_backtest_block(
+    //     &mut self,
+    //     best_results: HashMap<GroupId, (ResolutionResult, ConflictGroup)>,
+    //     orders_closed_at: OffsetDateTime,
+    //     block_is_full: bool,
+    // ) -> eyre::Result<Box<dyn BlockBuildingHelper>> {
+    //     let mut block_building_helper = BlockBuildingHelperFromProvider::new(
+    //         self.state.clone(),
+    //         self.ctx.clone(),
+    //         &mut self.local_ctx,
+    //         String::from("backtest_builder"),
+    //         self.discard_txs,
+    //         CancellationToken::new(),
+    //     )?;
+
+    //     block_building_helper.set_trace_orders_closed_at(orders_closed_at);
+
+    //     // Keep the key so we can tie-break deterministically.
+    //     let mut entries: Vec<(GroupId, ResolutionResult, ConflictGroup)> = best_results
+    //         .into_iter()
+    //         .map(|(gid, (res, grp))| (gid, res, grp))
+    //         .collect();
+
+    //     // Sort: profit desc, tie-break by group_id asc (total order, deterministic)
+    //     entries.sort_unstable_by(|(ga, ra, _), (gb, rb, _)| {
+    //         match rb.total_profit.cmp(&ra.total_profit) {
+    //             Ordering::Equal => ga.cmp(gb),
+    //             other => other,
+    //         }
+    //     });
+
+    //     // Drop key after sorting, keep your original type
+    //     let mut best_orderings_per_group: Vec<(ResolutionResult, ConflictGroup)> = entries
+    //         .into_iter()
+    //         .map(|(_, res, grp)| (res, grp))
+    //         .collect();
+
+    //     let use_suggested_fee_recipient_as_coinbase =
+    //         self.coinbase_payment && !self.contains_refunds(&best_orderings_per_group);
+
+    //     // Modify ctx if necessary
+    //     let mut ctx = self.ctx.clone();
+    //     if use_suggested_fee_recipient_as_coinbase {
+    //         ctx.modify_use_suggested_fee_recipient_as_coinbase();
+    //     }
+
+    //     let build_start = Instant::now();
+
+    //     for (sequence_of_orders, order_group) in best_orderings_per_group.iter_mut() {
+    //         for (order_idx, _, _) in sequence_of_orders.sequence_of_orders.iter() {
+    //             let sim_order = &order_group.orders[*order_idx];
+
+    //             let commit_result =
+    //                 block_building_helper
+    //                     .commit_order(&mut self.local_ctx, sim_order, &|_| Ok(()))?;
+
+    //             match commit_result {
+    //                 Ok(res) => {
+    //                     tracing::trace!(
+    //                         order_id = ?sim_order.id(),
+    //                         success = true,
+    //                         gas_used = res.gas_used,
+    //                         "Executed order in backtest"
+    //                     );
+    //                 }
+    //                 Err(err) => {
+    //                     tracing::trace!(
+    //                         order_id = ?sim_order.id(),
+    //                         success = false,
+    //                         error = ?err,
+    //                         "Failed to execute order in backtest"
+    //                     );
+    //                     // println!(
+    //                     //     "Failed to execute order {} in backtest: {}",
+    //                     //     sim_order.id(),
+    //                     //     err
+    //                     // );
+    //                 }
+    //             }
+    //         }
+    //     }
+
+    //     block_building_helper.set_trace_fill_time(build_start.elapsed());
+
+    //     Ok(Box::new(block_building_helper))
+    // }
+
     pub fn build_backtest_block(
         &mut self,
         best_results: HashMap<GroupId, (ResolutionResult, ConflictGroup)>,
         orders_closed_at: OffsetDateTime,
+        mode: BuildMode,
     ) -> eyre::Result<Box<dyn BlockBuildingHelper>> {
         let mut block_building_helper = BlockBuildingHelperFromProvider::new(
             self.state.clone(),
@@ -276,30 +513,23 @@ impl BlockBuildingResultAssembler {
 
         block_building_helper.set_trace_orders_closed_at(orders_closed_at);
 
-        // Keep the key so we can tie-break deterministically.
+        // Keep key so we can tie-break deterministically
         let mut entries: Vec<(GroupId, ResolutionResult, ConflictGroup)> = best_results
-            .into_iter()                         // (gid, (res, grp))
-            .map(|(gid, (res, grp))| (gid, res, grp))
+            .into_iter()
+            .map(|(gid, (res, group))| (gid, res, group))
             .collect();
 
-        // Sort: profit desc, tie-break by group_id asc (total order, deterministic)
-        entries.sort_unstable_by(|(ga, ra, _), (gb, rb, _)| {
-            match rb.total_profit.cmp(&ra.total_profit) {
-                Ordering::Equal => ga.cmp(gb),
+        // Sort: profit desc, tie-break by group_id asc (deterministic)
+        entries.sort_unstable_by(|(group_id_a, res_a, _), (group_id_b, res_b, _)| {
+            match res_b.total_profit.cmp(&res_a.total_profit) {
+                Ordering::Equal => group_id_a.cmp(group_id_b),
                 other => other,
             }
         });
 
-        // Drop key after sorting, keep your original type
-        let mut best_orderings_per_group: Vec<(ResolutionResult, ConflictGroup)> = entries
-            .into_iter()
-            .map(|(_, res, grp)| (res, grp))
-            .collect();
-
         let use_suggested_fee_recipient_as_coinbase =
-            self.coinbase_payment && !self.contains_refunds(&best_orderings_per_group);
+            self.coinbase_payment && !self.contains_refunds(&entries.iter().map(|(_, res, group)| (res.clone(), group.clone())).collect::<Vec<_>>());
 
-        // Modify ctx if necessary
         let mut ctx = self.ctx.clone();
         if use_suggested_fee_recipient_as_coinbase {
             ctx.modify_use_suggested_fee_recipient_as_coinbase();
@@ -307,42 +537,86 @@ impl BlockBuildingResultAssembler {
 
         let build_start = Instant::now();
 
-        for (sequence_of_orders, order_group) in best_orderings_per_group.iter_mut() {
-            for (order_idx, _) in sequence_of_orders.sequence_of_orders.iter() {
-                let sim_order = &order_group.orders[*order_idx];
+        match mode {
+            BuildMode::GreedyProfit | BuildMode::GreedyMgp => {
+                // 1) decide the group sort key
+                if matches!(mode, BuildMode::GreedyProfit) {
+                    // sort by total profit desc, tie-break by gid asc
+                    entries.sort_unstable_by(|(group_id_a, res_a, _), (group_id_b, res_b, _)| {
+                        match res_b.total_profit.cmp(&res_a.total_profit) {
+                            Ordering::Equal => group_id_a.cmp(group_id_b),
+                            other => other,
+                        }
+                    });
+                } else {
+                    // sort by group-level MGP desc (then profit desc, then gid asc)
+                    entries.sort_unstable_by(|(group_id_a, res_a, _), (group_id_b, res_b, _)| {
+                        match res_b.mev_gas_price.cmp(&res_a.mev_gas_price) {
+                            Ordering::Equal => match res_b.total_profit.cmp(&res_a.total_profit) {
+                                Ordering::Equal => group_id_a.cmp(group_id_b),
+                                other => other,
+                            },
+                            other => other,
+                        }
+                    });
+                }
 
-                let commit_result =
-                    block_building_helper
-                        .commit_order(&mut self.local_ctx, sim_order, &|_| Ok(()))?;
-
-                match commit_result {
-                    Ok(res) => {
-                        tracing::trace!(
-                            order_id = ?sim_order.id(),
-                            success = true,
-                            gas_used = res.gas_used,
-                            "Executed order in backtest"
-                        );
-                    }
-                    Err(err) => {
-                        tracing::trace!(
-                            order_id = ?sim_order.id(),
-                            success = false,
-                            error = ?err,
-                            "Failed to execute order in backtest"
-                        );
-                        println!(
-                            "Failed to execute order {} in backtest: {}",
-                            sim_order.id(),
-                            err
-                        );
+                // 2) pack groups contiguously in that order
+                for (_, sequence_of_orders, order_group) in entries.iter_mut() {
+                    for (order_idx, _, _) in sequence_of_orders.sequence_of_orders.iter() {
+                        let sim_order = &order_group.orders[*order_idx];
+                        let _ = block_building_helper
+                            .commit_order(&mut self.local_ctx, sim_order, &|_| Ok(()))?;
                     }
                 }
+            }
+
+            BuildMode::HeapMgp | BuildMode::HeapProfit => {
+                // initialize cursors once
+                let mut groups: Vec<GroupCursor> = entries
+                    .into_iter()
+                    .map(|(group_id, res, group)| {
+                        let seq = res.sequence_of_orders.clone();
+                        let mut sum_profit = U256::ZERO;
+                        let mut sum_gas = 0u64;
+                        for &(_, profit, gas) in &seq {
+                            sum_profit = sum_profit.saturating_add(profit);
+                            sum_gas = sum_gas.saturating_add(gas);
+                        }
+                        let rem_len = seq.len();
+                        GroupCursor {
+                            group_id,
+                            group,
+                            seq,
+                            next_pos: 0,
+                            rem_profit: sum_profit,
+                            rem_gas: sum_gas,
+                            rem_len: rem_len,
+                        }
+                    })
+                    .collect();
+
+
+
+                let gas_limit = self.ctx.evm_env.block_env.gas_limit;
+                let ord = if matches!(mode, BuildMode::HeapMgp) {
+                    CandidateOrd::ByMgp
+                } else {
+                    CandidateOrd::ByProfit
+                };
+
+                pack_with_heap(
+                    &mut block_building_helper,
+                    &mut groups,
+                    ord,
+                    gas_limit,
+                    &mut self.local_ctx,
+                )?;
+
             }
         }
 
         block_building_helper.set_trace_fill_time(build_start.elapsed());
-
         Ok(Box::new(block_building_helper))
     }
 
@@ -360,7 +634,7 @@ impl BlockBuildingResultAssembler {
             sequence_of_orders
                 .sequence_of_orders
                 .iter()
-                .any(|(order_idx, _)| {
+                .any(|(order_idx, _, _)| {
                     !order_group.orders[*order_idx]
                         .sim_value
                         .paid_kickbacks

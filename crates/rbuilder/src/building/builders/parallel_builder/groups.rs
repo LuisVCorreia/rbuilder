@@ -12,8 +12,33 @@ use std::sync::Arc;
 pub struct ResolutionResult {
     /// Total coinbase profit of the given ordering.
     pub total_profit: U256,
-    /// Sequence of orders and their profit in that sequence
-    pub sequence_of_orders: Vec<(usize, U256)>,
+    /// Total gas used by the given ordering.
+    pub gas_used: u64,
+    /// Mev gas price of the given ordering.
+    pub mev_gas_price: U256,
+    /// Sequence of orders and their profit and gas used in that sequence
+    pub sequence_of_orders: Vec<(usize, U256, u64)>,
+}
+
+impl ResolutionResult {
+    pub fn new(
+        total_profit: U256,
+        gas_used: u64,
+        sequence_of_orders: Vec<(usize, U256, u64)>,
+
+    ) -> Self {
+        let mev_gas_price = if gas_used != 0 {
+            total_profit / U256::from(gas_used)
+        } else {
+            U256::ZERO
+        };
+        Self {
+            total_profit,
+            gas_used,
+            mev_gas_price,
+            sequence_of_orders
+        }
+    }
 }
 
 /// ConflictGroups describes set of conflicting orders.

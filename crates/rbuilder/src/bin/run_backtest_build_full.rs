@@ -6,15 +6,9 @@ use tokio::{
     process::Command,
 };
 
-// --- Configuration ---
+const DB_PATH: &str = "rbuilder_results_1/main.sqlite";
+const OUTPUT_DIR: &str = "performance_testing/improvements_all";
 
-// The path to the SQLite database.
-const DB_PATH: &str = "rbuilder_results_1/main.sqlite"; // Adjust if your path is different
-
-// The directory where successful build logs and JSON outputs will be saved.
-const OUTPUT_DIR: &str = "rbuilder_results_1/build_outputs";
-
-// The command to run your backtesting build script.
 const EXECUTABLE: &str = "./target/debug/backtest-build-block";
 const BASE_ARGS: &[&str] = &["--config", "config-backtest.toml"];
 const BUILDER_ARGS: &[&str] = &[
@@ -43,25 +37,26 @@ async fn get_blocks_to_build(db_path: &str) -> anyhow::Result<Vec<u64>> {
         block_number: i64,
     }
 
-    // Use the query_as! macro for type-safe query execution.
     let rows = sqlx::query_as!(BlockRow, "SELECT block_number FROM blocks ORDER BY block_number ASC")
         .fetch_all(&pool)
         .await?;
 
-    // We can close the pool now that we're done with it.
     pool.close().await;
 
-    // Convert the results (i64) to the u64 we need.
     let blocks: Vec<u64> = rows.into_iter().map(|row| row.block_number as u64).collect();
 
     println!("  Found {} blocks to build in the database.", blocks.len());
     Ok(blocks)
 }
 
-/// Executes the block building script for a given block number, streaming its output.
-/// (This function does not need to change)
+
 async fn run_build_for_block(block_number: u64) -> anyhow::Result<()> {
     let log_path = Path::new(OUTPUT_DIR).join(format!("{}.log", block_number));
+    let json_path = Path::new(OUTPUT_DIR).join(format!("block_{}.json", block_number));
+    if tokio::fs::try_exists(&json_path).await? {
+        println!("  -- Skipping block {}, result file already exists. --", block_number);
+        return Ok(());
+    }
     if tokio::fs::try_exists(&log_path).await? {
         println!("  -- Skipping block {}, result file already exists. --", block_number);
         return Ok(());
@@ -129,9 +124,9 @@ async fn run_build_for_block(block_number: u64) -> anyhow::Result<()> {
     println!("--- End Subprocess Output ---");
 
     if status.success() {
-        let full_output = output_lines.join("");
-        tokio::fs::write(&log_path, full_output).await?;
-        println!("  -- Success on block {}, output saved to {:?} --", block_number, log_path);
+        // let full_output = output_lines.join("");
+        // tokio::fs::write(&log_path, full_output).await?;
+        // println!("  -- Success on block {}, output saved to {:?} --", block_number, log_path);
     } else {
         eprintln!(
             "  [Exec Error] Command failed for block {} with exit code {:?}",

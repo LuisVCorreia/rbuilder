@@ -77,7 +77,29 @@ pub enum Algorithm {
         /// Keep top_k sequences.
         top_k: usize,
     },
+    /// `RandomChain` groups orders from the same sender (nonce chain) together.
+    RandomChain { seed: u64, count: usize },
+    /// `RandomImproved` uses a random algorithm with some improvements to find a good ordering.
+    RandomImproved { seed: u64, count: usize },
 }
+
+impl Algorithm {
+    pub fn display(&self) -> &str {
+        match self {
+            Algorithm::Greedy => "Greedy",
+            Algorithm::ReverseGreedy => "ReverseGreedy",
+            Algorithm::Length => "Length",
+            Algorithm::AllPermutations => "AllPermutations",
+            Algorithm::Random { .. } => "Random",
+            Algorithm::Genetic { .. } => "Genetic",
+            Algorithm::ExhaustiveStreaming { .. } => "ExhaustiveStreaming",
+            Algorithm::RandomChain { .. } => "RandomChain",
+            Algorithm::RandomImproved { .. } => "RandomImproved",
+            
+        }
+    }
+}
+
 
 #[cfg(test)]
 mod tests {
