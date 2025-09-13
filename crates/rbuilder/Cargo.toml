@@ -162,4 +162,8 @@ path = "src/bin/run_backtest_fetch_full.rs"
 
 [[bin]]
 name = "rbuilder-build-full"
-path = "src/bin/run_backtest_build_full.rs" 
+path = "src/bin/run_backtest_build_full.rs"
+
+[[bin]]
+name = "rbuilder-conflict-test"
+path = "src/bin/run_conflict_test.rs"

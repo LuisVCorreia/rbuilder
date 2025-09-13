@@ -113,15 +113,15 @@ fn seed_initial_population(
     let mut seeds: Vec<Vec<usize>> = Vec::new();
     let mut seen: AHashSet<Vec<usize>> = AHashSet::default();
 
-    // Greedy and ReverseGreedy
-    for &rev in &[false, true] {
-        for seq in generate_greedy_sequence(task, rev) {
-            let repaired = repair_to_nonce_valid(&seq, layout);
-            if repaired.len() == layout.total_steps && seen.insert(repaired.clone()) {
-                seeds.push(repaired);
-            }
-        }
-    }
+    // // Greedy and ReverseGreedy
+    // for &rev in &[false, true] {
+    //     for seq in generate_greedy_sequence(task, rev) {
+    //         let repaired = repair_to_nonce_valid(&seq, layout);
+    //         if repaired.len() == layout.total_steps && seen.insert(repaired.clone()) {
+    //             seeds.push(repaired);
+    //         }
+    //     }
+    // }
 
     // let to_add = population_size.saturating_sub(seeds.len());
     // let cap = to_add.min(10);
@@ -302,10 +302,10 @@ fn run_dc_generation(
         let p1_idx = indices[i];
         let p2_idx = indices[i+1];
         let (p1, p2) = (&population[p1_idx], &population[p2_idx]);
-        
+
         let mut c1_seq = adapted_order_crossover(&p1.seq, &p2.seq, layout, rng);
         let mut c2_seq = adapted_order_crossover(&p2.seq, &p1.seq, layout, rng);
-        
+
         let multi_steps = layout.multi_steps();
         if rng.gen::<f64>() < params.mutation_rate {
             mutate(&mut c1_seq, layout, rng, &multi_steps);
@@ -416,16 +416,16 @@ impl ResolverContext {
                     res.total_profit
                 );
 
-                if !matches!(task.algorithm, Algorithm::AllPermutations { .. }) {
-                    // Save to JSON
-                    let out_dir = "performance_testing/best_algorithms_with_genetic";
-                    let line = BestAlgorithmJsonLine {
-                        group_id: task.group.id,
-                        best_profit: res.total_profit.to_string(),
-                        algorithm: task.algorithm.display().to_string(),
-                    };
-                    let _ = append_best_algorithm_json_line(&out_dir, self.ctx.evm_env.block_env.number, &line);
-                }
+                // if !matches!(task.algorithm, Algorithm::AllPermutations { .. }) {
+                //     // Save to JSON
+                //     let out_dir = "performance_testing/best_algorithms_with_genetic";
+                //     let line = BestAlgorithmJsonLine {
+                //         group_id: task.group.id,
+                //         best_profit: res.total_profit.to_string(),
+                //         algorithm: task.algorithm.display().to_string(),
+                //     };
+                //     let _ = append_best_algorithm_json_line(&out_dir, self.ctx.block(), &line);
+                // }
 
                 Ok(res)
             }
@@ -450,16 +450,16 @@ impl ResolverContext {
                 }
 
 
-                if !matches!(task.algorithm, Algorithm::AllPermutations { .. }) {
-                    // Save to JSON
-                    let out_dir = "performance_testing/best_algorithms_with_genetic";
-                    let line = BestAlgorithmJsonLine {
-                        group_id: task.group.id,
-                        best_profit: best_resolution_result.total_profit.to_string(),
-                        algorithm: task.algorithm.display().to_string(),
-                    };
-                    let _ = append_best_algorithm_json_line(&out_dir, self.ctx.evm_env.block_env.number, &line);
-                }
+                // if !matches!(task.algorithm, Algorithm::AllPermutations { .. }) {
+                //     // Save to JSON
+                //     let out_dir = "performance_testing/best_algorithms_orig";
+                //     let line = BestAlgorithmJsonLine {
+                //         group_id: task.group.id,
+                //         best_profit: best_resolution_result.total_profit.to_string(),
+                //         algorithm: task.algorithm.display().to_string(),
+                //     };
+                //     let _ = append_best_algorithm_json_line(&out_dir, self.ctx.block(), &line);
+                // }
 
                 trace!(
                     "Resolved conflict task {:?} with profit: {:?} and algorithm: {:?}",
@@ -651,7 +651,6 @@ impl ResolverContext {
         pending_orders: &mut HashMap<(Address, u64), usize>,
         order_idx: usize,
     ) {
-        // println!("Order {:?} failed with error: {:?}", sim_order.order.id(), err);
         if let Some((address, nonce)) = err.try_get_tx_too_high_error(&sim_order.order) {
             pending_orders.insert((address, nonce), order_idx);
         };
@@ -874,7 +873,7 @@ impl ResolverContext {
             .collect();
 
         let payload = ExhaustiveJsonLine {
-            block_number: self.ctx.evm_env.block_env.number,
+            block_number: self.ctx.block(),
             group_id: task.group.id,
             terminated_by_time,
             examined,
@@ -884,7 +883,7 @@ impl ResolverContext {
 
         let _ = append_exhaustive_json_line(
             "performance_testing/exhaustive_streaming",
-            self.ctx.evm_env.block_env.number,
+            self.ctx.block(),
             &payload,
         );
 
@@ -921,13 +920,15 @@ impl ResolverContext {
         for (seqs, rng) in initial_islands {
             let evaluated_results = seqs
                 .into_par_iter()
-                .map(|s| {
-                    if self.cancellation_token.is_cancelled() {
-                        return Err(eyre::eyre!("Cancelled during initial evaluation"));
+                .map_init(
+                    || local_ctx.clone(),
+                    |thread_ctx, s| {
+                        if self.cancellation_token.is_cancelled() {
+                            return Err(eyre::eyre!("Cancelled during initial evaluation"));
+                        }
+                        self.eval_to_individual(s, task, thread_ctx)
                     }
-                    let mut thread_ctx = ThreadBlockBuildingContext::default();
-                    self.eval_to_individual(s, task, &mut thread_ctx)
-                })
+                )
                 .collect::<Result<Vec<_>, _>>()?;
 
             let mut population = Vec::with_capacity(population_per_island);
@@ -962,12 +963,14 @@ impl ResolverContext {
             // Run one generation on each island in parallel
             let gen_results: Vec<DCGenerationResult> = islands
                 .par_iter_mut()
-                .map(|island| {
-                    let mut thread_ctx = ThreadBlockBuildingContext::default();
-                    run_dc_generation(
-                        island, &best_seen, task, &params, &layout, self, &mut thread_ctx
-                    )
-                })
+                .map_init(
+                    || local_ctx.clone(),
+                    |thread_ctx, island| {
+                        run_dc_generation(
+                            island, &best_seen, task, &params, &layout, self, thread_ctx
+                        )
+                    }
+                )
                 .collect::<Result<_, _>>()?;
 
             // Aggregate results for logging
@@ -1064,7 +1067,7 @@ impl ResolverContext {
             let child_survival_rate = (total_children_who_won as f64) / (params.population as f64);
 
             let payload = NSGA2GenLine {
-                block_number: self.ctx.evm_env.block_env.number,
+                block_number: self.ctx.block(),
                 group_id: task.group.id,
                 gen: generation,
                 elapsed_ms: start.elapsed().as_millis() as u64,
@@ -1091,7 +1094,7 @@ impl ResolverContext {
             };
             let _ = append_nsga2_debug_line(
                 "performance_testing/nsga2_debug",
-                self.ctx.evm_env.block_env.number,
+                self.ctx.block(),
                 &payload,
             );
             

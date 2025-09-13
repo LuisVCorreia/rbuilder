@@ -100,16 +100,33 @@ fn get_shared_data_structures() -> (Arc<BestResults>, TaskQueue) {
     let task_queue = Arc::new(SegQueue::new());
     (best_results, task_queue)
 }
+use std::fs::OpenOptions;
+use std::io::{Write, BufWriter};
 
-fn write_perf_json(out_dir: &str, file_name: String, payload: &BacktestPerfJson) -> eyre::Result<()> {
-    let dir = Path::new(out_dir);
+fn write_perf_json_append_ndjson(
+    out_dir: impl AsRef<Path>,
+    file_name: impl AsRef<Path>,
+    payload: &BacktestPerfJson,
+) -> eyre::Result<()> {
+    let dir = out_dir.as_ref();
     if !dir.exists() {
-        let _ = fs::create_dir_all(dir);
+        fs::create_dir_all(dir)?;
     }
-    let json = serde_json::to_string_pretty(payload)?;
-    fs::write(dir.join(file_name), json)?;
+    let path = dir.join(file_name);
+
+    let file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)?;
+    let mut w = BufWriter::new(file);
+
+    let line = serde_json::to_string(payload)?; // compact JSON
+    w.write_all(line.as_bytes())?;
+    w.write_all(b"\n")?;
+    w.flush()?;
     Ok(())
 }
+
 
 fn cmp_res(a: &ResolutionResult, b: &ResolutionResult) -> CmpOrdering {
     // Primary: total_profit desc
@@ -546,7 +563,7 @@ where
     ) = simulation_cache.stats();
 
     let perf = BacktestPerfJson {
-        block_number: input.ctx.evm_env.block_env.number,
+        block_number: input.ctx.block(),
         num_orders,
         groups_total,
         processing_duration_ms: processing_duration.as_millis(),
@@ -562,9 +579,9 @@ where
         cache_efficiency_pct: efficiency,
     };
 
-    let _ = write_perf_json(
-        "performance_testing/improvements_all",
-        format!("block_{:0>8}.json", perf.block_number),
+    let _ = write_perf_json_append_ndjson(
+        "performance_testing/robust_permutation_handling",
+        format!("block_{:0>8}.ndjson", perf.block_number),
         &perf,
     );
 

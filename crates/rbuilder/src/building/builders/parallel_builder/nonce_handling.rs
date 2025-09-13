@@ -421,7 +421,9 @@ pub fn random_interleaving_with_random_choices<R: Rng + ?Sized>(
 
 pub fn is_simple_chain(group: &ConflictGroup) -> bool {
     if let Some(layout) = NonceLayout::from_group(group) {
-        layout.chains.len() == 1 && group.orders.len() == layout.chains[0].steps.len()
+        layout.chains.len() == 1 && (group.orders.len() == layout.chains[0].steps.len()
+            || layout.chains[0].steps.len() == 1)
+
     } else {
         false
     }

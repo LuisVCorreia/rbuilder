@@ -6,36 +6,19 @@ use alloy_primitives::{Address, B256, Bytes, StorageKey, StorageValue, BlockNumb
 use reth_errors::ProviderResult;
 use reth_primitives::{Account, Bytecode, Header};
 use reth_provider::{
-    errors::any::AnyError, AccountReader, BlockHashReader, ProviderError, StateProofProvider, StateProvider, StateProviderBox, StateRootProvider, HashedPostStateProvider, StorageRootProvider
+    errors::any::AnyError, AccountReader, BlockHashReader, ProviderError, StateProofProvider,
+    StateProvider, StateProviderBox, StateRootProvider, HashedPostStateProvider, StorageRootProvider,
 };
-use reth_trie::{updates::TrieUpdates, AccountProof, HashedPostState, TrieInput, MultiProof, MultiProofTargets, StorageMultiProof, StorageProof, HashedStorage};
+use reth_trie::{
+    updates::TrieUpdates, AccountProof, HashedPostState, TrieInput, MultiProof, MultiProofTargets,
+    StorageMultiProof, StorageProof, HashedStorage,
+};
 use alloy_eips::BlockNumHash;
 use revm::database::BundleState;
-use std::sync::Arc;
-use std::path::PathBuf;
-use tokio::runtime::{Builder, Handle};
+use std::{path::PathBuf, sync::Arc};
+use tokio::runtime::Handle;
+use std::future::Future;
 
-#[derive(Clone)]
-pub struct HttpStateProviderFactory {
-    provider: Arc<dyn Provider<Ethereum> + Send + Sync>,
-    cache_db: CacheDB,
-}
-
-// runtime-agnostic block_on
-pub fn block_on_compat<F, T>(fut: F) -> T
-where
-    F: std::future::Future<Output = T>,
-{
-    if let Ok(handle) = Handle::try_current() {
-        tokio::task::block_in_place(|| handle.block_on(fut))
-    } else {
-        Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("build tokio rt")
-            .block_on(fut)
-    }
-}
 
 pub fn key_account(hash: B256, addr: Address) -> String {
     format!("account:{:#x}:{:#x}", hash, addr)
@@ -47,106 +30,119 @@ pub fn key_bytecode(hash: B256, code_hash: B256) -> String {
     format!("bytecode:{:#x}:{:#x}", hash, code_hash)
 }
 pub fn key_block_hash(num: u64) -> String {
-    format!("block_hash:{}", num)
+    format!("block_hash:{num}")
 }
 pub fn key_header(hash: B256) -> String {
     format!("header:{:#x}", hash)
 }
 
+#[inline]
+pub fn run_on_rt<F, T>(rt: &Handle, fut: F) -> T
+where
+    F: Future<Output = T>,
+{
+    match Handle::try_current() {
+        // Already on a Tokio runtime thread → use block_in_place to allow blocking.
+        Ok(_) => tokio::task::block_in_place(|| rt.block_on(fut)),
+        // Not on a Tokio runtime (e.g., std::thread/Rayon) → block directly.
+        Err(_) => rt.block_on(fut),
+    }
+}
+
+#[derive(Clone)]
+pub struct HttpStateProviderFactory {
+    provider: Arc<dyn Provider<Ethereum> + Send + Sync>,
+    cache_db: CacheDB,
+    rt: Handle,
+}
+
 impl HttpStateProviderFactory {
-    pub fn new_with_url_and_cache(url: &str, cache_path: PathBuf) -> Self {
+    pub fn new_with_url_and_cache(
+        url: &str,
+        cache_path: PathBuf,
+        rt: &tokio::runtime::Handle,
+    ) -> eyre::Result<Self> {
         let provider = ProviderBuilder::new()
             .network::<Ethereum>()
-            .on_http(url.parse().expect("Failed to parse provider URL"));
+            .on_http(url.parse()?);
 
-        let state_cache = block_on_compat(StateCache::new(&cache_path))
-            .expect("Failed to open or create state cache");
-
+        // async work executed on the long-lived runtime
+        let state_cache = run_on_rt(rt, StateCache::new(&cache_path))?;
         let cache_db = CacheDB::new(state_cache);
 
-        Self {
+        Ok(Self {
             provider: Arc::new(provider),
             cache_db,
-        }
+            rt: rt.clone(),
+        })
+    }
+
+    #[inline]
+    fn spawn_provider(&self, hash: B256) -> Box<HttpStateProvider> {
+        HttpStateProvider::new(self.provider.clone(), hash, self.cache_db.clone(), self.rt.clone())
     }
 }
 
 impl StateProviderFactory for HttpStateProviderFactory {
     fn history_by_block_number(&self, block_number: BlockNumber) -> ProviderResult<StateProviderBox> {
         if let Some(h) = self.block_hash(block_number)? {
-            return Ok(HttpStateProvider::new(self.provider.clone(), h, self.cache_db.clone()));
+            return Ok(self.spawn_provider(h));
         }
         let provider = self.provider.clone();
-        let res = block_on_compat(async {
-            provider.get_block_by_number(BlockNumberOrTag::Number(block_number)).await
-        })
-        .map_err(|e| ProviderError::Other(AnyError::new(e)))?
-        .ok_or_else(|| ProviderError::Other(AnyError::new(std::io::Error::new(
-            std::io::ErrorKind::Other, "Block not found",
-        ))))?;
+        let res = run_on_rt(&self.rt, async { provider.get_block_by_number(BlockNumberOrTag::Number(block_number)).await })
+            .map_err(|e| ProviderError::Other(AnyError::new(e)))?
+            .ok_or_else(|| ProviderError::Other(AnyError::new(std::io::Error::new(
+                std::io::ErrorKind::Other, "Block not found",
+            ))))?;
 
         let num_key = key_block_hash(block_number);
-        block_on_compat(self.cache_db.block_hashes.set(&num_key, &res.header.hash));
-        Ok(HttpStateProvider::new(self.provider.clone(), res.header.hash, self.cache_db.clone()))
+        let _ = run_on_rt(&self.rt, self.cache_db.block_hashes.set(&num_key, &res.header.hash));
+        Ok(self.spawn_provider(res.header.hash))
     }
 
     fn latest(&self) -> ProviderResult<StateProviderBox> {
         let provider = self.provider.clone();
-        let res = block_on_compat(async { provider.get_block(BlockId::latest()).await })
+        let res = run_on_rt(&self.rt, async { provider.get_block(BlockId::latest()).await })
             .map_err(|e| ProviderError::Other(AnyError::new(e)))?
             .ok_or_else(|| ProviderError::Other(AnyError::new(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "Block not found",
+                std::io::ErrorKind::Other, "Block not found",
             ))))?;
-
-        Ok(HttpStateProvider::new(
-            self.provider.clone(),
-            res.header.hash,
-            self.cache_db.clone(),
-        ))
+        Ok(self.spawn_provider(res.header.hash))
     }
 
     fn history_by_block_hash(&self, block_hash: B256) -> ProviderResult<StateProviderBox> {
-        Ok(HttpStateProvider::new(self.provider.clone(), block_hash, self.cache_db.clone()))
+        Ok(self.spawn_provider(block_hash))
     }
-    
+
     fn header(&self, block_hash: &BlockHash) -> ProviderResult<Option<Header>> {
         let key = key_header(*block_hash);
+        if let Some(h) = run_on_rt(&self.rt, self.cache_db.headers.get(&key)) {
+            return Ok(Some(h));
+        }
         let provider = self.provider.clone();
         let hash = *block_hash;
-        block_on_compat(async move {
-            if let Some(h) = self.cache_db.headers.get(&key).await {
-                return Ok(Some(h));
-            }
-            let res = provider
-                .get_block_by_hash(hash)
-                .await
-                .map_err(|e| ProviderError::Other(AnyError::new(e)))?;
-            if let Some(block) = res {
-                let hdr = block.header.inner;
-                self.cache_db.headers.set(&key, &hdr).await;
-                Ok(Some(hdr))
-            } else {
-                Ok(None)
-            }
-        })
+        let res = run_on_rt(&self.rt, async { provider.get_block_by_hash(hash).await })
+            .map_err(|e| ProviderError::Other(AnyError::new(e)))?;
+        if let Some(block) = res {
+            let hdr = block.header.inner;
+            let _ = run_on_rt(&self.rt, self.cache_db.headers.set(&key, &hdr));
+            Ok(Some(hdr))
+        } else {
+            Ok(None)
+        }
     }
 
     fn last_block_number(&self) -> ProviderResult<BlockNumber> {
         let provider = self.provider.clone();
-        let block_number = block_on_compat(async { provider.get_block_number().await })
+        let block_number = run_on_rt(&self.rt, async { provider.get_block_number().await })
             .map_err(|e| ProviderError::Other(AnyError::new(e)))?;
         Ok(block_number)
     }
 
     fn block_hash(&self, number: BlockNumber) -> ProviderResult<Option<B256>> {
         let provider = self.provider.clone();
-        let block = block_on_compat(async {
-            provider
-                .get_block_by_number(BlockNumberOrTag::Number(number))
-                .await
-        })
-        .map_err(|e| ProviderError::Other(AnyError::new(e)))?;
+        let block = run_on_rt(&self.rt, async { provider.get_block_by_number(BlockNumberOrTag::Number(number)).await })
+            .map_err(|e| ProviderError::Other(AnyError::new(e)))?;
         Ok(block.map(|b| b.header.hash))
     }
 
@@ -156,21 +152,20 @@ impl StateProviderFactory for HttpStateProviderFactory {
 
     fn header_by_number(&self, num: u64) -> ProviderResult<Option<Header>> {
         if let Some(h) = self.block_hash(num)? {
-            if let Some(hdr) = block_on_compat(self.cache_db.headers.get(&format!("header:{:?}", h))) {
+            let k = key_header(h);
+            if let Some(hdr) = run_on_rt(&self.rt, self.cache_db.headers.get(&k)) {
                 return Ok(Some(hdr));
             }
         }
         let provider = self.provider.clone();
-        let res = block_on_compat(async {
-            provider.get_block_by_number(BlockNumberOrTag::Number(num)).await
-        })
-        .map_err(|e| ProviderError::Other(AnyError::new(e)))?;
+        let res = run_on_rt(&self.rt, async { provider.get_block_by_number(BlockNumberOrTag::Number(num)).await })
+            .map_err(|e| ProviderError::Other(AnyError::new(e)))?;
 
         if let Some(block) = res {
             let hash = block.header.hash;
             let hdr = block.header.inner;
-            block_on_compat(self.cache_db.block_hashes.set(&format!("block_hash:{}", num), &hash));
-            block_on_compat(self.cache_db.headers.set(&format!("header:{:?}", hash), &hdr));
+            let _ = run_on_rt(&self.rt, self.cache_db.block_hashes.set(&key_block_hash(num), &hash));
+            let _ = run_on_rt(&self.rt, self.cache_db.headers.set(&key_header(hash), &hdr));
             Ok(Some(hdr))
         } else {
             Ok(None)
@@ -189,6 +184,7 @@ pub struct HttpStateProvider {
     provider: Arc<dyn Provider<Ethereum> + Send + Sync>,
     hash: B256,
     cache_db: CacheDB,
+    rt: Handle,
 }
 
 impl HttpStateProvider {
@@ -196,35 +192,36 @@ impl HttpStateProvider {
         provider: Arc<dyn Provider<Ethereum> + Send + Sync>,
         hash: B256,
         cache_db: CacheDB,
+        rt: Handle,
     ) -> Box<Self> {
-        Box::new(Self { provider, hash, cache_db })
+        Box::new(Self { provider, hash, cache_db, rt })
     }
 }
 
 impl StateProvider for HttpStateProvider {
     fn storage(&self, address: Address, storage_key: StorageKey) -> ProviderResult<Option<StorageValue>> {
         let cache_key = key_storage(self.hash, address, storage_key);
-        block_on_compat(async {
-            if let Some(cached_value) = self.cache_db.storage.get(&cache_key).await {
-                return Ok(Some(cached_value.into()));
-            }
-            let block_id = BlockId::hash(self.hash);
-            let res = self.provider
+        if let Some(cached_value) = run_on_rt(&self.rt, self.cache_db.storage.get(&cache_key)) {
+            return Ok(Some(cached_value.into()));
+        }
+
+        let block_id = BlockId::hash(self.hash);
+        let res = run_on_rt(&self.rt, async {
+            self.provider
                 .get_storage_at(address, storage_key.into())
                 .block_id(block_id)
                 .await
-                .map_err(|e| ProviderError::Other(AnyError::new(e)))?;
-            self.cache_db.storage.set(&cache_key, &res).await;
-            Ok(Some(res.into()))
-        })
+        }).map_err(|e| ProviderError::Other(AnyError::new(e)))?;
+
+        let _ = run_on_rt(&self.rt, self.cache_db.storage.set(&cache_key, &res));
+        Ok(Some(res.into()))
     }
 
     fn bytecode_by_hash(&self, code_hash: &B256) -> ProviderResult<Option<Bytecode>> {
-        let cache_key = format!("bytecode:{}:{}", self.hash, code_hash);
-        block_on_compat(async { Ok(self.cache_db.bytecode.get(&cache_key).await) })
+        let cache_key = key_bytecode(self.hash, *code_hash);
+        Ok(run_on_rt(&self.rt, self.cache_db.bytecode.get(&cache_key)))
     }
 
-    
     fn account_nonce(&self, address: &Address) -> ProviderResult<Option<u64>> {
         match self.basic_account(address)? {
             Some(account) => Ok(Some(account.nonce)),
@@ -236,19 +233,19 @@ impl StateProvider for HttpStateProvider {
 impl BlockHashReader for HttpStateProvider {
     fn block_hash(&self, number: BlockNumber) -> ProviderResult<Option<B256>> {
         let cache_key = key_block_hash(number);
-        block_on_compat(async {
-            if let Some(cached_hash) = self.cache_db.block_hashes.get(&cache_key).await {
-                return Ok(Some(cached_hash));
-            }
-            let block = self.provider
-                .get_block_by_number(BlockNumberOrTag::Number(number))
-                .await
-                .map_err(|e| ProviderError::Other(AnyError::new(e)))?;
-            if let Some(ref b) = block {
-                self.cache_db.block_hashes.set(&cache_key, &b.header.hash).await;
-            }
-            Ok(block.map(|b| b.header.hash))
-        })
+        if let Some(cached_hash) = run_on_rt(&self.rt, self.cache_db.block_hashes.get(&cache_key)) {
+            return Ok(Some(cached_hash));
+        }
+        let block = run_on_rt(&self.rt, async {
+                self.provider
+                    .get_block_by_number(BlockNumberOrTag::Number(number))
+                    .await
+            })
+            .map_err(|e| ProviderError::Other(AnyError::new(e)))?;
+        if let Some(ref b) = block {
+            let _ = run_on_rt(&self.rt, self.cache_db.block_hashes.set(&cache_key, &b.header.hash));
+        }
+        Ok(block.map(|b| b.header.hash))
     }
 
     fn canonical_hashes_range(&self, start: BlockNumber, end: BlockNumber) -> ProviderResult<Vec<B256>> {
@@ -265,35 +262,34 @@ impl BlockHashReader for HttpStateProvider {
 impl AccountReader for HttpStateProvider {
     fn basic_account(&self, address: &Address) -> ProviderResult<Option<Account>> {
         let cache_key = key_account(self.hash, *address);
-        block_on_compat(async {
-            if let Some(cached) = self.cache_db.accounts.get(&cache_key).await {
-                return Ok(Some(cached));
-            }
-            let block_id = BlockId::hash(self.hash);
-            let (balance_res, nonce_res, code_res) = tokio::join!(
-                self.provider.get_balance(*address).block_id(block_id),
-                self.provider.get_transaction_count(*address).block_id(block_id),
-                self.provider.get_code_at(*address).block_id(block_id),
-            );
-            let balance = balance_res.map_err(|e| ProviderError::Other(AnyError::new(e)))?;
-            let nonce   = nonce_res  .map_err(|e| ProviderError::Other(AnyError::new(e)))?;
-            let code    = code_res   .map_err(|e| ProviderError::Other(AnyError::new(e)))?;
+        if let Some(cached) = run_on_rt(&self.rt, self.cache_db.accounts.get(&cache_key)) {
+            return Ok(Some(cached));
+        }
+        let block_id = BlockId::hash(self.hash);
+        let (balance_res, nonce_res, code_res) = run_on_rt(&self.rt, async {
+            let balance = self.provider.get_balance(*address).block_id(block_id).await;
+            let nonce = self.provider.get_transaction_count(*address).block_id(block_id).await;
+            let code = self.provider.get_code_at(*address).block_id(block_id).await;
+            (balance, nonce, code)
+        });
+        let balance = balance_res.map_err(|e| ProviderError::Other(AnyError::new(e)))?;
+        let nonce   = nonce_res  .map_err(|e| ProviderError::Other(AnyError::new(e)))?;
+        let code    = code_res   .map_err(|e| ProviderError::Other(AnyError::new(e)))?;
 
-            // If there is code, compute its hash and store the bytecode by hash in our cache.
-            let bytecode_hash = if code.is_empty() {
-                None
-            } else {
-                let h = keccak256(&code);
-                let bytecode = Bytecode::new_raw(code.clone());
-                let bkey = key_bytecode(self.hash, h);
-                self.cache_db.bytecode.set(&bkey, &bytecode).await;
-                Some(h)
-            };
+        // If there is code, compute its hash and store bytecode by hash.
+        let bytecode_hash = if code.is_empty() {
+            None
+        } else {
+            let h = keccak256(&code);
+            let bytecode = Bytecode::new_raw(code.clone());
+            let bkey = key_bytecode(self.hash, h);
+            let _ = run_on_rt(&self.rt, self.cache_db.bytecode.set(&bkey, &bytecode));
+            Some(h)
+        };
 
-            let result = Account { balance, nonce, bytecode_hash };
-            self.cache_db.accounts.set(&cache_key, &result).await;
-            Ok(Some(result))
-        })
+        let result = Account { balance, nonce, bytecode_hash };
+        let _ = run_on_rt(&self.rt, self.cache_db.accounts.set(&cache_key, &result));
+        Ok(Some(result))
     }
 }
 

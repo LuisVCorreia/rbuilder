@@ -32,7 +32,7 @@ impl StateCache {
         }
 
         let db_url = format!("sqlite:{}?mode=rwc", db_path.to_str().unwrap());
-        let pool = SqlitePoolOptions::new().max_connections(5).connect(&db_url).await?;
+        let pool = SqlitePoolOptions::new().connect(&db_url).await?;
 
         let pragmas = [
             "PRAGMA journal_mode = WAL;",

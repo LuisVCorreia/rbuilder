@@ -317,9 +317,8 @@ pub fn adapted_order_crossover(
     rng: &mut SmallRng,
 ) -> Vec<usize> {
     let n = parent_a.len();
-    if n == 0 {
-        return Vec::new();
-    }
+    if n == 0 { return Vec::new(); }
+    if n == 1 { return vec![parent_a[0]]; }
 
     let p1 = rng.gen_range(0..n);
     let mut p2 = rng.gen_range(0..n);
@@ -363,7 +362,7 @@ pub fn adapted_order_crossover(
             if let Some(&(chain_id, step_id)) = layout.index_of.get(&tx) {
                 if filled_steps.contains(&(chain_id, step_id)) {
                     // This candidate is for a filled slot, so we discard it permanently
-                    progress_made = true; 
+                    progress_made = true;
                     continue;
                 }
             }
@@ -390,7 +389,6 @@ pub fn adapted_order_crossover(
 }
 
 /// Helper to build the predecessor map from the nonce layout.
-/// This version correctly handles multiple candidates per nonce.
 fn build_predecessor_map(layout: &NonceLayout) -> StdHashMap<usize, Vec<usize>> {
     let mut map: StdHashMap<usize, Vec<usize>> = StdHashMap::new();
     for chain in &layout.chains {
@@ -409,7 +407,6 @@ fn build_predecessor_map(layout: &NonceLayout) -> StdHashMap<usize, Vec<usize>> 
 }
 
 /// Helper to check if a transaction is ready to be placed.
-/// This version checks against a list of possible predecessors.
 fn is_ready(tx: &usize, predecessor_map: &StdHashMap<usize, Vec<usize>>, in_child: &HashSet<usize>) -> bool {
     match predecessor_map.get(tx) {
         Some(preds) => preds.iter().any(|pred| in_child.contains(pred)),

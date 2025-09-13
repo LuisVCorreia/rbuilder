@@ -309,22 +309,19 @@ impl BaseConfig {
     
     // Create http provider factory (similar to IPC but with a HTTP endpoint)
     pub fn create_http_provider_factory(&self) -> eyre::Result<HttpStateProviderFactory> {
-        // Validate the URL, but pass the original string to new_with_url_and_cache
         Url::parse(&self.backtest_fetch_eth_rpc_url)?;
-        // Ok(HttpStateProviderFactory::new_with_url(&self.backtest_fetch_eth_rpc_url))
 
-        // let cache_dir = dirs::home_dir()
-        //     .expect("Could not find home directory")
-        //     .join(".cache/rbuilder/");
-        // let cache_file = cache_dir.join("state_cache.sqlite");
+        // Get the long-lived Tokio handle
+        let rt = tokio::runtime::Handle::try_current()
+            .map_err(|_| eyre::eyre!("create_http_provider_factory must run on a Tokio runtime"))?;
 
-        // Ok(HttpStateProviderFactory::new_with_url_and_cache(&self.backtest_fetch_eth_rpc_url, cache_file))
-        Ok(HttpStateProviderFactory::new_with_url_and_cache(
+        HttpStateProviderFactory::new_with_url_and_cache(
             &self.backtest_fetch_eth_rpc_url,
             PathBuf::from("rbuilder_results_1/cache/state_cache.sqlite"),
-        ))
-        // Ok(HttpStateProviderFactory::new_with_url(&self.backtest_fetch_eth_rpc_url))
+            &rt,
+        )
     }
+
 
     /// Create HTTP provider factory reopener for backtest compatibility
     pub fn create_http_provider_factory_reopener(&self) -> eyre::Result<crate::utils::HttpProviderFactoryReopener> {

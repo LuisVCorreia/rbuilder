@@ -505,23 +505,21 @@ pub fn get_tasks_for_group(group: &ConflictGroup, priority: TaskPriority) -> Vec
                     created_at,
                 });
             } else {
-                if group.id == 107 {
-                    tasks.push(ConflictTask {
-                        group_idx: group.id,
-                        algorithm: Algorithm::Genetic {
-                            population: 30,
-                            crossover_rate: 0.9,
-                            mutation_rate: 0.2,
-                            tourn_k: 3,
-                            max_generations: 50,
-                            time_ms: 6000,
-                            seed: group.id as u64,
-                        },
-                        priority: TaskPriority::Medium,
-                        group: group.clone(),
-                        created_at,
-                    });
-                }
+                tasks.push(ConflictTask {
+                    group_idx: group.id,
+                    algorithm: Algorithm::Genetic {
+                        population: 30,
+                        crossover_rate: 0.9,
+                        mutation_rate: 0.2,
+                        tourn_k: 3,
+                        max_generations: 50,
+                        time_ms: 6000,
+                        seed: group.id as u64 * 2,
+                    },
+                    priority: TaskPriority::Medium,
+                    group: group.clone(),
+                    created_at,
+                });
 
                 // tasks.push(ConflictTask {
                 //     group_idx: group.id,
@@ -553,7 +551,7 @@ pub fn get_tasks_for_group(group: &ConflictGroup, priority: TaskPriority) -> Vec
                 tasks.push(ConflictTask {
                     group_idx: group.id,
                     algorithm: Algorithm::Random {
-                        seed: group.id as u64,
+                        seed: group.id as u64 * 2,
                         count: NUMBER_OF_RANDOM_TASKS,
                     },
                     priority: TaskPriority::Low,
