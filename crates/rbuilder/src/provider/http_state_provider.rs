@@ -42,9 +42,9 @@ where
     F: Future<Output = T>,
 {
     match Handle::try_current() {
-        // Already on a Tokio runtime thread → use block_in_place to allow blocking.
+        // Already on a Tokio runtime thread, use block_in_place to allow blocking.
         Ok(_) => tokio::task::block_in_place(|| rt.block_on(fut)),
-        // Not on a Tokio runtime (e.g., std::thread/Rayon) → block directly.
+        // Not on a Tokio runtime (e.g., std::thread/Rayon), block directly.
         Err(_) => rt.block_on(fut),
     }
 }

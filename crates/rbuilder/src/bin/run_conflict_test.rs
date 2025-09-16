@@ -7,12 +7,9 @@ use tokio::{
 };
 use futures::stream::{self, StreamExt};
 
-// --- Configuration ---
 
-// The path to the SQLite database.
 const DB_PATH: &str = "rbuilder_results_1/main.sqlite";
 
-// The directory where successful build logs and JSON outputs will be saved.
 const OUTPUT_DIR: &str = "performance_testing/exhaustive_streaming";
 
 const EXECUTABLE: &str = "./target/debug/backtest-build-block";
@@ -32,26 +29,21 @@ async fn get_blocks_to_build(db_path: &str) -> anyhow::Result<Vec<u64>> {
         anyhow::bail!("Database not found at '{}'", db_path);
     }
 
-    // sqlx requires a connection string with a protocol prefix.
     let connection_string = format!("sqlite://{}", db_path);
     let pool = SqlitePool::connect(&connection_string)
         .await
         .context("Failed to connect to SQLite database")?;
 
-    // A simple struct to map the query result to.
     struct BlockRow {
         block_number: i64,
     }
 
-    // Use the query_as! macro for type-safe query execution.
     let rows = sqlx::query_as!(BlockRow, "SELECT block_number FROM blocks ORDER BY block_number ASC")
         .fetch_all(&pool)
         .await?;
 
-    // We can close the pool now that we're done with it.
     pool.close().await;
 
-    // Convert the results (i64) to the u64 we need.
     let blocks: Vec<u64> = rows.into_iter().map(|row| row.block_number as u64).collect();
 
     println!("  Found {} blocks to build in the database.", blocks.len());
@@ -90,10 +82,8 @@ async fn run_build_for_block(block_number: u64) -> anyhow::Result<()> {
     let mut stdout_line = String::new();
     let mut stderr_line = String::new();
 
-    // Optional: prefix lines so parallel runs don’t interleave confusingly
     let prefix = format!("[{}] ", block_number);
 
-    // Read both until BOTH are done (don’t break when one hits EOF)
     let mut stdout_done = false;
     let mut stderr_done = false;
 
@@ -156,9 +146,7 @@ async fn main() -> anyhow::Result<()> {
     println!("--- Starting rbuilder Block Building Process ---");
     println!("--- Logs for successful builds will be saved to the '{}/' directory. ---", OUTPUT_DIR);
 
-    // let blocks_to_process = get_blocks_to_build(DB_PATH).await?;
-
-    let blocks_to_process = vec![19872271u64];
+    let blocks_to_process = get_blocks_to_build(DB_PATH).await?;
 
     if blocks_to_process.is_empty() {
         println!("\nNo blocks found to process. Exiting.");
@@ -173,14 +161,13 @@ async fn main() -> anyhow::Result<()> {
     let total_blocks = blocks_to_process.len();
     println!("  Planning to process {} blocks with concurrency = {}", total_blocks, concurrency);
 
-    // Queue them all, run up to `concurrency` at a time
     let results = stream::iter(blocks_to_process.into_iter().enumerate())
         .map(|(i, block_number)| async move {
             println!("\n--- Queued block {} ({}/{}) ---", block_number, i + 1, total_blocks);
             let res = run_build_for_block(block_number).await;
             (block_number, res)
         })
-        .buffer_unordered(concurrency) // Control concurrency here
+        .buffer_unordered(concurrency)
         .collect::<Vec<_>>()
         .await;
 

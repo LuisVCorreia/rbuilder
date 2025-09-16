@@ -26,7 +26,7 @@ fn build_descriptors(sim_orders: &[Arc<SimulatedOrder>]) -> Vec<OrderDesc> {
     }).collect()
 }
 
-/// Choose the “best” blob at a nonce (highest profit, tie --> smaller blob_gas).
+/// Choose the “best” blob at a nonce (highest profit, tie -> smaller blob_gas).
 fn choose_best_blob<'a>(blobs: &[&'a OrderDesc]) -> &'a OrderDesc {
     let mut best = blobs[0];
     for &d in blobs.iter().skip(1) {
@@ -39,7 +39,6 @@ fn choose_best_blob<'a>(blobs: &[&'a OrderDesc]) -> &'a OrderDesc {
     best
 }
 
-/// Per-nonce raw group (uncondensed) for reconstruction.
 #[derive(Clone, Debug)]
 struct RawGroup {
     nonce: u64,
@@ -59,14 +58,14 @@ struct RepNode<'a> {
 /// Value/gas step contributed by selecting a blob at position i (inclusive) up to next blob (exclusive).
 #[derive(Clone, Debug)]
 struct Step {
-    delta_v: U256,   // sum of representative profits in that segment
-    delta_w: u64,    // blob gas of the starting blob
+    delta_v: U256,  // sum of representative profits in that segment
+    delta_w: u64,  // blob gas of the starting blob
 }
 
 /// A signer class: raw groups for reconstruction + a condensed chain for scoring
 #[derive(Clone, Debug)]
 struct Class<'a> {
-    raw_groups: Vec<RawGroup>,    // full duplicates kept (by nonce)
+    raw_groups: Vec<RawGroup>,  // full duplicates kept (by nonce)
     rep_chain: Vec<RepNode<'a>>,  // one representative per nonce
     blob_idx: Vec<usize>,         // indices into rep_chain that are blobs
     steps: Vec<Step>,             // incremental steps between consecutive blobs
@@ -111,7 +110,7 @@ fn prepare_classes<'a>(
         profit_by_id.insert(d.id, d.profit);
     }
 
-    // group candidates with clear (signer,nonce); keep multi-signer/ambiguous upfront
+    // group candidates with clear (signer,nonce)
     let mut by_signer: AHashMap<Address, Vec<&OrderDesc>> = AHashMap::default();
     for d in descs {
         match (d.signer, d.nonce) {
@@ -189,7 +188,6 @@ fn prepare_classes<'a>(
             rep_chain.push(rep);
         }
 
-        // Blob indices in rep_chain
         let blob_idx: Vec<usize> = rep_chain.iter()
             .enumerate()
             .filter_map(|(i, rn)| rn.is_blob.then_some(i))
@@ -231,7 +229,6 @@ fn greedy_once<'a>(classes: &'a [Class<'a>], blob_cap: u64, strategy: Strategy) 
         }
         if candidates.is_empty() { break; }
 
-        // Sort by strategy
         match strategy {
             Strategy::Ratio => {
                 candidates.sort_unstable_by(|a, b| cmp_ratio((a.1, a.2), (b.1, b.2)).reverse());
@@ -255,13 +252,12 @@ fn greedy_once<'a>(classes: &'a [Class<'a>], blob_cap: u64, strategy: Strategy) 
         if !picked { break; }
     }
 
-    // Reconstruct keep-set from RAW GROUPS.
     let mut keep: AHashSet<OrderId> = AHashSet::default();
 
     for (i, cls) in classes.iter().enumerate() {
         let k = chosen_prefix[i]; // number of blobs accepted for this signer
         if k >= cls.blob_idx.len() {
-            // selected all blobs → keep entire RAW chain:
+            // selected all blobs -> keep entire RAW chain:
             // - for blob nonces: keep ONLY the chosen blob (not all blob-alternatives)
             // - for normal-only nonces: keep ALL normal duplicates
             for g in &cls.raw_groups {
@@ -274,15 +270,15 @@ fn greedy_once<'a>(classes: &'a [Class<'a>], blob_cap: u64, strategy: Strategy) 
                 }
             }
         } else {
-            // we did not select the blob at blob_idx[k] → cutoff at that blob's nonce
+            // we did not select the blob at blob_idx[k] -> cutoff at that blob's nonce
             let cutoff_nonce = cls.rep_chain[cls.blob_idx[k]].nonce;
             for g in &cls.raw_groups {
                 if g.nonce < cutoff_nonce {
                     if let Some(chosen_blob) = g.chosen_blob_id {
-                        // earlier blob (must have been selected); keep ONLY the chosen blob here
+                        // earlier blob (must have been selected); keep only the chosen blob here
                         keep.insert(chosen_blob);
                     } else {
-                        // normal-only nonce before cutoff → keep ALL normal alternatives
+                        // normal-only nonce before cutoff -> keep all normal alternatives
                         for &id in &g.normals_ids {
                             keep.insert(id);
                         }
@@ -307,7 +303,6 @@ fn select_keep_set(descs: &[OrderDesc], blob_cap: u64) -> AHashSet<OrderId> {
     let (_kr, keep_ratio) = greedy_once(&classes, blob_cap, Strategy::Ratio);
     let (_ka, keep_abs)   = greedy_once(&classes, blob_cap, Strategy::Absolute);
 
-    // Add always-keep to both and score.
     let mut with_ratio = keep_ratio;
     let mut with_abs   = keep_abs;
     for k in &always_keep { with_ratio.insert(*k); with_abs.insert(*k); }
@@ -344,7 +339,7 @@ mod tests {
 
     fn dummy_tx_id(n: u8) -> OrderId {
         let mut bytes = [0u8; 32];
-        bytes[31] = n; // unique last byte
+        bytes[31] = n;
         OrderId::Tx(B256::new(bytes))
     }
 
@@ -442,12 +437,12 @@ mod tests {
             od(21, 9, 10, Some(b), Some(1)), // B blob
         ];
 
-        // cap=10 → expect {11,21} (ratio beats absolute here)
+        // cap=10 -> expect {11,21} (ratio beats absolute here)
         let keep = select_keep_set(&d, 10);
         let expected: AHashSet<OrderId> = [dummy_tx_id(11), dummy_tx_id(21)].into_iter().collect();
         assert_eq!(keep, expected);
 
-        // cap=20 → both blobs fit → {11,12,13,21}
+        // cap=20 -> both blobs fit -> {11,12,13,21}
         let keep2 = select_keep_set(&d, 20);
         let exp2: AHashSet<OrderId> = [11u8,12,13,21].into_iter().map(dummy_tx_id).collect();
         assert_eq!(keep2, exp2);

@@ -5,7 +5,7 @@ use num_traits::One;
 
 use super::{
     ConflictGroup,
-    task::{ConflictTask, Algorithm},
+    task::ConflictTask,
     conflict_resolvers::generate_sequences_of_orders_to_try,
     nonce_handling::NonceLayout,
 };
@@ -31,7 +31,7 @@ pub struct GroupMetrics {
     multinomial_permutations: MultinomialStat, // interleavings of nonce steps only (no per-step choices)
     pub rbuilder_total_sequences_planned: usize,
     pub rbuilder_unique_input_sequences: usize,
-    pub rbuilder_unique_executed_sequences: usize, // after canonicalization, full-length
+    pub rbuilder_unique_executed_sequences: usize,
     per_algo: Vec<AlgoCount>,
 }
 
@@ -57,20 +57,6 @@ pub struct BlockMetrics {
     pub simulation_cache: CacheStats,
 }
 
-fn algo_name(a: &Algorithm) -> &'static str {
-    match a {
-        Algorithm::Greedy => "Greedy",
-        Algorithm::ReverseGreedy => "ReverseGreedy",
-        Algorithm::Length => "Length",
-        Algorithm::AllPermutations => "AllPermutations",
-        Algorithm::Random { .. } => "Random",
-        Algorithm::Genetic { .. } => "Genetic",
-        Algorithm::ExhaustiveStreaming { .. } => "ExhaustiveStreaming",
-        Algorithm::RandomImproved { .. } => "RandomImproved",
-        Algorithm::RandomChain { .. } => "RandomChain",
-    }
-}
-
 fn binom_big(n: usize, k: usize) -> BigUint {
     let k = k.min(n - k);
     let mut res = BigUint::one();
@@ -82,7 +68,6 @@ fn binom_big(n: usize, k: usize) -> BigUint {
 }
 
 fn multinomial_exact_and_log10(n: usize, lens: &[usize]) -> (BigUint, f64) {
-    // exact = ∏_j C(remaining, k_j)
     let mut remaining = n;
     let mut exact = BigUint::one();
     for &k in lens {
@@ -99,11 +84,11 @@ fn multinomial_exact_and_log10(n: usize, lens: &[usize]) -> (BigUint, f64) {
 
 
 /// Return a canonical, valid execution order from a raw sequence:
-/// - choose at most one tx per (sender,nonce), namely the one that appears earliest in `seq`
+/// - choose at most one tx per (sender,nonce), namely the one that appears earliest in seq
 /// - within each sender, keep nonce order
 /// - across senders (and items with no sender/nonce), order by the raw position of that chosen tx
 ///
-/// If a slot has no candidate present in `seq`, it's skipped (we don't invent one).
+/// If a slot has no candidate present in seq, it's skipped
 pub fn normalize_sequence_to_executable(layout: &NonceLayout, seq: &[usize]) -> Vec<usize> {
     // 1) position of each index in the raw sequence
     let mut pos_of: HashMap<usize, usize> = HashMap::default();
@@ -172,7 +157,7 @@ pub fn normalize_sequence_to_executable(layout: &NonceLayout, seq: &[usize]) -> 
             }
         }
 
-        // next slot rep for each sender (if any)
+        // next slot rep for each sender
         for (s, reps) in reps_per_sender.iter().enumerate() {
             let p = ptr_per_sender[s];
             if p < reps.len() {
@@ -186,7 +171,6 @@ pub fn normalize_sequence_to_executable(layout: &NonceLayout, seq: &[usize]) -> 
 
         let Some((_, kind, s, _, idx)) = best else { break; };
 
-        // emit & advance the corresponding pointer
         out.push(idx);
         if kind == 1 {
             free_ptr += 1;
@@ -200,16 +184,14 @@ pub fn normalize_sequence_to_executable(layout: &NonceLayout, seq: &[usize]) -> 
 
 
 pub fn build_group_metrics_for_tasks(group: &ConflictGroup, tasks: &[ConflictTask]) -> GroupMetrics {
-    // Build the nonce layout once. If None (bundles / multi-tx), we won’t normalize
     let layout_opt = NonceLayout::from_group(group);
 
-    // Per-sender step counts (dedup’d by nonce) + product of per-step candidate counts
     let (lens, n_steps, choice_prod_big, choice_log10): (Vec<usize>, usize, BigUint, f64) =
         if let Some(ref layout) = layout_opt {
             let lens: Vec<usize> = layout.chain_lengths();
             let n_steps: usize = lens.iter().sum();
 
-            // Multiply number of candidates in each NONCE STEP (i.e., duplicate-nonce choices)
+            // Multiply number of candidates in each nonce step
             let mut prod = BigUint::one();
             let mut log10_sum = 0.0;
             for mult in layout.multiplicities() {
@@ -219,7 +201,6 @@ pub fn build_group_metrics_for_tasks(group: &ConflictGroup, tasks: &[ConflictTas
             }
             (lens, n_steps, prod, log10_sum)
         } else {
-            // No nonce structure available (bundles/mixed). Treat as plain permutations
             let n = group.orders.len();
             (vec![n], n, BigUint::one(), 0.0)
         };
@@ -239,7 +220,7 @@ pub fn build_group_metrics_for_tasks(group: &ConflictGroup, tasks: &[ConflictTas
     let mut uniq_exec:   HashSet<Vec<usize>> = HashSet::default();
 
     for t in tasks {
-        let algo = algo_name(&t.algorithm).to_string();
+        let algo = t.algorithm.display().to_string();
         let seqs = generate_sequences_of_orders_to_try(t);
         total += seqs.len();
         per_algo.push(AlgoCount { algorithm: algo, planned_sequences: seqs.len() });
@@ -251,7 +232,7 @@ pub fn build_group_metrics_for_tasks(group: &ConflictGroup, tasks: &[ConflictTas
                 let norm = normalize_sequence_to_executable(layout, &s);
                 uniq_exec.insert(norm);
             } else {
-                // No nonce view, count the raw sequence.
+                // No nonce layout, count the raw sequence.
                 uniq_exec.insert(s);
             }
         }

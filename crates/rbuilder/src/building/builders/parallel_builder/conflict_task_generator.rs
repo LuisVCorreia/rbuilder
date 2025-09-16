@@ -334,120 +334,6 @@ impl ConflictTaskGenerator {
     }
 }
 
-use std::sync::OnceLock;
-static RB_ALLOWLIST: OnceLock<HashMap<u64, HashSet<usize>>> = OnceLock::new();
-
-fn selected_groups() -> &'static HashMap<u64, HashSet<usize>> {
-    RB_ALLOWLIST.get_or_init(|| {
-        let mut m: HashMap<u64, HashSet<usize>> = HashMap::default();
-
-        // helper to insert
-        let mut ins = |bn: u64, gid: usize| { m.entry(bn).or_default().insert(gid); };
-
-        ins(22274264, 104);
-        ins(20314472, 21);
-        ins(21626181, 10);
-        ins(20311195, 4);
-        ins(22489877, 9);
-        ins(22485725, 43);
-        ins(22485138, 5);
-        ins(20100348, 3);
-        ins(19874363, 2);
-        ins(20969654, 13);
-        ins(19657221, 115);
-        ins(22712795, 38);
-        ins(22712795, 32);
-        ins(21195356, 125);
-        ins(21195356, 22);
-        ins(19660788, 147);
-        ins(19660788, 158);
-        ins(20967865, 21);
-        ins(21854682, 57);
-        ins(21854682, 65);
-        ins(21408989, 27);
-        ins(21405709, 5);
-        ins(21191186, 0);
-        ins(22273666, 14);
-        ins(22273968, 0);
-        ins(21628569, 21);
-        ins(21628569, 5);
-        ins(22713092, 36);
-        ins(20098565, 59);
-        ins(20097670, 4);
-        ins(19871974, 9);
-        ins(20752606, 7);
-        ins(22053356, 0);
-        ins(21195654, 11);
-        ins(20096476, 22);
-        ins(20533017, 55);
-        ins(20099460, 81);
-        ins(19662577, 40);
-        ins(22277248, 96);
-        ins(20758891, 84);
-        ins(20758891, 2);
-        ins(20534208, 58);
-        ins(20534208, 7);
-        ins(22055148, 3);
-        ins(21627080, 0);
-        ins(21627080, 23);
-        ins(19664061, 28);
-        ins(19664061, 49);
-        ins(19877353, 47);
-        ins(21850521, 69);
-        ins(19663766, 24);
-        ins(21630657, 5);
-        ins(19878248, 6);
-        ins(21407499, 13);
-        ins(20094404, 14);
-        ins(21408395, 6);
-        ins(21406904, 25);
-        ins(22708631, 13);
-        ins(21191485, 3);
-        ins(20970547, 21);
-        ins(20969056, 18);
-        ins(20314771, 10);
-        ins(20967265, 5);
-        ins(22276948, 5);
-        ins(20093805, 45);
-        ins(20095290, 179);
-        ins(22051261, 13);
-        ins(22276053, 0);
-        ins(21194167, 18);
-        ins(21631553, 71);
-        ins(21191783, 15);
-        ins(22490176, 31);
-        ins(19876754, 0);
-        ins(22274564, 1);
-
-        m
-    })
-}
-
-#[inline]
-fn is_selected_group(block_number: u64, group_id: usize) -> bool {
-    selected_groups()
-        .get(&block_number)
-        .map_or(false, |set| set.contains(&group_id))
-}
-
-/// Optional, non-breaking wrapper: pass `Some(block_number)` to filter,
-/// or `None` to behave like the legacy `get_tasks_for_group`.
-pub fn get_tasks_for_group_filtered(
-    group: &ConflictGroup,
-    priority: TaskPriority,
-    block_number: Option<u64>,
-) -> Vec<ConflictTask> {
-    if let Some(bn) = block_number {
-        if !is_selected_group(bn, group.id) {
-            // Skip this group entirely
-            return vec![];
-        }
-    }
-    // Fall back to the existing policy
-    get_tasks_for_group(group, priority)
-}
-
-
 /// Generates a vector of conflict tasks for a given order group.
 ///
 /// # Arguments
@@ -488,14 +374,6 @@ pub fn get_tasks_for_group(group: &ConflictGroup, priority: TaskPriority) -> Vec
             let ln_cap = (MULTINOMIAL_ALL_PERMS_THRESHOLD as f64).ln();
             let small = stats.ln_with_choice <= ln_cap + 1e-12;
 
-            println!("Group {}: {} orders, multinomial {}, ln={}{}",
-                group.id,
-                group.orders.len(),
-                stats.ln_multinomial,
-                stats.ln_with_choice,
-                if small { "" } else { " (too large)" }
-            );
-
             if small {
                 tasks.push(ConflictTask {
                     group_idx: group.id,
@@ -514,7 +392,7 @@ pub fn get_tasks_for_group(group: &ConflictGroup, priority: TaskPriority) -> Vec
                         tourn_k: 3,
                         max_generations: 50,
                         time_ms: 6000,
-                        seed: group.id as u64 * 2,
+                        seed: group.id as u64,
                     },
                     priority: TaskPriority::Medium,
                     group: group.clone(),
@@ -523,45 +401,7 @@ pub fn get_tasks_for_group(group: &ConflictGroup, priority: TaskPriority) -> Vec
 
                 // tasks.push(ConflictTask {
                 //     group_idx: group.id,
-                //     algorithm: Algorithm::Genetic {
-                //         population: 20,
-                //         crossover_rate: 0.9,
-                //         mutation_rate: 0.4,
-                //         tourn_k: 2,
-                //         max_generations: 100,
-                //         time_ms: 3000,
-                //         seed: group.id as u64,
-                //     },
-                //     priority: TaskPriority::Medium,
-                //     group: group.clone(),
-                //     created_at,
-                // });
-
-                // tasks.push(ConflictTask {
-                //         group_idx: group.id,
-                //         algorithm: Algorithm::ExhaustiveStreaming {
-                //             time_ms: 5_000, // 1 hour
-                //             top_k: 20,
-                //         },
-                //         priority: TaskPriority::Low,
-                //         group: group.clone(),
-                //         created_at,
-                //     });
-
-                tasks.push(ConflictTask {
-                    group_idx: group.id,
-                    algorithm: Algorithm::Random {
-                        seed: group.id as u64 * 2,
-                        count: NUMBER_OF_RANDOM_TASKS,
-                    },
-                    priority: TaskPriority::Low,
-                    group: group.clone(),
-                    created_at,
-                });
-
-                // tasks.push(ConflictTask {
-                //     group_idx: group.id,
-                //     algorithm: Algorithm::RandomChain {
+                //     algorithm: Algorithm::Random {
                 //         seed: group.id as u64,
                 //         count: NUMBER_OF_RANDOM_TASKS,
                 //     },
@@ -581,26 +421,26 @@ pub fn get_tasks_for_group(group: &ConflictGroup, priority: TaskPriority) -> Vec
                     created_at,
                 });
 
-                // tasks.push(ConflictTask {
-                //     group_idx: group.id,
-                //     algorithm: Algorithm::Length,
-                //     priority: TaskPriority::Low,
-                //     group: group.clone(),
-                //     created_at,
-                // });
-                // tasks.push(ConflictTask {
-                //     group_idx: group.id,
-                //     algorithm: Algorithm::ReverseGreedy,
-                //     priority: TaskPriority::Low,
-                //     group: group.clone(),
-                //     created_at,
-                // });
+                tasks.push(ConflictTask {
+                    group_idx: group.id,
+                    algorithm: Algorithm::Length,
+                    priority: TaskPriority::Low,
+                    group: group.clone(),
+                    created_at,
+                });
+                tasks.push(ConflictTask {
+                    group_idx: group.id,
+                    algorithm: Algorithm::ReverseGreedy,
+                    priority: TaskPriority::Low,
+                    group: group.clone(),
+                    created_at,
+                });
             }
             return tasks;
         }
     }
 
-    // Fallback: legacy policy (bundles/multi-tx orders / cannot extract sender+nonce)
+    // Fallback: legacy policy
     tasks.push(ConflictTask {
         group_idx: group.id,
         algorithm: Algorithm::Greedy,

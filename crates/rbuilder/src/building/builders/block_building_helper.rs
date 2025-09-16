@@ -209,16 +209,15 @@ impl BlockBuildingHelperFromProvider {
         let payout_tx_gas = if building_ctx.coinbase_is_suggested_fee_recipient() {
             None
         } else {
-            None
-            // let payout_tx_gas = estimate_payout_gas_limit(
-            //     building_ctx.attributes.suggested_fee_recipient,
-            //     &building_ctx,
-            //     local_ctx,
-            //     &mut block_state,
-            //     0,
-            // )?;
-            // partial_block.reserve_gas(payout_tx_gas);
-            // Some(payout_tx_gas)
+            let payout_tx_gas = estimate_payout_gas_limit(
+                building_ctx.attributes.suggested_fee_recipient,
+                &building_ctx,
+                local_ctx,
+                &mut block_state,
+                0,
+            )?;
+            partial_block.reserve_gas(payout_tx_gas);
+            Some(payout_tx_gas)
         };
 
         Ok(Self {
@@ -231,10 +230,6 @@ impl BlockBuildingHelperFromProvider {
             built_block_trace: BuiltBlockTrace::new(),
             cancel_on_fatal_error,
         })
-    }
-
-    pub fn get_gas_used(&self) -> u64 {
-        self.partial_block.gas_used
     }
 
     /// Trace and telemetry
@@ -392,7 +387,6 @@ impl BlockBuildingHelper for BlockBuildingHelperFromProvider {
                 .partial_block
                 .get_proposer_payout_tx_value(payout_tx_gas, &self.building_ctx)?)
         } else {
-            println!("True block value called with no payout tx gas");
             Ok(self.partial_block.coinbase_profit)
         }
     }

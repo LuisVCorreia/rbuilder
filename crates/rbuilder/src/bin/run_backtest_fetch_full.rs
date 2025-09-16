@@ -6,7 +6,6 @@ use std::collections::BTreeSet;
 use std::path::PathBuf;
 use tokio::{process::Command, time::{sleep, Duration}};
 
-// ----- Config -----
 
 const BASE_COMMAND: &[&str] = &[
     "./target/debug/backtest-fetch",
@@ -19,18 +18,13 @@ const OUTPUT_DIR: &str = "rbuilder_results_high_mev_sample/fetch_outputs";
 const MAX_RETRIES: u32 = 20;
 const DESIRED_BLOCKS: usize = 200;
 
-// Move the sampling window away from UTC day edges:
 const SAFETY_START_OFFSET_SECS: i64 = 3 * 60; // +4 minutes
 const SAFETY_END_MARGIN_SECS: i64 = 50;        // -50 seconds
 
-// Input date comes from env, fallback provided here
 const TARGET_DATE_ENV: &str = "MEV_DAY";
 const DEFAULT_TARGET_DATE: &str = "2025-07-04";
 
-// Optional gentle throttle for Etherscan (free tier is rate-limited)
 const API_CALL_PAUSE_MS: u64 = 200;
-
-// ----- API types -----
 
 #[derive(Deserialize)]
 struct EtherscanResponse {
@@ -38,9 +32,7 @@ struct EtherscanResponse {
     result: String,
 }
 
-// ----- Helpers -----
 
-/// Parse MEV day from env in either "DD/MM/YYYY" or "YYYY-MM-DD".
 fn parse_target_date() -> anyhow::Result<NaiveDate> {
     let s = std::env::var(TARGET_DATE_ENV).unwrap_or_else(|_| DEFAULT_TARGET_DATE.to_string());
     if let Ok(d) = NaiveDate::parse_from_str(&s, "%d/%m/%Y") { return Ok(d); }
@@ -48,7 +40,6 @@ fn parse_target_date() -> anyhow::Result<NaiveDate> {
     anyhow::bail!("Could not parse MEV day {:?}. Use DD/MM/YYYY or YYYY-MM-DD.", s)
 }
 
-/// Etherscan: block at/just before a unix timestamp.
 async fn get_block_number_by_timestamp(ts: i64) -> anyhow::Result<Option<u64>> {
     let api_key = std::env::var("ETHERSCAN_API_KEY")
         .context("[Config Error] ETHERSCAN_API_KEY not found in environment.")?;
@@ -81,7 +72,6 @@ async fn get_block_number_by_timestamp(ts: i64) -> anyhow::Result<Option<u64>> {
     Ok(None)
 }
 
-/// Evenly spaced timestamps (inclusive) between [start_ts, end_ts].
 fn choose_timestamps_evenly(start_ts: i64, end_ts: i64, n: usize) -> Vec<i64> {
     if n == 0 || end_ts <= start_ts { return vec![]; }
     if n == 1 { return vec![start_ts]; }
@@ -92,7 +82,6 @@ fn choose_timestamps_evenly(start_ts: i64, end_ts: i64, n: usize) -> Vec<i64> {
     }).collect()
 }
 
-/// Try a specific block, and if it fails walk forward up to MAX_RETRIES, but don’t go past `end_block_cap`.
 async fn run_backtest_for_block_capped(initial_block_number: u64, end_block_cap: u64) -> anyhow::Result<()> {
     for i in 0..MAX_RETRIES {
         let current_block = initial_block_number + i as u64;
@@ -146,7 +135,6 @@ async fn run_backtest_for_block_capped(initial_block_number: u64, end_block_cap:
     Ok(())
 }
 
-// ----- Main -----
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -189,7 +177,7 @@ async fn main() -> anyhow::Result<()> {
                 picks.insert(b);
             }
         }
-        sleep(Duration::from_millis(API_CALL_PAUSE_MS)).await; // be gentle
+        sleep(Duration::from_millis(API_CALL_PAUSE_MS)).await;
     }
 
     let chosen: Vec<u64> = picks.into_iter().collect();

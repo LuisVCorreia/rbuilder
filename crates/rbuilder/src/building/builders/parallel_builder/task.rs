@@ -71,14 +71,6 @@ pub enum Algorithm {
     Random { seed: u64, count: usize },
     /// `Genetic` uses a genetic algorithm to find a good ordering.
     Genetic { population: usize, crossover_rate: f64, mutation_rate: f64, tourn_k: usize, max_generations: usize, time_ms: u64, seed: u64 },
-    ExhaustiveStreaming {
-        /// Time limit for this task (e.g. 1 hour = 3_600_000 ms).
-        time_ms: u64,
-        /// Keep top_k sequences.
-        top_k: usize,
-    },
-    /// `RandomChain` groups orders from the same sender (nonce chain) together.
-    RandomChain { seed: u64, count: usize },
     /// `RandomImproved` uses a random algorithm with some improvements to find a good ordering.
     RandomImproved { seed: u64, count: usize },
 }
@@ -92,10 +84,8 @@ impl Algorithm {
             Algorithm::AllPermutations => "AllPermutations",
             Algorithm::Random { .. } => "Random",
             Algorithm::Genetic { .. } => "Genetic",
-            Algorithm::ExhaustiveStreaming { .. } => "ExhaustiveStreaming",
-            Algorithm::RandomChain { .. } => "RandomChain",
             Algorithm::RandomImproved { .. } => "RandomImproved",
-            
+
         }
     }
 }

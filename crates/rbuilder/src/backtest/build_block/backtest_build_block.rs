@@ -5,24 +5,21 @@
 //! Sample call:
 //! backtest-build-block --config /home/happy_programmer/config.toml --builders mgp-ordering --builders mp-ordering 19380913 --show-orders --show-missing
 
+use ahash::HashMap;
+use alloy_primitives::utils::format_ether;
 
 use crate::{
     backtest::{
         execute::{backtest_prepare_orders_from_building_context, BacktestBlockInput},
         OrdersWithTimestamp,
     },
-    building::{builders::{BacktestSimulateBlockInput}, blob_tx_selection::select_orders_under_blob_cap, BlockBuildingContext},
+    building::{builders::BacktestSimulateBlockInput, BlockBuildingContext, blob_tx_selection::select_orders_under_blob_cap},
     live_builder::cli::LiveBuilderConfig,
     primitives::{Order, OrderId, SimulatedOrder},
     provider::StateProviderFactory,
 };
-use ahash::HashMap;
-use alloy_primitives::{utils::format_ether, U256};
 use clap::Parser;
-use std::{
-    path::{PathBuf},
-    sync::Arc, time::Instant,
-};
+use std::{path::PathBuf, sync::Arc, time::Instant};
 
 #[derive(Parser, Debug)]
 pub struct BuildBlockCfg {
@@ -65,109 +62,6 @@ where
     fn print_custom_stats(&self, provider: ProviderType) -> eyre::Result<()>;
 }
 
-/// Defines the overall structure of the final sims_{block_number}.json file.
-// #[derive(Serialize)]
-// struct SimResultFile<'a> {
-//     simulations: Vec<JsonSimulatedOrder<'a>>,
-// }
-
-// /// Defines the EXACT JSON structure for a single simulated order.
-// #[derive(Serialize)]
-// struct JsonSimulatedOrder<'a> {
-//     order_id: String,
-//     gas_used: u64,
-//     coinbase_profit: U256,
-//     blob_gas_used: u64,
-//     /// The field will be named "state_trace" in the JSON and omitted if None.
-//     #[serde(rename = "state_trace", skip_serializing_if = "Option::is_none")]
-//     used_state_trace: &'a Option<UsedStateTrace>,
-// }
-
-// #[derive(Serialize)]
-// struct JsonBuilderResult {
-//     block_summary: JsonBlockSummary,
-//     ordered_transactions: Vec<JsonOrderedTransaction>,
-// }
-
-// #[derive(Serialize)]
-// struct JsonBlockSummary {
-//     gas_used: u64,
-//     blob_gas_used: u64,
-//     num_orders: usize,
-//     raw_coinbase_profit: U256,
-// }
-
-// #[derive(Serialize)]
-// struct JsonOrderedTransaction {
-//     order_id: String,
-//     gas_used: u64,
-//     coinbase_profit: U256,
-// }
-
-use serde::{Deserialize, Serialize};
-
-#[derive(Serialize, Deserialize, Debug)]
-struct BacktestResult {
-    builder_type: String,
-    total_backtest_duration_ms: f64,
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-struct BlockDurationFile {
-    block_number: u64,
-    results: Vec<BacktestResult>,
-}
-
-use eyre::Context;
-use std::fs::{File, OpenOptions};
-use std::io::{ErrorKind, BufReader, BufWriter};
-use std::path::Path;
-
-fn write_total_backtest_duration(
-    block_number: u64,
-    duration_ms: f64,
-    builder_type: &str,
-    out_dir: &str,
-) -> eyre::Result<()> {
-    let out_dir = Path::new(out_dir);
-    std::fs::create_dir_all(out_dir)
-        .wrap_err_with(|| format!("Failed to create directory: {:?}", out_dir))?;
-
-    let file_path = out_dir.join(format!("{}.json", block_number));
-
-    let mut data: BlockDurationFile = match File::open(&file_path) {
-        // File exists: read and parse it
-        Ok(file) => {
-            let reader = BufReader::new(file);
-            serde_json::from_reader(reader)
-                .wrap_err_with(|| format!("Failed to parse JSON from {:?}", file_path))?
-        }
-        // File does not exist: create a new data structure
-        Err(e) if e.kind() == ErrorKind::NotFound => BlockDurationFile {
-            block_number,
-            results: Vec::new(),
-        },
-        // Another error occurred
-        Err(e) => return Err(e).wrap_err_with(|| format!("Failed to open file {:?}", file_path)),
-    };
-
-    // Add the new result
-    data.results.push(BacktestResult {
-        builder_type: builder_type.to_string(),
-        total_backtest_duration_ms: duration_ms,
-    });
-
-    // Write the entire updated structure back to the file
-    let file = OpenOptions::new().write(true).create(true).truncate(true).open(&file_path)?;
-    let writer = BufWriter::new(file);
-    serde_json::to_writer_pretty(writer, &data)
-        .wrap_err_with(|| format!("Failed to write JSON to {:?}", file_path))?;
-    
-    println!("Updated backtest duration data in {:?}", file_path);
-
-    Ok(())
-}
-
 pub async fn run_backtest_build_block<ConfigType, OrdersSourceType, ProviderType>(
     build_block_cfg: BuildBlockCfg,
     orders_source: OrdersSourceType,
@@ -177,7 +71,6 @@ where
     ProviderType: StateProviderFactory + Clone + 'static,
     OrdersSourceType: OrdersSource<ConfigType, ProviderType>,
 {
-    let backtest_start_time = Instant::now();
     let config = orders_source.config();
     config.base_config().setup_tracing_subscriber()?;
 
@@ -212,23 +105,11 @@ where
         );
     }
 
-    println!(
-        "Simulated orders: {}",
-        sim_orders.len()
-    );
-
-    // let processing_start = Instant::now();
-    // let blob_cap = ctx.max_blob_gas_per_block();
-    // let sim_orders = select_orders_under_blob_cap(&sim_orders, blob_cap);
-    // let processing_duration = processing_start.elapsed();
-    // ctx.blob_tx_selection_duration = Some(processing_duration);
-
-    // println!(
-    //     "Selected {} orders under {} blob gas cap in {} ms",
-    //     sim_orders.len(),
-    //     blob_cap,
-    //     processing_duration.as_millis()
-    // );
+    let processing_start = Instant::now();
+    let blob_cap = ctx.max_blob_gas_per_block();
+    let sim_orders = select_orders_under_blob_cap(&sim_orders, blob_cap);
+    let processing_duration = processing_start.elapsed();
+    ctx.blob_tx_selection_duration = Some(processing_duration);
 
     if !build_block_cfg.no_block_building {
         let winning_builder = build_block_cfg
@@ -280,7 +161,7 @@ where
                         }
                     }
                 }
-                Some((builder_name.clone(), block.trace.coinbase_reward))
+                Some((builder_name.clone(), block.trace.bid_value))
             })
             .max_by_key(|(_, value)| *value);
 
@@ -292,17 +173,6 @@ where
             );
         }
     }
-
-    // let backtest_duration = backtest_start_time.elapsed();
-    // println!("Total backtest duration: {:.2}s", backtest_duration.as_secs_f64());
-    
-    // // Call the new function to save the result
-    // write_total_backtest_duration(
-    //     ctx.block(),
-    //     backtest_duration.as_millis() as f64,
-    //     &build_block_cfg.builders[0],
-    //     "total_durations", // Output directory
-    // )?;
 
     Ok(())
 }

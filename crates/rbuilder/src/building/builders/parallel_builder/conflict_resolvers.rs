@@ -13,12 +13,6 @@ use rand::{Rng, SeedableRng};
 use std::time::Instant;
 use rayon::prelude::*;
 
-use serde::Serialize;
-use std::cmp::Reverse;
-use std::fs::OpenOptions;
-use std::io::Write;
-
-
 use super::{
     simulation_cache::{CachedSimulationState, SharedSimulationCache},
     Algorithm, ConflictTask, ResolutionResult,
@@ -34,76 +28,11 @@ use crate::{
 };
 const ALL_PERMS_INCLUDE_DUPLICATE_NONCE_CHOICES: bool = true;
 
-#[derive(Serialize)]
-struct ExhaustiveTopSeq {
-    seq: Vec<usize>,
-    profit: String,
-}
-
-#[derive(Serialize)]
-struct ExhaustiveJsonLine {
-    block_number: u64,
-    group_id: usize,
-    terminated_by_time: bool,
-    examined: u64,
-    baseline_profit: String,
-    top: Vec<ExhaustiveTopSeq>,
-}
-
-fn append_exhaustive_json_line(
-    out_dir: &str,
-    block_number: u64,
-    payload: &ExhaustiveJsonLine,
-) -> eyre::Result<()> {
-    let dir = std::path::Path::new(out_dir);
-    if !dir.exists() {
-        let _ = std::fs::create_dir_all(dir);
-    }
-    let file_name = format!("exhaustive_block_{:0>8}.ndjson", block_number);
-    let path = dir.join(file_name);
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)?;
-    let line = serde_json::to_string(payload)?;
-    writeln!(file, "{}", line)?;
-    Ok(())
-}
-
-#[derive(Serialize)]
-struct BestAlgorithmJsonLine {
-    group_id: usize,
-    best_profit: String,
-    algorithm: String,
-}
-
-fn append_best_algorithm_json_line(
-    out_dir: &str,
-    block_number: u64,
-    payload: &BestAlgorithmJsonLine,
-) -> eyre::Result<()> {
-    let dir = std::path::Path::new(out_dir);
-    if !dir.exists() {
-        let _ = std::fs::create_dir_all(dir);
-    }
-    let file_name = format!("block_{:0>8}.ndjson", block_number);
-    let path = dir.join(file_name);
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)?;
-    let line = serde_json::to_string(payload)?;
-    writeln!(file, "{}", line)?;
-    Ok(())
-}
-
-
 fn build_nonce_layout(task: &ConflictTask) -> Option<NonceLayout> {
     NonceLayout::from_group(&task.group)
 }
 
 fn seed_initial_population(
-    task: &ConflictTask,
     layout: &NonceLayout,
     population_size: usize,
     rng: &mut SmallRng,
@@ -113,30 +42,6 @@ fn seed_initial_population(
     let mut seeds: Vec<Vec<usize>> = Vec::new();
     let mut seen: AHashSet<Vec<usize>> = AHashSet::default();
 
-    // // Greedy and ReverseGreedy
-    // for &rev in &[false, true] {
-    //     for seq in generate_greedy_sequence(task, rev) {
-    //         let repaired = repair_to_nonce_valid(&seq, layout);
-    //         if repaired.len() == layout.total_steps && seen.insert(repaired.clone()) {
-    //             seeds.push(repaired);
-    //         }
-    //     }
-    // }
-
-    // let to_add = population_size.saturating_sub(seeds.len());
-    // let cap = to_add.min(10);
-    // if cap > 0 {
-    //     for seq in generate_chain_grouped_sequences(layout, rng, cap) {
-    //         if seq.len() == layout.total_steps && seen.insert(seq.clone()) {
-    //             seeds.push(seq);
-    //             if seeds.len() >= population_size { return seeds; }
-    //         }
-    //     }
-    // }
-
-    // TODO: add some random interleavings but picking candidates with highest mev_gas_price
-
-    // Fill rest with random candidates per step + uniform interleaving
     while seeds.len() < population_size {
         let s = random_interleaving_with_random_choices(layout, rng);
         if s.len() == layout.total_steps && seen.insert(s.clone()) {
@@ -146,118 +51,6 @@ fn seed_initial_population(
 
     seeds
 }
-
-
-/// Streaming enumerator of all nonce-valid interleavings with per-slot choices.
-/// Memory-light: no per-depth ready vectors are stored.
-struct InterleaveStreamer<'a> {
-    layout: &'a NonceLayout,
-    cursors: Vec<usize>,     // next slot per chain
-    seq: Vec<usize>,         // current path (indices)
-    stack: Vec<Frame>,       // DFS frames
-}
-
-struct Frame {
-    next_i: usize,           // which "nth ready choice" to try at this depth
-    applied_chain: Option<usize>, // which chain we advanced to reach this depth (for undo)
-}
-
-impl<'a> InterleaveStreamer<'a> {
-    fn new(layout: &'a NonceLayout) -> Self {
-        let mut it = Self {
-            layout,
-            cursors: vec![0; layout.chains.len()],
-            seq: Vec::with_capacity(layout.total_steps),
-            stack: Vec::new(),
-        };
-        // root frame
-        it.stack.push(Frame { next_i: 0, applied_chain: None });
-        it
-    }
-
-    #[inline]
-    fn ready_count(&self) -> usize {
-        let mut tot = 0usize;
-        for c in 0..self.cursors.len() {
-            let s = self.cursors[c];
-            if s < self.layout.chains[c].steps.len() {
-                tot += self.layout.chains[c].steps[s].candidates.len();
-            }
-        }
-        tot
-    }
-
-    /// Map nth ready option (0-based) to (chain, cand_pos_in_bucket).
-    #[inline]
-    fn nth_ready(&self, mut n: usize) -> (usize, usize) {
-        for c in 0..self.cursors.len() {
-            let s = self.cursors[c];
-            if s >= self.layout.chains[c].steps.len() {
-                continue;
-            }
-            let len = self.layout.chains[c].steps[s].candidates.len();
-            if n < len {
-                return (c, n);
-            }
-            n -= len;
-        }
-        unreachable!("nth_ready called with n >= ready_count()");
-    }
-
-    fn next(&mut self) -> Option<Vec<usize>> {
-        let total_slots = self.layout.total_steps;
-
-        loop {
-            // Done?
-            if self.stack.is_empty() {
-                return None;
-            }
-
-            // Take the frame by value so we don't hold a borrow on self.stack
-            let mut frame = self.stack.pop().unwrap();
-
-            // These only need &self, and no frame is borrowed now.
-            let total_ready = self.ready_count();
-
-            // No more options at this depth → backtrack
-            if frame.next_i >= total_ready {
-                if let Some(chain) = frame.applied_chain {
-                    self.seq.pop();
-                    self.cursors[chain] -= 1;
-                }
-                // do not push this exhausted frame back
-                continue;
-            }
-
-            // Figure out which ready option to try next (still only &self)
-            let (chain, cand_pos) = self.nth_ready(frame.next_i);
-            frame.next_i += 1;
-
-            // We will come back to this depth; put the updated frame back first.
-            self.stack.push(frame);
-
-            // Apply choice
-            let slot = self.cursors[chain];
-            let cand = self.layout.chains[chain].steps[slot].candidates[cand_pos];
-            self.seq.push(cand);
-            self.cursors[chain] += 1;
-
-            if self.seq.len() == total_slots {
-                // Leaf: emit and undo immediately
-                let out = self.seq.clone();
-                self.seq.pop();
-                self.cursors[chain] -= 1;
-                return Some(out);
-            } else {
-                // Go deeper
-                self.stack.push(Frame { next_i: 0, applied_chain: Some(chain) });
-                // continue the loop
-            }
-        }
-    }
-
-}
-
 
 /// Context for resolving conflicts in merging tasks.
 
@@ -415,27 +208,6 @@ impl ResolverContext {
                     task.group.id,
                     res.total_profit
                 );
-
-                // if !matches!(task.algorithm, Algorithm::AllPermutations { .. }) {
-                //     // Save to JSON
-                //     let out_dir = "performance_testing/best_algorithms_with_genetic";
-                //     let line = BestAlgorithmJsonLine {
-                //         group_id: task.group.id,
-                //         best_profit: res.total_profit.to_string(),
-                //         algorithm: task.algorithm.display().to_string(),
-                //     };
-                //     let _ = append_best_algorithm_json_line(&out_dir, self.ctx.block(), &line);
-                // }
-
-                Ok(res)
-            }
-            Algorithm::ExhaustiveStreaming { time_ms, top_k } => {
-                let res = self.run_exhaustive_streaming(&task, time_ms, top_k, local_ctx)?;
-                trace!(
-                    "Resolved ExhaustiveStreaming task {:?} with profit: {:?}",
-                    task.group.id,
-                    res.total_profit
-                );
                 Ok(res)
             }
             _ => {
@@ -448,18 +220,6 @@ impl ResolverContext {
                         self.process_sequence_of_orders(sequence_of_orders, &task, self.state.clone(), local_ctx)?;
                     self.update_best_result(resolution_result, &mut best_resolution_result);
                 }
-
-
-                // if !matches!(task.algorithm, Algorithm::AllPermutations { .. }) {
-                //     // Save to JSON
-                //     let out_dir = "performance_testing/best_algorithms_orig";
-                //     let line = BestAlgorithmJsonLine {
-                //         group_id: task.group.id,
-                //         best_profit: best_resolution_result.total_profit.to_string(),
-                //         algorithm: task.algorithm.display().to_string(),
-                //     };
-                //     let _ = append_best_algorithm_json_line(&out_dir, self.ctx.block(), &line);
-                // }
 
                 trace!(
                     "Resolved conflict task {:?} with profit: {:?} and algorithm: {:?}",
@@ -513,14 +273,9 @@ impl ResolverContext {
         let order_id_to_index = self.initialize_order_id_to_index_map(task);
         let full_sequence_of_orders = self.initialize_full_order_ids_vec(&sequence_of_orders, task);
 
-        // Check for cached simulation state
-        let use_cache = !matches!(task.algorithm, Algorithm::ExhaustiveStreaming { .. });
-        let (cached_state_option, cached_up_to_index) = if use_cache {
-            self.simulation_cache.get_cached_state(&full_sequence_of_orders)
-        } else {
-            (None, 0)
-        };
-
+        let (cached_state_option, cached_up_to_index) = self
+            .simulation_cache
+            .get_cached_state(&full_sequence_of_orders);
 
         // Initialize state and partial block
         let mut partial_block = PartialBlock::new(true);
@@ -603,13 +358,6 @@ impl ResolverContext {
                 Err(err) => self.handle_err(&err, sim_order, &mut pending_orders, order_idx),
             }
         }
-
-        // self.store_simulation_state(
-        //     &full_sequence_of_orders,
-        //     &state,
-        //     total_profit,
-        //     &per_order_profits,
-        // );
 
         let resolution_result = ResolutionResult::new(
             total_profit,
@@ -697,11 +445,6 @@ impl ResolverContext {
         }
     }
 
-    // /// Initializes the block state, using a cached state if available.
-    // fn initialize_block_state(&mut self, state_provider: Arc<dyn StateProvider>) -> BlockState {
-    //     BlockState::new_arc(state_provider)
-    // }
-
     /// Initializes the block state, using a cached state if available.
     fn initialize_block_state(
         &self,
@@ -715,24 +458,6 @@ impl ResolverContext {
             BlockState::new_arc(state_provider)
         }
     }
-
-    // /// Stores the simulation state in the cache.
-    // fn store_simulation_state(
-    //     &self,
-    //     full_order_ids: &[OrderId],
-    //     state: &BlockState,
-    //     total_profit: U256,
-    //     per_order_profits: &[(OrderId, U256)],
-    // ) {
-    //     let (bundle_state, _) = state.clone().into_parts();
-    //     let cached_simulation_state = CachedSimulationState {
-    //         bundle_state,
-    //         total_profit,
-    //         per_order_profits: per_order_profits.to_owned(),
-    //     };
-    //     self.simulation_cache
-    //         .store_cached_state(full_order_ids, cached_simulation_state);
-    // }
 
     fn evaluate_fitness(
         &self,
@@ -763,134 +488,6 @@ impl ResolverContext {
         Ok((ind, res))
     }
 
-    /// Compute baseline profit using current implementation tasks:
-    /// Greedy, ReverseGreedy, Length, and a random task.
-    fn compute_baseline_profit(&mut self, task: &ConflictTask, local_ctx: &mut ThreadBlockBuildingContext) -> eyre::Result<U256> {
-        let mut best = U256::ZERO;
-
-        // Greedy and ReverseGreedy
-        for &rev in &[false, true] {
-            for seq in generate_greedy_sequence(task, rev) {
-                let res = self.evaluate_fitness(&seq, task, local_ctx)?;
-                if res.total_profit > best { best = res.total_profit; }
-            }
-        }
-
-        // Length
-        for seq in generate_length_based_sequence(task) {
-            let res = self.evaluate_fitness(&seq, task, local_ctx)?;
-            if res.total_profit > best { best = res.total_profit; }
-        }
-
-        // Random
-        let rnd = generate_random_permutations(
-            &ConflictTask { algorithm: Algorithm::Random { seed: task.group.id as u64, count: 50 }, ..task.clone() },
-            task.group.id as u64,
-            50,
-        );
-        for seq in rnd {
-            let res = self.evaluate_fitness(&seq, task, local_ctx)?;
-            if res.total_profit > best { best = res.total_profit; }
-        }
-
-        Ok(best)
-    }
-
-
-    fn run_exhaustive_streaming(
-        &mut self,
-        task: &ConflictTask,
-        time_ms: u64,
-        top_k: usize,
-        local_ctx: &mut ThreadBlockBuildingContext,
-    ) -> eyre::Result<ResolutionResult> {
-        let Some(layout) = build_nonce_layout(task) else {
-            // Fallback when we can’t derive (sender, nonce)
-            return Ok(ResolutionResult::new(U256::ZERO, 0, vec![]));
-        };
-
-        // Baseline first (so we can compare later)
-        let baseline = self.compute_baseline_profit(task, local_ctx)?;
-
-        // Stream all sequences; simulate each immediately.
-        let start = Instant::now();
-        let deadline = start + std::time::Duration::from_millis(time_ms);
-        let mut streamer = InterleaveStreamer::new(&layout);
-
-        // Keep Top-K via a min-heap on profit
-        let mut heap: std::collections::BinaryHeap<(Reverse<U256>, Vec<usize>)> =
-            std::collections::BinaryHeap::new();
-        let mut examined: u64 = 0;
-        let mut terminated_by_time = false;
-
-        // Track best ResolutionResult (so we can return a full record with per-order profits)
-        let mut best_res: Option<ResolutionResult> = None;
-
-        while let Some(seq) = streamer.next() {
-            if Instant::now() >= deadline {
-                terminated_by_time = true;
-                break;
-            }
-            if self.cancellation_token.is_cancelled() {
-                return Err(eyre::eyre!("Cancelled"));
-            }
-
-            // Evaluate and update Top-K
-            let res = self.evaluate_fitness(&seq, task, local_ctx)?;
-            examined += 1;
-
-            if heap.len() < top_k {
-                heap.push((Reverse(res.total_profit), seq.clone()));
-            } else if let Some(&(Reverse(curr_min), _)) = heap.peek() {
-                if res.total_profit > curr_min {
-                    heap.pop();
-                    heap.push((Reverse(res.total_profit), seq.clone()));
-                }
-            }
-
-            // Track the global best (so we don't need to re-run later)
-            match &best_res {
-                Some(b) if res.total_profit > b.total_profit => best_res = Some(res),
-                None => best_res = Some(res),
-                _ => {}
-            }
-        }
-
-        // Serialize Top-K to JSON (sorted descending)
-        let mut top: Vec<(U256, Vec<usize>)> = heap
-            .into_sorted_vec()
-            .into_iter()
-            .map(|(Reverse(p), s)| (p, s))
-            .collect();
-        top.reverse(); // now descending by profit
-
-        let json_top: Vec<ExhaustiveTopSeq> = top
-            .iter()
-            .map(|(p, s)| ExhaustiveTopSeq {
-                seq: s.clone(),
-                profit: p.to_string(),
-            })
-            .collect();
-
-        let payload = ExhaustiveJsonLine {
-            block_number: self.ctx.block(),
-            group_id: task.group.id,
-            terminated_by_time,
-            examined,
-            baseline_profit: baseline.to_string(),
-            top: json_top,
-        };
-
-        let _ = append_exhaustive_json_line(
-            "performance_testing/exhaustive_streaming",
-            self.ctx.block(),
-            &payload,
-        );
-
-        // Return the best result we saw (if none, return zero)
-        Ok(best_res.unwrap_or(ResolutionResult::new(U256::ZERO, 0, vec![])))
-    }
-
     fn run_genetic(&mut self, task: &ConflictTask, params: GAParams, local_ctx: &mut ThreadBlockBuildingContext) -> eyre::Result<ResolutionResult> {
         let Some(layout) = build_nonce_layout(task) else {
             return Ok(ResolutionResult::default());
@@ -900,18 +497,17 @@ impl ResolverContext {
         
         // Island model configuration
         let num_islands = 10;
-        let migration_interval = 3; // Migrate every 2 generations
+        let migration_interval = 3; // Migrate every 3 generations
         let population_per_island = (params.population / num_islands).max(2);
 
         let mut islands: Vec<Island> = Vec::with_capacity(num_islands);
         let mut best_seen: Option<ResolutionResult> = None;
-        let mut evals_cum: u64 = 0;
 
         let initial_islands: Vec<(Vec<Vec<usize>>, SmallRng)> = (0..num_islands)
             .into_iter()
             .map(|i| {
                 let mut island_rng = SmallRng::seed_from_u64(params.seed.wrapping_add(i as u64));
-                let seed_seqs = seed_initial_population(task, &layout, population_per_island, &mut island_rng);
+                let seed_seqs = seed_initial_population(&layout, population_per_island, &mut island_rng);
                 
                 (seed_seqs, island_rng)
             })
@@ -934,7 +530,6 @@ impl ResolverContext {
             let mut population = Vec::with_capacity(population_per_island);
             // Process results sequentially to safely update shared state
             for (ind, res) in evaluated_results {
-                evals_cum += 1;
                 if best_seen.as_ref().map_or(true, |b| res.total_profit > b.total_profit) {
                     best_seen = Some(res.clone());
                 }
@@ -961,28 +556,15 @@ impl ResolverContext {
             let profit_before_gen = best_seen.as_ref().map(|b| b.total_profit).unwrap_or_default();
 
             // Run one generation on each island in parallel
-            let gen_results: Vec<DCGenerationResult> = islands
+            islands
                 .par_iter_mut()
-                .map_init(
+                .try_for_each_init(
                     || local_ctx.clone(),
                     |thread_ctx, island| {
-                        run_dc_generation(
-                            island, &best_seen, task, &params, &layout, self, thread_ctx
-                        )
-                    }
-                )
-                .collect::<Result<_, _>>()?;
-
-            // Aggregate results for logging
-            let mut total_evals_this_gen = 0;
-            let mut total_new_best_hits = 0;
-            let mut total_children_who_won = 0;
-            for result in gen_results {
-                total_evals_this_gen += result.evals;
-                total_new_best_hits += result.new_best_hits;
-                total_children_who_won += result.children_who_won;
-            }
-            evals_cum += total_evals_this_gen;
+                        run_dc_generation(island, &best_seen, task, &params, &layout, self, thread_ctx)
+                            .map(|_| ()) // discard DCGenerationResult but keep errors
+                    },
+                )?;
 
             if generation > 0 && generation % migration_interval == 0 {
                 let mut migrants: Vec<Individual> = Vec::with_capacity(num_islands);
@@ -1039,65 +621,6 @@ impl ResolverContext {
                 );
                 break;
             }
-            
-            // logging
-            let mut combined_population: Vec<Individual> = islands.iter().flat_map(|i| i.population.clone()).collect();
-            let fronts = fast_non_dominated_sort(&mut combined_population);  // taken from nsga2 algorithm
-            for f in &fronts { assign_crowding_distance(&mut combined_population, f); }            
-            let f1: Vec<usize> = if fronts.is_empty() { vec![] } else { fronts[0].clone() };
-            let front_sizes: Vec<usize> = fronts.iter().map(|f| f.len()).collect();
-            let pareto_points: Vec<(U256, u64)> = f1.iter().map(|&i| (combined_population[i].profit, combined_population[i].gas)).collect();
-            let hv = hv2d(&pareto_points);
-            let s  = spacing_s(&pareto_points);
-            let (avg_dc, min_dc, max_dc, std_dc) = pairwise_dc_stats(&combined_population, &layout);
-            let (uniq_seqs, uniq_slot_orders)   = uniq_counts(&combined_population, &layout);
-            let niches = niche_components(&combined_population, &layout, 0.15);
-
-            let mut crowd_f1: Vec<f64> = f1.iter().map(|&i| combined_population[i].crowding).collect();
-            crowd_f1.sort_by(|a,b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-            let (cmin, cmed, cmax) = if crowd_f1.is_empty() { (0.0,0.0,0.0) } else {
-                let med = crowd_f1[crowd_f1.len()/2];
-                (*crowd_f1.first().unwrap(), med, *crowd_f1.last().unwrap())
-            };
-
-            let best_profit = best_seen.as_ref().map(|r| r.total_profit.to_string()).unwrap_or_else(|| "0".to_string());
-            let best_gas    = best_seen.as_ref().map(|r| r.gas_used).unwrap_or(0);
-            
-            // Use the new metrics from gen_result for logging
-            let child_survival_rate = (total_children_who_won as f64) / (params.population as f64);
-
-            let payload = NSGA2GenLine {
-                block_number: self.ctx.block(),
-                group_id: task.group.id,
-                gen: generation,
-                elapsed_ms: start.elapsed().as_millis() as u64,
-                evals_cum,
-
-                best_profit,
-                best_gas,
-
-                pareto_size: pareto_points.len(),
-                hv2d: hv,
-                spacing_s: s,
-                crowding_front1_min: cmin,
-                crowding_front1_med: cmed,
-                crowding_front1_max: cmax,
-
-                avg_dc, min_dc, max_dc, std_dc,
-                uniq_seqs, uniq_slot_orders,
-                niche_sizes: niches,
-
-                fronts: front_sizes,
-                new_best_hits: total_new_best_hits,
-                child_accept_rate: child_survival_rate,
-                child_non_dominated_vs_parents: child_survival_rate, // In DC, this is essentially the same metric
-            };
-            let _ = append_nsga2_debug_line(
-                "performance_testing/nsga2_debug",
-                self.ctx.block(),
-                &payload,
-            );
-            
             generation += 1;
         }
 
@@ -1127,54 +650,11 @@ pub fn generate_sequences_of_orders_to_try(task: &ConflictTask) -> Vec<Vec<usize
             // Genetic algorithm is handled separately in ResolverContext::run_genetic
             vec![]
         }
-        Algorithm::ExhaustiveStreaming { .. } => {
-            // Exhaustive streaming is handled separately in ResolverContext::run_exhaustive_streaming
-            vec![]
-        }
-        Algorithm::RandomChain { seed, count } => generate_chain_based_sequences(task, seed, count),
         Algorithm::RandomImproved { seed, count } => generate_random_permutations_with_nonce(task, seed, count),
     }
 }
 
-/// Generates random permutations of sequences of order indices (with replacement),
-/// respecting nonce dependencies. For large spaces (always the case for Random),
-/// we sample `count` independent uniform interleavings.
-/// Fallback (when no nonce view is available): old shuffle behavior.
-/// # Arguments
-///
-/// * `task` - The current conflict task.
-/// * `seed` - Seed for the random number generator.
-/// * `count` - Number of random permutations to generate.
-///
-/// # Returns
-///
-/// A vector of randomly generated sequences of order indices.
-// fn generate_random_permutations(task: &ConflictTask, seed: u64, count: usize) -> Vec<Vec<usize>> {
-//     let mut sequences_of_orders = vec![];
-
-//     let order_group = &task.group;
-//     let mut indexes = (0..order_group.orders.len()).collect::<Vec<_>>();
-//     let mut rng = SmallRng::seed_from_u64(seed);
-//     for _ in 0..count {
-//         indexes.shuffle(&mut rng);
-//         sequences_of_orders.push(indexes.clone());
-//     }
-
-//     sequences_of_orders
-// }
-
 fn generate_random_permutations(task: &ConflictTask, seed: u64, count: usize) -> Vec<Vec<usize>> {
-    // if let Some(layout) = build_nonce_layout(task) {
-    //     let mut rng = SmallRng::seed_from_u64(seed);
-    //     let mut out = Vec::with_capacity(count);
-    //     for _ in 0..count {
-    //         out.push(random_interleaving_with_random_choices(&layout, &mut rng));
-    //     }
-
-    //     return out;
-    // }
-
-    // Fallback: bundles/multi-tx orders where we can't derive nonce chains
     let mut rng = SmallRng::seed_from_u64(seed);
     let mut indexes: Vec<usize> = (0..task.group.orders.len()).collect();
     let mut out = Vec::with_capacity(count);
@@ -1196,15 +676,8 @@ fn generate_random_permutations_with_nonce(task: &ConflictTask, seed: u64, count
         return out;
     }
 
-    // Fallback: bundles/multi-tx orders where we can't derive nonce chains
-    let mut rng = SmallRng::seed_from_u64(seed);
-    let mut indexes: Vec<usize> = (0..task.group.orders.len()).collect();
-    let mut out = Vec::with_capacity(count);
-    for _ in 0..count {
-        indexes.shuffle(&mut rng);
-        out.push(indexes.clone());
-    }
-    out
+    // Fallback
+    generate_random_permutations(task, seed, count)
 }
 
 /// Generates all possible permutations of sequences of order indices.
@@ -1233,51 +706,21 @@ fn generate_all_permutations(task: &ConflictTask) -> Vec<Vec<usize>> {
         .collect()
 }
 
-// / Generates static sequences of order indices based on gas price and coinbase profit.
-// /
-// / # Arguments
-// /
-// / * `task` - The current conflict task.
-// / * `reverse` - Whether to reverse the sorting order (e.g. sorting by min coinbase profit and mev_gas_price)
-// /
-// / # Returns
-// /
-// / A vector of static sequences of order indices, sorted by coinbase profit and mev_gas_price.
-// fn generate_greedy_sequence(task: &ConflictTask, reverse: bool) -> Vec<Vec<usize>> {
-//     let order_group = &task.group;
-
-//     let create_sequence = |value_extractor: fn(&SimulatedOrder) -> U256| {
-//         let mut ids_and_value: Vec<_> = order_group
-//             .orders
-//             .iter()
-//             .enumerate()
-//             .map(|(idx, order)| (idx, value_extractor(order)))
-//             .collect();
-
-//         ids_and_value.sort_by(|a, b| {
-//             if reverse {
-//                 a.1.cmp(&b.1)
-//             } else {
-//                 b.1.cmp(&a.1)
-//             }
-//         });
-//         ids_and_value.into_iter().map(|(idx, _)| idx).collect()
-//     };
-
-//     vec![
-//         create_sequence(|sim_order| sim_order.sim_value.coinbase_profit),
-//         create_sequence(|sim_order| sim_order.sim_value.mev_gas_price),
-//     ]
-// }
-
-
+/// Generates static sequences of order indices based on gas price and coinbase profit.
+///
+/// # Arguments
+///
+/// * `task` - The current conflict task.
+/// * `reverse` - Whether to reverse the sorting order (e.g. sorting by min coinbase profit and mev_gas_price)
+///
+/// # Returns
+///
+/// A vector of static sequences of order indices, sorted by coinbase profit and mev_gas_price.
 fn generate_greedy_sequence(task: &ConflictTask, reverse: bool) -> Vec<Vec<usize>> {
     let group = &task.group;
 
-    // Build a single greedy preference list for the given key, filtered by
-    // key-aware per-slot dedup.
+    // Build a single greedy preference list for the given key
     let build_for = |key: GreedyKey| {
-        // Only keep best-per-slot candidates according to this key+reverse.
         let allowed = allowed_indices_after_nonce_dedup(group, key, reverse);
 
         // Collect indices with both metrics so we can do a stable secondary tie-break.
@@ -1318,44 +761,6 @@ fn generate_greedy_sequence(task: &ConflictTask, reverse: bool) -> Vec<Vec<usize
     ]
 }
 
-// / Generates length based sequences of order indices based on the length of the orders.
-// / e.g. prioritizes longer bundles first
-// /
-// / # Arguments
-// /
-// / * `task` - The current conflict task.
-// /
-// / # Returns
-// /
-// / A vector of length based sequences of order indices.
-// fn generate_length_based_sequence(task: &ConflictTask) -> Vec<Vec<usize>> {
-//     let mut sequences_of_orders = vec![];
-//     let order_group = &task.group;
-
-//     let mut order_data: Vec<(usize, usize, U256)> = order_group
-//         .orders
-//         .iter()
-//         .enumerate()
-//         .map(|(idx, order)| {
-//             (
-//                 idx,
-//                 order.order.list_txs().len(),
-//                 order.sim_value.coinbase_profit,
-//             )
-//         })
-//         .collect();
-
-//     // Sort by length (descending) and then by profit (descending) as a tie-breaker
-//     order_data.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| b.2.cmp(&a.2)));
-
-//     // Extract the sorted indices
-//     let length_based_sequence: Vec<usize> = order_data.into_iter().map(|(idx, _, _)| idx).collect();
-
-//     sequences_of_orders.push(length_based_sequence);
-//     sequences_of_orders
-// }
-
-
 fn generate_length_based_sequence(task: &ConflictTask) -> Vec<Vec<usize>> {
     let order_group = &task.group;
     let allowed = allowed_indices_after_nonce_dedup(order_group, GreedyKey::Profit, false);
@@ -1371,135 +776,6 @@ fn generate_length_based_sequence(task: &ConflictTask) -> Vec<Vec<usize>> {
     order_data.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| b.2.cmp(&a.2)));
     let seq: Vec<usize> = order_data.into_iter().map(|(idx, _, _)| idx).collect();
     vec![seq]
-}
-
-fn generate_chain_based_sequences(task: &ConflictTask, seed: u64, count: usize) -> Vec<Vec<usize>> {
-    if let Some(layout) = build_nonce_layout(task) {
-        let mut rng = SmallRng::seed_from_u64(seed);
-        return generate_chain_grouped_sequences(&layout, &mut rng, count);
-    }
-
-    // Fallback: bundles/multi-tx orders where we can't derive nonce chains
-    let mut rng = SmallRng::seed_from_u64(seed);
-    let mut indexes: Vec<usize> = (0..task.group.orders.len()).collect();
-    let mut out = Vec::with_capacity(count);
-    for _ in 0..count {
-        indexes.shuffle(&mut rng);
-        out.push(indexes.clone());
-    }
-    out
-}
-
-/// Generate sequences where each nonce chain appears as one contiguous block.
-/// We permute the chains randomly; within each chain, we append all steps in order,
-/// picking a random candidate when a step has multiple candidates.
-fn generate_chain_grouped_sequences(
-    layout: &NonceLayout,
-    rng: &mut SmallRng,
-    count: usize,
-) -> Vec<Vec<usize>> {
-    let k = layout.chains.len();
-    if k == 0 || count == 0 { return Vec::new(); }
-
-    let mut out = Vec::with_capacity(count);
-    let mut chains: Vec<usize> = (0..k).collect();
-
-    for _ in 0..count {
-        chains.shuffle(rng);
-
-        let mut seq = Vec::with_capacity(layout.total_steps);
-        for &c in &chains {
-            let steps = &layout.chains[c].steps;
-            for s in 0..steps.len() {
-                let bucket = &steps[s].candidates;
-                let pick = if bucket.len() == 1 {
-                    bucket[0]
-                } else {
-                    bucket[rng.gen_range(0..bucket.len())]
-                };
-                seq.push(pick);
-            }
-        }
-        out.push(seq);
-    }
-
-    out
-}
-
-pub fn generate_chain_greedy_sequences(task: &ConflictTask) -> Vec<Vec<usize>> {
-    let Some(layout) = build_nonce_layout(task) else {
-        // Fallback when we can’t derive (sender, nonce): reuse plain greedy.
-        return generate_greedy_sequence(task, false);
-    };
-
-    fn metrics(task: &ConflictTask, idx: usize) -> (U256, U256) {
-        let o = &task.group.orders[idx];
-        (o.sim_value.coinbase_profit, o.sim_value.mev_gas_price)
-    }
-
-    let build_for = |key: GreedyKey| -> Vec<usize> {
-        // For each chain, pick per-step best candidate and sum as chain score.
-        let mut chains: Vec<(usize /*chain_id*/, U256 /*score*/, Vec<usize> /*picked*/)> =
-            Vec::with_capacity(layout.chains.len());
-
-        for (c_id, chain) in layout.chains.iter().enumerate() {
-            let mut picked: Vec<usize> = Vec::with_capacity(chain.steps.len());
-            let mut score = U256::ZERO;
-
-            for step in &chain.steps {
-                // pick best candidate for this nonce step
-                let &best_idx = step
-                    .candidates
-                    .iter()
-                    .max_by(|&&a, &&b| {
-                        let (pa, ga) = metrics(task, a);
-                        let (pb, gb) = metrics(task, b);
-
-                        // primary / secondary according to `key`
-                        let (ka1, ka2) = match key {
-                            GreedyKey::Profit => (pa, ga),
-                            GreedyKey::MevGasPrice => (ga, pa),
-                        };
-                        let (kb1, kb2) = match key {
-                            GreedyKey::Profit => (pb, gb),
-                            GreedyKey::MevGasPrice => (gb, pb),
-                        };
-
-                        // Desc on primary, then desc on secondary, then idx asc
-                        ka1.cmp(&kb1)
-                            .then_with(|| ka2.cmp(&kb2))
-                            .then_with(|| a.cmp(&b))
-                    })
-                    .expect("step must have at least one candidate");
-
-                picked.push(best_idx);
-
-                // add to chain score
-                let (p, g) = metrics(task, best_idx);
-                score += match key {
-                    GreedyKey::Profit => p,
-                    GreedyKey::MevGasPrice => g,
-                };
-            }
-
-            chains.push((c_id, score, picked));
-        }
-
-        // Sort chains by score desc (tie-break by chain id for determinism)
-        chains.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-
-        // Concatenate picked steps chain-by-chain (keeps chains contiguous)
-        let mut seq = Vec::with_capacity(layout.total_steps);
-        for (_, _, picked) in chains {
-            seq.extend(picked);
-        }
-        seq
-    };
-
-    vec![
-        build_for(GreedyKey::Profit),
-        build_for(GreedyKey::MevGasPrice),
-    ]
 }
 
 #[cfg(test)]
@@ -1864,7 +1140,7 @@ mod tests {
 
         let mut rng = SmallRng::seed_from_u64(999);
         let population_size = 2;
-        let seeds = seed_initial_population(&task, &layout, population_size, &mut rng);
+        let seeds = seed_initial_population(&layout, population_size, &mut rng);
 
         assert_eq!(seeds.len(), population_size);
         let mut uniq: HashSet<Vec<usize>> = HashSet::default();

@@ -15,7 +15,6 @@ use super::{
     conflict_resolvers::ResolverContext, conflict_task_generator::{get_tasks_for_group},
     simulation_cache::SharedSimulationCache, ConflictGroup, ConflictResolutionResultPerGroup,
     ConflictTask, GroupId, ResolutionResult, TaskPriority,
-    // metrics::{build_group_metrics_for_tasks, GroupMetrics},
 };
 use crate::building::{BlockBuildingContext, ThreadBlockBuildingContext};
 use crate::provider::StateProviderFactory;
@@ -198,47 +197,4 @@ where
         }
         results
     }
-
-
-    // pub fn process_groups_backtest(
-    //     &mut self,
-    //     new_groups: Vec<ConflictGroup>,
-    //     ctx: &BlockBuildingContext,
-    //     state: Arc<dyn StateProvider>,
-    //     simulation_cache: Arc<SharedSimulationCache>,
-    // ) -> (
-    //     Vec<(GroupId, (ResolutionResult, ConflictGroup))>,
-    //     Vec<GroupMetrics>,
-    // ) {
-    //     let mut results = Vec::new();
-    //     let mut metrics = Vec::new();
-    //     let mut local_ctx = ThreadBlockBuildingContext::default();
-
-    //     for new_group in new_groups {
-    //         let tasks = get_tasks_for_group(&new_group, TaskPriority::High);
-
-    //         if new_group.orders.len() > 1 {
-    //             // compute metrics before running
-    //             let m = build_group_metrics_for_tasks(&new_group, &tasks);
-    //             metrics.push(m);
-    //         }
-
-    //         for task in tasks {
-    //             let simulation_cache = Arc::clone(&simulation_cache);
-    //             let result = Self::process_task(
-    //                 task,
-    //                 ctx,
-    //                 &mut local_ctx,
-    //                 state.clone(),
-    //                 CancellationToken::new(),
-    //                 simulation_cache,
-    //             );
-    //             if let Ok(result) = result {
-    //                 results.push(result);
-    //             }
-    //         }
-    //     }
-
-    //     (results, metrics)
-    // }
 }

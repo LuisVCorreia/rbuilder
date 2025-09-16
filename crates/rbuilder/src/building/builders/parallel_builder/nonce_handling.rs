@@ -60,7 +60,6 @@ pub struct NonceLayout {
 impl NonceLayout {
     /// Build from `ConflictGroup`. Returns None when we cannot derive (sender,nonce) for some order
     pub fn from_group(group: &ConflictGroup) -> Option<Self> {
-        // sender -> (nonce -> [order indices])
         let mut by_sender: BTreeMap<Address, BTreeMap<u64, Vec<usize>>> = BTreeMap::new();
 
         for (idx, o) in group.orders.iter().enumerate() {

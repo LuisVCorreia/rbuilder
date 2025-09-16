@@ -22,64 +22,6 @@ use std::{
 };
 use tracing::{error, trace};
 
-use std::fs;
-use serde_json::json;
-use tikv_jemalloc_ctl::{epoch, stats};
-#[cfg(target_os = "linux")]
-use libc::{getrusage, rusage, RUSAGE_SELF};
-
-#[derive(Clone, Copy, Default, Debug)]
-struct AllocStats {
-    allocated: u64,
-    active: u64,
-    resident: u64,
-}
-
-fn read_alloc_stats() -> AllocStats {
-    // Refresh jemalloc epoch so stats reflect recent frees/mallocs.
-    let _ = epoch::advance();
-    AllocStats {
-        allocated: stats::allocated::read().unwrap_or(0) as u64,
-        active: stats::active::read().unwrap_or(0) as u64,
-        resident: stats::resident::read().unwrap_or(0) as u64,
-    }
-}
-
-fn read_rss_and_hwm_bytes() -> (u64, u64) {
-    // Linux: parse /proc/self/status for VmRSS and VmHWM (kB -> bytes).
-    let mut rss = 0;
-    let mut hwm = 0;
-    if let Ok(s) = fs::read_to_string("/proc/self/status") {
-        for line in s.lines() {
-            if let Some(rest) = line.strip_prefix("VmRSS:") {
-                if let Some(kb) = rest.split_whitespace().find_map(|t| t.parse::<u64>().ok()) {
-                    rss = kb.saturating_mul(1024);
-                }
-            } else if let Some(rest) = line.strip_prefix("VmHWM:") {
-                if let Some(kb) = rest.split_whitespace().find_map(|t| t.parse::<u64>().ok()) {
-                    hwm = kb.saturating_mul(1024);
-                }
-            }
-        }
-    }
-    (rss, hwm)
-}
-
-#[cfg(target_os = "linux")]
-fn read_ru_maxrss_bytes() -> u64 {
-    unsafe {
-        let mut r: rusage = std::mem::zeroed();
-        if getrusage(RUSAGE_SELF, &mut r) == 0 {
-            (r.ru_maxrss as u64).saturating_mul(1024)
-        } else {
-            0
-        }
-    }
-}
-#[cfg(not(target_os = "linux"))]
-fn read_ru_maxrss_bytes() -> u64 { 0 }
-
-
 #[derive(Debug)]
 pub enum OrderSimResult {
     Success(SimulatedOrder, Vec<(Address, u64)>),
@@ -387,10 +329,6 @@ where
     let mut state_for_sim =
         Arc::<dyn StateProvider>::from(provider.history_by_block_hash(ctx.attributes.parent)?);
     let mut local_ctx = ThreadBlockBuildingContext::default();
-
-    // Collect per-tx perf rows
-    let mut perf_records: Vec<serde_json::Value> = Vec::new();
-
     loop {
         // mix new orders into the sim_tree
         if randomize_insertion && !orders.is_empty() {
@@ -411,11 +349,6 @@ where
         let mut sim_results = Vec::new();
         for sim_task in sim_tasks {
             let start_time = Instant::now();
-
-            let alloc_before = read_alloc_stats();
-            let (rss_before, hwm_before) = read_rss_and_hwm_bytes();
-            let ru_before = read_ru_maxrss_bytes();
-
             let mut block_state = BlockState::new_arc(state_for_sim);
             let sim_result = simulate_order(
                 sim_task.parents.clone(),
@@ -426,55 +359,17 @@ where
             )?;
             let (_, provider) = block_state.into_parts();
             state_for_sim = provider;
-
-            let sim_dur = start_time.elapsed();
-            let alloc_after = read_alloc_stats();
-            let (rss_after, hwm_after) = read_rss_and_hwm_bytes();
-            let ru_after = read_ru_maxrss_bytes();
-
-            // let is_success = matches!(sim_result.result, OrderSimResult::Success(_, _));
-            // println!("Simulation result: {}, gas used: {}", is_success, sim_result.gas_used);
-            let alloc_delta = alloc_after.allocated.saturating_sub(alloc_before.allocated);
-            let active_delta = alloc_after.active.saturating_sub(alloc_before.active);
-            let resident_delta = alloc_after.resident.saturating_sub(alloc_before.resident);
-            let rss_delta = rss_after.saturating_sub(rss_before);
-            let hwm_delta = hwm_after.saturating_sub(hwm_before);
-            let ru_delta = ru_after.saturating_sub(ru_before);
-
             match sim_result.result {
                 OrderSimResult::Failed(err) => {
-                    println!(
-                        "Order simulation failed: order = {}, err = {}",
-                        sim_task.order.id(),
-                        err
+                    trace!(
+                        order = sim_task.order.id().to_string(),
+                        ?err,
+                        "Order simulation failed"
                     );
                     sim_errors.push(err);
                     continue;
                 }
                 OrderSimResult::Success(sim_order, nonces) => {
-                    perf_records.push(json!({
-                        "order_id": format!("{}", sim_task.order.id()),
-                        "success": true,
-                        "time_ms": sim_dur.as_secs_f64() * 1_000.0,
-                        "gas_used": sim_order.sim_value.gas_used,
-                        "blob_gas_used": sim_order.sim_value.blob_gas_used,
-                        "coinbase_profit_wei": format!("{}", sim_order.sim_value.coinbase_profit),
-
-                        // allocator / OS metrics
-                        "jemalloc_allocated_delta": alloc_delta,
-                        "jemalloc_active_delta": active_delta,
-                        "jemalloc_resident_delta": resident_delta,
-                        "rss_before_bytes": rss_before,
-                        "rss_after_bytes": rss_after,
-                        "rss_delta_bytes": rss_delta,
-                        "hwm_before_bytes": hwm_before,
-                        "hwm_after_bytes": hwm_after,
-                        "hwm_delta_bytes": hwm_delta,
-                        "ru_maxrss_before_bytes": ru_before,
-                        "ru_maxrss_after_bytes": ru_after,
-                        "ru_maxrss_delta_bytes": ru_delta
-                    }));
-
                     let result = SimulatedResult {
                         id: sim_task.id,
                         simulated_order: sim_order,
@@ -492,21 +387,6 @@ where
         }
         sim_tree.submit_simulation_tasks_results(sim_results)?;
     }
-
-    // let out_dir = PathBuf::from("performance_testing/ave_speed_and_mem");
-    // if let Err(e) = fs::create_dir_all(&out_dir) {
-    //     tracing::warn!(?e, "failed to create ave_speed_and_mem dir");
-    // } else {
-    //     let out_file = out_dir.join(format!("{}.json", ctx.evm_env.block_env.number));
-    //     match serde_json::to_string_pretty(&perf_records) {
-    //         Ok(s) => {
-    //             if let Err(e) = fs::write(&out_file, s) {
-    //                 tracing::warn!(?e, ?out_file, "failed to write perf metrics json");
-    //             }
-    //         }
-    //         Err(e) => tracing::warn!(?e, "failed to serialize perf metrics json"),
-    //     }
-    // }
 
     Ok((
         sim_tree
