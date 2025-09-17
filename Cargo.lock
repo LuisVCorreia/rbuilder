@@ -3484,11 +3484,20 @@ dependencies = [
 
 [[package]]
 name = "dirs"
+version = "5.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "44c45a9d03d6676652bcb5e724c7e988de1acad23a711b5217ab9cbecbec2225"
+dependencies = [
+ "dirs-sys 0.4.1",
+]
+
+[[package]]
+name = "dirs"
 version = "6.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3e8aa94d75141228480295a7d0e7feb620b1a5ad9f12bc40be62411e38cce4e"
 dependencies = [
- "dirs-sys",
+ "dirs-sys 0.5.0",
 ]
 
 [[package]]
@@ -3499,6 +3508,18 @@ checksum = "b98cf8ebf19c3d1b223e151f99a4f9f0690dca41414773390fc824184ac833e1"
 dependencies = [
  "cfg-if",
  "dirs-sys-next",
+]
+
+[[package]]
+name = "dirs-sys"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "520f05a5cbd335fae5a99ff7a6ab8627577660ee5cfd6a94a6a929b52ff0321c"
+dependencies = [
+ "libc",
+ "option-ext",
+ "redox_users 0.4.6",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
@@ -9460,6 +9481,8 @@ dependencies = [
  "alloy-rpc-types-engine",
  "alloy-rpc-types-eth",
  "alloy-signer-local",
+ "alloy-transport-http",
+ "anyhow",
  "alloy-trie 0.8.1",
  "assert_matches",
  "async-trait",
@@ -9468,6 +9491,7 @@ dependencies = [
  "bigdecimal 0.4.9",
  "bincode",
  "built",
+ "chrono",
  "clap",
  "criterion",
  "crossbeam",
@@ -9476,6 +9500,8 @@ dependencies = [
  "dashmap 6.1.0",
  "derivative",
  "derive_more 2.1.0",
+ "dirs 5.0.1",
+ "dotenvy",
  "eth-sparse-mpt",
  "ethereum-consensus",
  "ethereum_ssz 0.9.1",
@@ -9489,12 +9515,15 @@ dependencies = [
  "itertools 0.11.0",
  "jsonrpsee 0.20.4",
  "lazy_static",
+ "libc",
  "lru 0.12.5",
  "lz4_flex",
  "mempool-dumpster",
  "metrics_macros",
  "mev-share-sse",
  "mockall",
+ "num-bigint",
+ "num-traits",
  "parking_lot",
  "priority-queue",
  "prometheus",
@@ -13814,7 +13843,7 @@ version = "3.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8b1fdf65dd6331831494dd616b30351c38e96e45921a27745cf98490458b90bb"
 dependencies = [
- "dirs",
+ "dirs 6.0.0",
 ]
 
 [[package]]

@@ -14,7 +14,7 @@ use crate::{
         OrdersWithTimestamp,
     },
     building::{
-        builders::BacktestSimulateBlockInput, BlockBuildingContext, ExecutionResult,
+        builders::BacktestSimulateBlockInput, BlockBuildingContext, blob_tx_selection::select_orders_under_blob_cap, ExecutionResult,
         NullPartialBlockExecutionTracer,
     },
     live_builder::cli::LiveBuilderConfig,
@@ -22,7 +22,7 @@ use crate::{
 };
 use clap::Parser;
 use rbuilder_primitives::{order_statistics::OrderStatistics, Order, OrderId, SimulatedOrder};
-use std::{path::PathBuf, sync::Arc};
+use std::{path::PathBuf, sync::Arc, time::Instant};
 
 #[derive(Parser, Debug)]
 pub struct BuildBlockCfg {
@@ -102,6 +102,7 @@ where
     let provider_factory = orders_source.create_provider_factory()?;
     orders_source.print_custom_stats(provider_factory.clone())?;
 
+    let mut ctx = orders_source.create_block_building_context()?;
     let BacktestBlockInput { sim_orders, .. } = backtest_prepare_orders_from_building_context(
         ctx.clone(),
         available_orders.clone(),
@@ -127,6 +128,12 @@ where
             orders_source.block_time_as_unix_ms(),
         );
     }
+
+    let processing_start = Instant::now();
+    let blob_cap = ctx.max_blob_gas_per_block();
+    let sim_orders = select_orders_under_blob_cap(&sim_orders, blob_cap);
+    let processing_duration = processing_start.elapsed();
+    ctx.blob_tx_selection_duration = Some(processing_duration);
 
     if !build_block_cfg.no_block_building {
         let winning_builder = build_block_cfg

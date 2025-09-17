@@ -5,7 +5,10 @@ use itertools::Itertools;
 use rbuilder_primitives::SimulatedOrder;
 use std::{sync::Arc, time::Instant};
 use tracing::trace;
-
+use super::nonce_handling::{
+    compute_interleaving_stats, NonceLayout, is_simple_chain,
+    ALL_PERMS_CAP as MULTINOMIAL_ALL_PERMS_THRESHOLD,
+};
 use super::{
     task::ConflictTask, Algorithm, ConflictGroup, ConflictResolutionResultPerGroup, GroupId,
     ResolutionResult, TaskPriority, TaskQueue,
@@ -14,7 +17,6 @@ use std::sync::mpsc as std_mpsc;
 
 const THRESHOLD_FOR_SIGNIFICANT_CHANGE: u64 = 20;
 const NUMBER_OF_TOP_ORDERS_TO_CONSIDER_FOR_SIGNIFICANT_CHANGE: usize = 10;
-const MAX_LENGTH_FOR_ALL_PERMUTATIONS: usize = 3;
 const NUMBER_OF_RANDOM_TASKS: usize = 50;
 
 /// Manages conflicts and updates for conflict groups, coordinating with a worker pool to process tasks.
@@ -182,19 +184,11 @@ impl ConflictTaskGenerator {
     /// * `group_id` - The ID of the group to process.
     /// * `group` - The `ConflictGroup` to process.
     fn process_single_order_group(&mut self, group_id: GroupId, group: &ConflictGroup) {
-        let sequence_of_orders = ResolutionResult {
-            total_profit: group.orders[0]
-                .sim_value
-                .full_profit_info()
-                .coinbase_profit(),
-            sequence_of_orders: vec![(
-                0,
-                group.orders[0]
-                    .sim_value
-                    .full_profit_info()
-                    .coinbase_profit(),
-            )],
-        };
+        let sequence_of_orders = ResolutionResult::new(
+            group.orders[0].sim_value.coinbase_profit,
+            group.orders[0].sim_value.gas_used,
+            vec![(0, group.orders[0].sim_value.coinbase_profit, group.orders[0].sim_value.gas_used)],
+        );
         // We ignore the error since it means "receiver disconnected" and we expect the caller will detect the cancellation and stop calling us.
         let _ = self
             .group_result_sender
@@ -360,9 +354,101 @@ pub fn get_tasks_for_group(
     safe_sorting_only: bool,
 ) -> Vec<ConflictTask> {
     let mut tasks = vec![];
-
     let created_at = Instant::now();
-    // We want to run Greedy first so we can get quick, decent results
+
+    if let Some(_layout) = NonceLayout::from_group(&group) {
+        if is_simple_chain(&group) {
+            // Single sender: only AllPermutations (no need for Greedy/others)
+            tasks.push(ConflictTask {
+                group_idx: group.id,
+                algorithm: Algorithm::AllPermutations,
+                priority,
+                group: group.clone(),
+                created_at,
+            });
+            return tasks;
+        }
+
+        // Always try Greedy first (fast baseline)
+        tasks.push(ConflictTask {
+            group_idx: group.id,
+            algorithm: Algorithm::Greedy,
+            priority,
+            group: group.clone(),
+            created_at,
+        });
+
+        if let Some(stats) = compute_interleaving_stats(group) {
+            let ln_cap = (MULTINOMIAL_ALL_PERMS_THRESHOLD as f64).ln();
+            let small = stats.ln_with_choice <= ln_cap + 1e-12;
+
+            if small {
+                tasks.push(ConflictTask {
+                    group_idx: group.id,
+                    algorithm: Algorithm::AllPermutations,
+                    priority,
+                    group: group.clone(),
+                    created_at,
+                });
+            } else {
+                tasks.push(ConflictTask {
+                    group_idx: group.id,
+                    algorithm: Algorithm::Genetic {
+                        population: 30,
+                        crossover_rate: 0.9,
+                        mutation_rate: 0.2,
+                        tourn_k: 3,
+                        max_generations: 50,
+                        time_ms: 6000,
+                        seed: group.id as u64,
+                    },
+                    priority: TaskPriority::Medium,
+                    group: group.clone(),
+                    created_at,
+                });
+
+                // tasks.push(ConflictTask {
+                //     group_idx: group.id,
+                //     algorithm: Algorithm::Random {
+                //         seed: group.id as u64,
+                //         count: NUMBER_OF_RANDOM_TASKS,
+                //     },
+                //     priority: TaskPriority::Low,
+                //     group: group.clone(),
+                //     created_at,
+                // });
+
+                tasks.push(ConflictTask {
+                    group_idx: group.id,
+                    algorithm: Algorithm::RandomImproved {
+                        seed: group.id as u64,
+                        count: NUMBER_OF_RANDOM_TASKS,
+                    },
+                    priority: TaskPriority::Low,
+                    group: group.clone(),
+                    created_at,
+                });
+
+                tasks.push(ConflictTask {
+                    group_idx: group.id,
+                    algorithm: Algorithm::Length,
+                    priority: TaskPriority::Low,
+                    group: group.clone(),
+                    created_at,
+                });
+                tasks.push(ConflictTask {
+                    group_idx: group.id,
+                    algorithm: Algorithm::ReverseGreedy,
+                    priority: TaskPriority::Low,
+                    group: group.clone(),
+                    created_at,
+                });
+            }
+            return tasks;
+        }
+    }
+
+    // Fallback: legacy policy
     tasks.push(ConflictTask {
         group_idx: group.id,
         algorithm: Algorithm::Greedy,
@@ -371,9 +457,7 @@ pub fn get_tasks_for_group(
         created_at,
     });
 
-    // Then, we can push lower priority tasks that have a low chance, but a chance, of finding a better result
-    if group.orders.len() <= MAX_LENGTH_FOR_ALL_PERMUTATIONS && !safe_sorting_only {
-        // AllPermutations
+    if group.orders.len() <= 3 {
         tasks.push(ConflictTask {
             group_idx: group.id,
             algorithm: Algorithm::AllPermutations,

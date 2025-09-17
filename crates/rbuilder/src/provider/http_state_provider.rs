@@ -1,0 +1,366 @@
+use super::{state_cache::*, StateProviderFactory};
+use alloy_network::Ethereum;
+use alloy_provider::{Provider, ProviderBuilder};
+use alloy_rpc_types::{BlockId, BlockNumberOrTag};
+use alloy_primitives::{Address, B256, Bytes, StorageKey, StorageValue, BlockNumber, BlockHash, keccak256};
+use reth_errors::ProviderResult;
+use reth_primitives::{Account, Bytecode, Header};
+use reth_provider::{
+    errors::any::AnyError, AccountReader, BlockHashReader, ProviderError, StateProofProvider,
+    StateProvider, StateProviderBox, StateRootProvider, HashedPostStateProvider, StorageRootProvider,
+};
+use reth_trie::{
+    updates::TrieUpdates, AccountProof, HashedPostState, TrieInput, MultiProof, MultiProofTargets,
+    StorageMultiProof, StorageProof, HashedStorage,
+};
+use alloy_eips::BlockNumHash;
+use revm::database::BundleState;
+use std::{path::PathBuf, sync::Arc};
+use tokio::runtime::Handle;
+use std::future::Future;
+
+
+pub fn key_account(hash: B256, addr: Address) -> String {
+    format!("account:{:#x}:{:#x}", hash, addr)
+}
+pub fn key_storage(hash: B256, addr: Address, slot: B256) -> String {
+    format!("storage:{:#x}:{:#x}:{:#x}", hash, addr, slot)
+}
+pub fn key_bytecode(hash: B256, code_hash: B256) -> String {
+    format!("bytecode:{:#x}:{:#x}", hash, code_hash)
+}
+pub fn key_block_hash(num: u64) -> String {
+    format!("block_hash:{num}")
+}
+pub fn key_header(hash: B256) -> String {
+    format!("header:{:#x}", hash)
+}
+
+#[inline]
+pub fn run_on_rt<F, T>(rt: &Handle, fut: F) -> T
+where
+    F: Future<Output = T>,
+{
+    match Handle::try_current() {
+        // Already on a Tokio runtime thread, use block_in_place to allow blocking.
+        Ok(_) => tokio::task::block_in_place(|| rt.block_on(fut)),
+        // Not on a Tokio runtime (e.g., std::thread/Rayon), block directly.
+        Err(_) => rt.block_on(fut),
+    }
+}
+
+#[derive(Clone)]
+pub struct HttpStateProviderFactory {
+    provider: Arc<dyn Provider<Ethereum> + Send + Sync>,
+    cache_db: CacheDB,
+    rt: Handle,
+}
+
+impl HttpStateProviderFactory {
+    pub fn new_with_url_and_cache(
+        url: &str,
+        cache_path: PathBuf,
+        rt: &tokio::runtime::Handle,
+    ) -> eyre::Result<Self> {
+        let provider = ProviderBuilder::new()
+            .network::<Ethereum>()
+            .on_http(url.parse()?);
+
+        // async work executed on the long-lived runtime
+        let state_cache = run_on_rt(rt, StateCache::new(&cache_path))?;
+        let cache_db = CacheDB::new(state_cache);
+
+        Ok(Self {
+            provider: Arc::new(provider),
+            cache_db,
+            rt: rt.clone(),
+        })
+    }
+
+    #[inline]
+    fn spawn_provider(&self, hash: B256) -> Box<HttpStateProvider> {
+        HttpStateProvider::new(self.provider.clone(), hash, self.cache_db.clone(), self.rt.clone())
+    }
+}
+
+impl StateProviderFactory for HttpStateProviderFactory {
+    fn history_by_block_number(&self, block_number: BlockNumber) -> ProviderResult<StateProviderBox> {
+        if let Some(h) = self.block_hash(block_number)? {
+            return Ok(self.spawn_provider(h));
+        }
+        let provider = self.provider.clone();
+        let res = run_on_rt(&self.rt, async { provider.get_block_by_number(BlockNumberOrTag::Number(block_number)).await })
+            .map_err(|e| ProviderError::Other(AnyError::new(e)))?
+            .ok_or_else(|| ProviderError::Other(AnyError::new(std::io::Error::new(
+                std::io::ErrorKind::Other, "Block not found",
+            ))))?;
+
+        let num_key = key_block_hash(block_number);
+        let _ = run_on_rt(&self.rt, self.cache_db.block_hashes.set(&num_key, &res.header.hash));
+        Ok(self.spawn_provider(res.header.hash))
+    }
+
+    fn latest(&self) -> ProviderResult<StateProviderBox> {
+        let provider = self.provider.clone();
+        let res = run_on_rt(&self.rt, async { provider.get_block(BlockId::latest()).await })
+            .map_err(|e| ProviderError::Other(AnyError::new(e)))?
+            .ok_or_else(|| ProviderError::Other(AnyError::new(std::io::Error::new(
+                std::io::ErrorKind::Other, "Block not found",
+            ))))?;
+        Ok(self.spawn_provider(res.header.hash))
+    }
+
+    fn history_by_block_hash(&self, block_hash: B256) -> ProviderResult<StateProviderBox> {
+        Ok(self.spawn_provider(block_hash))
+    }
+
+    fn header(&self, block_hash: &BlockHash) -> ProviderResult<Option<Header>> {
+        let key = key_header(*block_hash);
+        if let Some(h) = run_on_rt(&self.rt, self.cache_db.headers.get(&key)) {
+            return Ok(Some(h));
+        }
+        let provider = self.provider.clone();
+        let hash = *block_hash;
+        let res = run_on_rt(&self.rt, async { provider.get_block_by_hash(hash).await })
+            .map_err(|e| ProviderError::Other(AnyError::new(e)))?;
+        if let Some(block) = res {
+            let hdr = block.header.inner;
+            let _ = run_on_rt(&self.rt, self.cache_db.headers.set(&key, &hdr));
+            Ok(Some(hdr))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn last_block_number(&self) -> ProviderResult<BlockNumber> {
+        let provider = self.provider.clone();
+        let block_number = run_on_rt(&self.rt, async { provider.get_block_number().await })
+            .map_err(|e| ProviderError::Other(AnyError::new(e)))?;
+        Ok(block_number)
+    }
+
+    fn block_hash(&self, number: BlockNumber) -> ProviderResult<Option<B256>> {
+        let provider = self.provider.clone();
+        let block = run_on_rt(&self.rt, async { provider.get_block_by_number(BlockNumberOrTag::Number(number)).await })
+            .map_err(|e| ProviderError::Other(AnyError::new(e)))?;
+        Ok(block.map(|b| b.header.hash))
+    }
+
+    fn best_block_number(&self) -> ProviderResult<BlockNumber> {
+        self.last_block_number()
+    }
+
+    fn header_by_number(&self, num: u64) -> ProviderResult<Option<Header>> {
+        if let Some(h) = self.block_hash(num)? {
+            let k = key_header(h);
+            if let Some(hdr) = run_on_rt(&self.rt, self.cache_db.headers.get(&k)) {
+                return Ok(Some(hdr));
+            }
+        }
+        let provider = self.provider.clone();
+        let res = run_on_rt(&self.rt, async { provider.get_block_by_number(BlockNumberOrTag::Number(num)).await })
+            .map_err(|e| ProviderError::Other(AnyError::new(e)))?;
+
+        if let Some(block) = res {
+            let hash = block.header.hash;
+            let hdr = block.header.inner;
+            let _ = run_on_rt(&self.rt, self.cache_db.block_hashes.set(&key_block_hash(num), &hash));
+            let _ = run_on_rt(&self.rt, self.cache_db.headers.set(&key_header(hash), &hdr));
+            Ok(Some(hdr))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn root_hasher(&self, _parent_num_hash: BlockNumHash) -> ProviderResult<Box<dyn super::RootHasher>> {
+        Err(ProviderError::Other(AnyError::new(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "State root calculation not implemented - not needed for backtesting",
+        ))))
+    }
+}
+
+pub struct HttpStateProvider {
+    provider: Arc<dyn Provider<Ethereum> + Send + Sync>,
+    hash: B256,
+    cache_db: CacheDB,
+    rt: Handle,
+}
+
+impl HttpStateProvider {
+    pub fn new(
+        provider: Arc<dyn Provider<Ethereum> + Send + Sync>,
+        hash: B256,
+        cache_db: CacheDB,
+        rt: Handle,
+    ) -> Box<Self> {
+        Box::new(Self { provider, hash, cache_db, rt })
+    }
+}
+
+impl StateProvider for HttpStateProvider {
+    fn storage(&self, address: Address, storage_key: StorageKey) -> ProviderResult<Option<StorageValue>> {
+        let cache_key = key_storage(self.hash, address, storage_key);
+        if let Some(cached_value) = run_on_rt(&self.rt, self.cache_db.storage.get(&cache_key)) {
+            return Ok(Some(cached_value.into()));
+        }
+
+        let block_id = BlockId::hash(self.hash);
+        let res = run_on_rt(&self.rt, async {
+            self.provider
+                .get_storage_at(address, storage_key.into())
+                .block_id(block_id)
+                .await
+        }).map_err(|e| ProviderError::Other(AnyError::new(e)))?;
+
+        let _ = run_on_rt(&self.rt, self.cache_db.storage.set(&cache_key, &res));
+        Ok(Some(res.into()))
+    }
+
+    fn bytecode_by_hash(&self, code_hash: &B256) -> ProviderResult<Option<Bytecode>> {
+        let cache_key = key_bytecode(self.hash, *code_hash);
+        Ok(run_on_rt(&self.rt, self.cache_db.bytecode.get(&cache_key)))
+    }
+
+    fn account_nonce(&self, address: &Address) -> ProviderResult<Option<u64>> {
+        match self.basic_account(address)? {
+            Some(account) => Ok(Some(account.nonce)),
+            None => Ok(None),
+        }
+    }
+}
+
+impl BlockHashReader for HttpStateProvider {
+    fn block_hash(&self, number: BlockNumber) -> ProviderResult<Option<B256>> {
+        let cache_key = key_block_hash(number);
+        if let Some(cached_hash) = run_on_rt(&self.rt, self.cache_db.block_hashes.get(&cache_key)) {
+            return Ok(Some(cached_hash));
+        }
+        let block = run_on_rt(&self.rt, async {
+                self.provider
+                    .get_block_by_number(BlockNumberOrTag::Number(number))
+                    .await
+            })
+            .map_err(|e| ProviderError::Other(AnyError::new(e)))?;
+        if let Some(ref b) = block {
+            let _ = run_on_rt(&self.rt, self.cache_db.block_hashes.set(&cache_key, &b.header.hash));
+        }
+        Ok(block.map(|b| b.header.hash))
+    }
+
+    fn canonical_hashes_range(&self, start: BlockNumber, end: BlockNumber) -> ProviderResult<Vec<B256>> {
+        let mut res = vec![];
+        for i in start..end {
+            if let Some(hash) = self.block_hash(i)? {
+                res.push(hash);
+            }
+        }
+        Ok(res)
+    }
+}
+
+impl AccountReader for HttpStateProvider {
+    fn basic_account(&self, address: &Address) -> ProviderResult<Option<Account>> {
+        let cache_key = key_account(self.hash, *address);
+        if let Some(cached) = run_on_rt(&self.rt, self.cache_db.accounts.get(&cache_key)) {
+            return Ok(Some(cached));
+        }
+        let block_id = BlockId::hash(self.hash);
+        let (balance_res, nonce_res, code_res) = run_on_rt(&self.rt, async {
+            let balance = self.provider.get_balance(*address).block_id(block_id).await;
+            let nonce = self.provider.get_transaction_count(*address).block_id(block_id).await;
+            let code = self.provider.get_code_at(*address).block_id(block_id).await;
+            (balance, nonce, code)
+        });
+        let balance = balance_res.map_err(|e| ProviderError::Other(AnyError::new(e)))?;
+        let nonce   = nonce_res  .map_err(|e| ProviderError::Other(AnyError::new(e)))?;
+        let code    = code_res   .map_err(|e| ProviderError::Other(AnyError::new(e)))?;
+
+        // If there is code, compute its hash and store bytecode by hash.
+        let bytecode_hash = if code.is_empty() {
+            None
+        } else {
+            let h = keccak256(&code);
+            let bytecode = Bytecode::new_raw(code.clone());
+            let bkey = key_bytecode(self.hash, h);
+            let _ = run_on_rt(&self.rt, self.cache_db.bytecode.set(&bkey, &bytecode));
+            Some(h)
+        };
+
+        let result = Account { balance, nonce, bytecode_hash };
+        let _ = run_on_rt(&self.rt, self.cache_db.accounts.set(&cache_key, &result));
+        Ok(Some(result))
+    }
+}
+
+impl StateRootProvider for HttpStateProvider {
+    fn state_root(&self, _hashed_state: HashedPostState) -> ProviderResult<B256> {
+        Err(ProviderError::Other(AnyError::new(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "State root calculation not supported for HTTP provider",
+        ))))
+    }
+    fn state_root_from_nodes(&self, _input: TrieInput) -> ProviderResult<B256> {
+        Err(ProviderError::Other(AnyError::new(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "State root calculation not supported for HTTP provider",
+        ))))
+    }
+    fn state_root_with_updates(&self, _hashed_state: HashedPostState) -> ProviderResult<(B256, TrieUpdates)> {
+        Err(ProviderError::Other(AnyError::new(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "State root calculation not supported for HTTP provider",
+        ))))
+    }
+    fn state_root_from_nodes_with_updates(&self, _input: TrieInput) -> ProviderResult<(B256, TrieUpdates)> {
+        Err(ProviderError::Other(AnyError::new(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "State root calculation not supported for HTTP provider",
+        ))))
+    }
+}
+impl StorageRootProvider for HttpStateProvider {
+    fn storage_root(&self, _address: Address, _hashed_storage: HashedStorage) -> ProviderResult<B256> {
+        Err(ProviderError::Other(AnyError::new(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "Storage root calculation not supported for HTTP provider",
+        ))))
+    }
+    fn storage_proof(&self, _address: Address, _slot: B256, _hashed_storage: HashedStorage) -> ProviderResult<StorageProof> {
+        Err(ProviderError::Other(AnyError::new(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "Storage proof not supported for HTTP provider",
+        ))))
+    }
+    fn storage_multiproof(&self, _address: Address, _slots: &[B256], _hashed_storage: HashedStorage) -> ProviderResult<StorageMultiProof> {
+        Err(ProviderError::Other(AnyError::new(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "Storage multiproof not supported for HTTP provider",
+        ))))
+    }
+}
+impl StateProofProvider for HttpStateProvider {
+    fn proof(&self, _input: TrieInput, _address: Address, _slots: &[B256]) -> ProviderResult<AccountProof> {
+        Err(ProviderError::Other(AnyError::new(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "Proof generation not supported for HTTP provider",
+        ))))
+    }
+    fn multiproof(&self, _input: TrieInput, _targets: MultiProofTargets) -> ProviderResult<MultiProof> {
+        Err(ProviderError::Other(AnyError::new(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "Multiproof generation not supported for HTTP provider",
+        ))))
+    }
+    fn witness(&self, _input: TrieInput, _target: HashedPostState) -> ProviderResult<Vec<Bytes>> {
+        Err(ProviderError::Other(AnyError::new(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "Witness generation not supported for HTTP provider",
+        ))))
+    }
+}
+impl HashedPostStateProvider for HttpStateProvider {
+    fn hashed_post_state(&self, _bundle_state: &BundleState) -> HashedPostState {
+        HashedPostState::default()
+    }
+}

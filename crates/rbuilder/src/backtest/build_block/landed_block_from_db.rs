@@ -28,7 +28,7 @@ use crate::{
     provider::StateProviderFactory,
     utils::{
         mevblocker::get_mevblocker_price, timestamp_as_u64, timestamp_ms_to_offset_datetime,
-        ProviderFactoryReopener,
+        HttpProviderFactoryReopener,
     },
 };
 use clap::Parser;
@@ -105,7 +105,7 @@ impl<ConfigType: LiveBuilderConfig> LandedBlockFromDBOrdersSource<ConfigType> {
 impl<ConfigType: LiveBuilderConfig>
     OrdersSource<
         ConfigType,
-        ProviderFactoryReopener<NodeTypesWithDBAdapter<EthereumNode, Arc<DatabaseEnv>>>,
+        HttpProviderFactoryReopener,
     > for LandedBlockFromDBOrdersSource<ConfigType>
 {
     fn available_orders(&self) -> Vec<OrdersWithTimestamp> {
@@ -118,9 +118,9 @@ impl<ConfigType: LiveBuilderConfig>
 
     fn create_provider_factory(
         &self,
-    ) -> eyre::Result<ProviderFactoryReopener<NodeTypesWithDBAdapter<EthereumNode, Arc<DatabaseEnv>>>>
+    ) -> eyre::Result<HttpProviderFactoryReopener>
     {
-        self.config.base_config().create_reth_provider_factory(true)
+        self.config.base_config().create_http_provider_factory_reopener()
     }
 
     fn create_block_building_context(&self) -> eyre::Result<BlockBuildingContext> {
@@ -145,7 +145,7 @@ impl<ConfigType: LiveBuilderConfig>
 
     fn print_custom_stats(
         &self,
-        provider: ProviderFactoryReopener<NodeTypesWithDBAdapter<EthereumNode, Arc<DatabaseEnv>>>,
+        provider: HttpProviderFactoryReopener,
     ) -> eyre::Result<()> {
         if self.sim_landed_block {
             let tx_sim_results = sim_historical_block(

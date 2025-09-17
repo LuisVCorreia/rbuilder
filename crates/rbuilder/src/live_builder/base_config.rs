@@ -10,14 +10,10 @@ use crate::{
         LiveBuilder,
     },
     provider::{
-        ipc_state_provider::{IpcProviderConfig, IpcStateProviderFactory},
-        StateProviderFactory,
+        http_state_provider::HttpStateProviderFactory, ipc_state_provider::{IpcProviderConfig, IpcStateProviderFactory}, StateProviderFactory
     },
     roothash::RootHashContext,
-    utils::{
-        constants::{MINS_PER_HOUR, SECS_PER_MINUTE},
-        http_provider, ProviderFactoryReopener, Signer,
-    },
+    utils::{constants::{MINS_PER_HOUR, SECS_PER_MINUTE}, http_provider, tracing::{setup_tracing_subscriber, LoggerConfig}, ProviderFactoryReopener, Signer},
 };
 use alloy_primitives::{Address, B256};
 use alloy_provider::RootProvider;
@@ -316,6 +312,29 @@ impl BaseConfig {
             Duration::from_millis(ipc_provider_config.request_timeout_ms),
         ))
     }
+    
+    // Create http provider factory (similar to IPC but with a HTTP endpoint)
+    pub fn create_http_provider_factory(&self) -> eyre::Result<HttpStateProviderFactory> {
+        Url::parse(&self.backtest_fetch_eth_rpc_url)?;
+
+        // Get the long-lived Tokio handle
+        let rt = tokio::runtime::Handle::try_current()
+            .map_err(|_| eyre::eyre!("create_http_provider_factory must run on a Tokio runtime"))?;
+
+        HttpStateProviderFactory::new_with_url_and_cache(
+            &self.backtest_fetch_eth_rpc_url,
+            PathBuf::from("rbuilder_results_1/cache/state_cache.sqlite"),
+            &rt,
+        )
+    }
+
+
+    /// Create HTTP provider factory reopener for backtest compatibility
+    pub fn create_http_provider_factory_reopener(&self) -> eyre::Result<crate::utils::HttpProviderFactoryReopener> {
+        let http_provider = self.create_http_provider_factory()?;
+        Ok(crate::utils::HttpProviderFactoryReopener::new(http_provider))
+    }
+
 
     /// live_root_hash_config creates a root hash thread pool
     /// so it should be called once on the startup and cloned if needed

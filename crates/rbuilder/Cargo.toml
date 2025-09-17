@@ -11,11 +11,19 @@ build = "build.rs"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+anyhow = { workspace = true }
+chrono = { workspace = true }
+dotenvy = { workspace = true }
 rbuilder-primitives.workspace = true
 rbuilder-config.workspace = true
 rbuilder-utils.workspace = true
 
 serde = { workspace = true }
+bincode = { workspace = true }
+dirs = { workspace = true }
+num-bigint = { workspace = true }
+num-traits = { workspace = true }
+libc = { workspace = true }
 derive_more = { workspace = true }
 serde_json = { workspace = true }
 tokio.workspace = true
@@ -47,6 +55,7 @@ alloy-evm.workspace = true
 alloy-provider.workspace = true
 alloy-rpc-types.workspace = true
 alloy-json-rpc.workspace = true
+alloy-transport-http.workspace = true
 alloy-network.workspace = true
 alloy-network-primitives.workspace = true
 alloy-rpc-types-beacon.workspace = true
@@ -158,3 +167,11 @@ jemalloc-unprefixed = [
 [[bench]]
 name = "bench_main"
 harness = false
+
+[[bin]]
+name = "rbuilder-fetch-full"
+path = "src/bin/run_backtest_fetch_full.rs"
+
+[[bin]]
+name = "rbuilder-build-full"
+path = "src/bin/run_backtest_build_full.rs"

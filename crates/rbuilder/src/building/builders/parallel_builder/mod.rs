@@ -7,15 +7,20 @@ pub mod order_intake_store;
 pub mod results_aggregator;
 pub mod simulation_cache;
 pub mod task;
-use alloy_primitives::I256;
+use alloy_primitives::{U256, I256};
 pub use groups::*;
+pub mod nonce_handling;
+pub mod genetic_algo;
+pub use conflict_task_generator::*;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
+use std::sync::mpsc::RecvTimeoutError;
+use rayon::join;
 
 use ahash::HashMap;
 use conflict_resolving_pool::{ConflictResolvingPool, TaskQueue};
-use conflict_task_generator::ConflictTaskGenerator;
 use crossbeam::queue::SegQueue;
 use eyre::Result;
-use itertools::Itertools;
 use results_aggregator::BestResults;
 use reth_provider::StateProvider;
 use serde::Deserialize;
@@ -24,6 +29,7 @@ use std::{
     sync::{mpsc as std_mpsc, Arc},
     thread,
     time::{Duration, Instant},
+    cmp::Ordering as CmpOrdering,
 };
 use task::*;
 use time::OffsetDateTime;
@@ -75,6 +81,29 @@ fn get_shared_data_structures() -> (Arc<BestResults>, TaskQueue) {
     (best_results, task_queue)
 }
 
+fn cmp_res(a: &ResolutionResult, b: &ResolutionResult) -> CmpOrdering {
+    // Primary: total_profit desc
+    let c = b.total_profit.cmp(&a.total_profit);
+    if c != CmpOrdering::Equal { return c; }
+
+    // Secondary: gas_used asc (prefer cheaper for same profit)
+    let c = a.gas_used.cmp(&b.gas_used);
+    if c != CmpOrdering::Equal { return c; }
+
+    // Final tie-breaker: lexicographic by order indices (intra-group determinism)
+    let mut ia = a.sequence_of_orders.iter().map(|(i, _, _)| *i);
+    let mut ib = b.sequence_of_orders.iter().map(|(i, _, _)| *i);
+    loop {
+        match (ia.next(), ib.next()) {
+            (Some(x), Some(y)) => if x != y { return x.cmp(&y); },
+            (None, Some(_)) => return CmpOrdering::Less,
+            (Some(_), None) => return CmpOrdering::Greater,
+            (None, None) => return CmpOrdering::Equal, // truly identical
+        }
+    }
+}
+
+
 struct ParallelBuilder<P> {
     order_intake_consumer: OrderIntakeStore,
     conflict_finder: ConflictFinder,
@@ -82,6 +111,14 @@ struct ParallelBuilder<P> {
     conflict_resolving_pool: ConflictResolvingPool<P>,
     results_aggregator: ResultsAggregator,
     block_building_result_assembler: BlockBuildingResultAssembler,
+}
+
+#[derive(Copy, Clone, Debug)]
+pub enum BuildMode {
+    GreedyProfit,   // groups contiguous, sorted by total_profit
+    GreedyMgp,      // groups contiguous, sorted by group-level mev_gas_price
+    HeapMgp,        // interleave by per-tx MEV gas price
+    HeapProfit,     // interleave by per-tx profit only
 }
 
 impl<P> ParallelBuilder<P>
@@ -286,6 +323,7 @@ fn run_order_intake(
     }
 }
 
+
 pub fn parallel_build_backtest<P>(
     input: BacktestSimulateBlockInput<'_, P>,
     config: ParallelBuilderConfig,
@@ -299,7 +337,8 @@ where
     let init_start = Instant::now();
     let (best_results, task_queue) = get_shared_data_structures();
 
-    let (group_result_sender, _) = get_communication_channels();
+    let (group_result_sender, group_result_receiver) = get_communication_channels();
+    let group_result_sender_for_task_generator = group_result_sender.clone();
 
     let mut conflict_finder = ConflictFinder::new();
 
@@ -309,23 +348,24 @@ where
         orders
     };
 
-    conflict_finder.add_orders(sorted_orders);
     let simulation_cache = Arc::new(SharedSimulationCache::new());
     let init_duration = init_start.elapsed();
 
     // Worker pool and conflict manager creation
     let setup_start = Instant::now();
 
-    let mut conflict_resolving_pool = ConflictResolvingPool::new(
+    let cancel_token = CancellationToken::new();
+    let outstanding = Arc::new(AtomicUsize::new(0));
+    let conflict_resolving_pool = ConflictResolvingPool::new(
         config.num_threads,
         Arc::clone(&task_queue),
         config.safe_sorting_only,
         group_result_sender,
-        CancellationToken::new(),
+        cancel_token.clone(),
         input.ctx.clone(),
         input.provider.clone(),
         Arc::clone(&simulation_cache),
-    );
+    ).with_outstanding_counter(outstanding.clone());
 
     let setup_duration = setup_start.elapsed();
 
@@ -335,54 +375,118 @@ where
         .into();
 
     // Group processing
-    let processing_start = Instant::now();
+    conflict_finder.add_orders(sorted_orders);
     let groups = conflict_finder.get_order_groups();
-    let results = conflict_resolving_pool.process_groups_backtest(
-        groups,
-        &input.ctx,
-        block_state.clone(),
-        Arc::clone(&simulation_cache),
-    );
-    let processing_duration = processing_start.elapsed();
+
+    // Generate tasks using the same logic as live builder
+    let mut task_generator = ConflictTaskGenerator::new(Arc::clone(&task_queue), group_result_sender_for_task_generator);
+    let processing_start = Instant::now();
+    task_generator.process_groups(groups.clone());
+
+    // Initialise outstanding from the actual number of enqueued tasks
+    let planned = task_queue.len();
+    outstanding.store(planned, Ordering::Release);
+
+    // Start worker threads (after tasks are enqueued)
+    if let Err(err) = conflict_resolving_pool.start() {
+        return Err(err);
+    }
+    
+    let mut results: Vec<(GroupId, (ResolutionResult, ConflictGroup))> = Vec::new();
+    let mut last_progress = Instant::now();
+    loop {
+        match group_result_receiver.recv_timeout(Duration::from_millis(250)) {
+            Ok(res) => {
+                results.push(res);
+                last_progress = Instant::now();
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                if outstanding.load(Ordering::Acquire) == 0 {
+                    break;
+                }
+            }
+            Err(RecvTimeoutError::Disconnected) => break,
+        }
+    }
+
+    // Stop workers
+    cancel_token.cancel();
+
+    let processing_end = last_progress; // updated on every Ok(res)
+    let processing_duration = processing_end.duration_since(processing_start);
 
     // Block building result assembler creation
     let assembler_start = Instant::now();
-    let mut block_building_result_assembler = BlockBuildingResultAssembler::new(
+        let mut asm_greedy = BlockBuildingResultAssembler::new(
         &config,
         Arc::clone(&best_results),
         block_state.clone(),
         input.ctx.clone(),
         CancellationToken::new(),
-        String::from("backtest_builder"),
+        "backtest_builder_greedy".into(),
+        true,
         None,
-        Arc::new(BuiltBlockIdSource::new()),
+    );
+
+    let mut asm_mgp = BlockBuildingResultAssembler::new(
+        &config,
+        Arc::clone(&best_results),
+        block_state.clone(),
+        input.ctx.clone(),
+        CancellationToken::new(),
+        "backtest_builder_mgp".into(),
+        true,
         None,
     );
     let assembler_duration = assembler_start.elapsed();
 
     // Best results collection
     let collection_start = Instant::now();
-    let best_results: HashMap<GroupId, (ResolutionResult, ConflictGroup)> = results
-        .into_iter()
-        .sorted_by(|a, b| b.1 .0.total_profit.cmp(&a.1 .0.total_profit))
-        .into_group_map_by(|(group_id, _)| *group_id)
-        .into_iter()
-        .map(|(group_id, mut group_results)| (group_id, group_results.remove(0).1))
-        .collect();
+
+    let mut best_results: HashMap<GroupId, (ResolutionResult, ConflictGroup)> = HashMap::default();
+
+    for (gid, (res, grp)) in results.into_iter() {
+        match best_results.get_mut(&gid) {
+            None => { best_results.insert(gid, (res, grp)); }
+            Some((cur_res, cur_grp)) => {
+                if cmp_res(&res, cur_res).is_lt() {
+                    *cur_res = res;
+                    *cur_grp = grp;
+                }
+            }
+        }
+    }
+
     let collection_duration = collection_start.elapsed();
 
     // Block building
     let building_start = Instant::now();
-    let mut block_building_helper = block_building_result_assembler
-        .build_backtest_block(best_results, OffsetDateTime::now_utc())?;
+    let orders_closed_at = OffsetDateTime::now_utc();
+    let (res_greedy, res_mgp) = join(
+        || asm_greedy.build_backtest_block(best_results.clone(), orders_closed_at, BuildMode::HeapProfit),
+        || asm_mgp.build_backtest_block(best_results.clone(), orders_closed_at, BuildMode::HeapMgp),
+    );
 
-    let payout_tx_value = block_building_helper.true_block_value()?;
-    let finalize_block_result = block_building_helper.finalize_block(
-        &mut block_building_result_assembler.local_ctx,
+    let helper_greedy = res_greedy?;
+    let helper_mgp    = res_mgp?;
+
+    let val_greedy = if config.coinbase_payment { U256::ZERO } else { helper_greedy.true_block_value()? };
+    let val_mgp    = if config.coinbase_payment { U256::ZERO } else { helper_mgp.true_block_value()? };
+
+    let (chosen_helper, mut chosen_asm) = if val_mgp > val_greedy {
+        (helper_mgp, asm_mgp)
+    } else {
+        (helper_greedy, asm_greedy)
+    };
+
+    let payout_tx_value = if config.coinbase_payment { None } else { Some(chosen_helper.true_block_value()?) };
+    let finalize_block_result = chosen_helper.finalize_block(
+        &mut chosen_asm.local_ctx,
         payout_tx_value,
         I256::ZERO,
         CompetitionBidContext::no_competition_bid(),
     )?;
+
     let building_duration = building_start.elapsed();
     let total_duration = start_time.elapsed();
 
@@ -396,6 +500,7 @@ where
 
     Ok(finalize_block_result.block)
 }
+
 
 #[derive(Debug)]
 pub struct ParallelBuildingAlgorithm {

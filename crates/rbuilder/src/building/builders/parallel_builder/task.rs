@@ -69,7 +69,27 @@ pub enum Algorithm {
     AllPermutations,
     /// `Random` checks random permutations of the group.
     Random { seed: u64, count: usize },
+    /// `Genetic` uses a genetic algorithm to find near-optimal orderings.
+    Genetic { population: usize, crossover_rate: f64, mutation_rate: f64, tourn_k: usize, max_generations: usize, time_ms: u64, seed: u64 },
+    /// `RandomImproved` checks valid random permutations of the group only.
+    RandomImproved { seed: u64, count: usize },
 }
+
+impl Algorithm {
+    pub fn display(&self) -> &str {
+        match self {
+            Algorithm::Greedy => "Greedy",
+            Algorithm::ReverseGreedy => "ReverseGreedy",
+            Algorithm::Length => "Length",
+            Algorithm::AllPermutations => "AllPermutations",
+            Algorithm::Random { .. } => "Random",
+            Algorithm::Genetic { .. } => "Genetic",
+            Algorithm::RandomImproved { .. } => "RandomImproved",
+
+        }
+    }
+}
+
 
 #[cfg(test)]
 mod tests {

@@ -13,7 +13,10 @@ use std::sync::{
 pub struct CachedSimulationState {
     pub bundle_state: BundleState,
     pub total_profit: U256,
-    pub per_order_profits: Vec<(OrderId, U256)>,
+    pub per_order_profits_and_gas: Vec<(OrderId, U256, u64)>,
+    pub cumulative_gas_used: u64,
+    pub cumulative_blob_gas_used: u64,
+    pub coinbase_profit: U256,
 }
 
 /// An inner cache of simulation results, keyed by the ordering of the orders that produced the simulation state.
@@ -118,6 +121,27 @@ impl SharedSimulationCache {
 
         let mut cache_lock = self.cache.write();
         cache_lock.inner_cache.insert(partial_key, new_state);
+    }
+
+
+    pub fn ensure_cached_with<F>(&self, ordering: &[OrderId], make: F) -> bool
+    where
+        F: FnOnce() -> CachedSimulationState,
+    {
+        {
+            let guard = self.cache.read();
+            if guard.inner_cache.contains_key(ordering) {
+                return false; // already present
+            }
+        }
+        if let Some(mut w) = self.cache.try_write() {
+            if !w.inner_cache.contains_key(ordering) {
+                let value = Arc::new(make());
+                w.inner_cache.insert(ordering.to_owned(), value);
+                return true;
+            }
+        }
+        false // lock contended or already present
     }
 
     /// Retrieves statistics about the cache usage.
@@ -235,7 +259,10 @@ mod tests {
             CachedSimulationState {
                 bundle_state,
                 total_profit: U256::from(self.last_used_id),
-                per_order_profits: vec![(self.create_order_id(), U256::from(10))],
+                per_order_profits_and_gas: vec![(self.create_order_id(), U256::from(10), 2100)],
+                cumulative_gas_used: 100,
+                cumulative_blob_gas_used: 5,
+                coinbase_profit: U256::from(2),
             }
         }
     }

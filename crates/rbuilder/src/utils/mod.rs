@@ -29,7 +29,7 @@ pub mod fmt;
 mod provider_factory_reopen;
 pub use provider_factory_reopen::{
     check_block_hash_reader_health, is_provider_factory_health_error, HistoricalBlockError,
-    ProviderFactoryReopener, RootHasherImpl,
+    ProviderFactoryReopener, RootHasherImpl, HttpProviderFactoryReopener,
 };
 
 pub mod reconnect;

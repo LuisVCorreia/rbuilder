@@ -88,6 +88,7 @@ pub mod sim;
 pub mod testing;
 pub mod tracers;
 pub mod tx_sim_cache;
+pub mod blob_tx_selection;
 
 pub use self::{
     block_orders::*, builders::mock_block_building_helper::MockRootHasher, built_block_trace::*,
@@ -119,6 +120,7 @@ pub struct BlockBuildingContext {
     pub payload_id: InternalPayloadId,
     pub shared_cached_reads: Arc<SharedCachedReads>,
     pub tx_execution_cache: Arc<TxExecutionCache>,
+    pub blob_tx_selection_duration: Option<Duration>,
     pub mempool_tx_detector: Arc<MempoolTxsDetector>,
     pub faster_finalize: bool,
     pub mev_blocker_price: U256,
@@ -218,6 +220,7 @@ impl BlockBuildingContext {
             shared_cached_reads: Default::default(),
             tx_execution_cache: Arc::new(TxExecutionCache::new(evm_caching_enable)),
             max_blob_gas_per_block,
+            blob_tx_selection_duration: None,
             mempool_tx_detector: Arc::new(MempoolTxsDetector::new()),
             faster_finalize,
             mev_blocker_price,
@@ -300,6 +303,7 @@ impl BlockBuildingContext {
             shared_cached_reads: Default::default(),
             tx_execution_cache: Arc::new(TxExecutionCache::new(evm_caching_enable)),
             max_blob_gas_per_block,
+            blob_tx_selection_duration: None,
             mempool_tx_detector: Arc::new(MempoolTxsDetector::new()),
             faster_finalize: true,
             mev_blocker_price,
