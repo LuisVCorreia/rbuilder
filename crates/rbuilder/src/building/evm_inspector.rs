@@ -2,7 +2,6 @@ use ahash::HashMap;
 use alloy_consensus::Transaction;
 use alloy_primitives::{Address, B256, U256};
 use reth_primitives::{Recovered, TransactionSigned};
-use serde::{Serialize, Serializer};
 use revm::{
     bytecode::opcode,
     context::ContextTr,
@@ -18,17 +17,7 @@ pub struct SlotKey {
     pub key: B256,
 }
 
-impl Serialize for SlotKey {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serializer.serialize_str(&format!("0x{:x}:0x{:x}", self.address, self.key))
-    }
-}
-
-
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 /// UsedStateTrace is an execution trace of the given order
 /// Limitations:
 /// * `written_slot_values`, `received_amount` and `sent_amount` are not correct if transaction reverts
@@ -94,66 +83,6 @@ impl UsedStateTrace {
         self.sent_amount.clear();
         self.created_contracts.clear();
         self.destructed_contracts.clear();
-    }
-
-    pub fn summary(&self) -> String {
-        let mut summary = String::new();
-        if !self.read_slot_values.is_empty() {
-            summary.push_str("\n[Read Slots]\n");
-            for (slot_key, value) in &self.read_slot_values {
-                summary.push_str(&format!(
-                    "  - Address: {:?}, Slot: {:?}, Value: {:?}\n",
-                    slot_key.address, slot_key.key, value
-                ));
-            }
-        }
-
-        if !self.written_slot_values.is_empty() {
-            summary.push_str("\n[Written Slots]\n");
-            for (slot_key, value) in &self.written_slot_values {
-                summary.push_str(&format!(
-                    "  - Address: {:?}, Slot: {:?}, Value: {:?}\n",
-                    slot_key.address, slot_key.key, value
-                ));
-            }
-        }
-
-        if !self.read_balances.is_empty() {
-            summary.push_str("\n[Read Balances]\n");
-            for (address, balance) in &self.read_balances {
-                summary.push_str(&format!("  - Address: {:?}, Balance: {:?}\n", address, balance));
-            }
-        }
-
-        if !self.received_amount.is_empty() {
-            summary.push_str("\n[Received Amounts (Wei)]\n");
-            for (address, amount) in &self.received_amount {
-                summary.push_str(&format!("  - Address: {:?}, Amount: {:?}\n", address, amount));
-            }
-        }
-
-        if !self.sent_amount.is_empty() {
-            summary.push_str("\n[Sent Amounts (Wei)]\n");
-            for (address, amount) in &self.sent_amount {
-                summary.push_str(&format!("  - Address: {:?}, Amount: {:?}\n", address, amount));
-            }
-        }
-
-        if !self.created_contracts.is_empty() {
-            summary.push_str("\n[Created Contracts]\n");
-            for address in &self.created_contracts {
-                summary.push_str(&format!("  - Address: {:?}\n", address));
-            }
-        }
-
-        if !self.destructed_contracts.is_empty() {
-            summary.push_str("\n[Destructed Contracts]\n");
-            for address in &self.destructed_contracts {
-                summary.push_str(&format!("  - Address: {:?}\n", address));
-            }
-        }
-
-        summary
     }
 }
 
@@ -289,24 +218,6 @@ where
         None
     }
 
-    // fn call_end(&mut self, _context: &mut CTX, inputs: &CallInputs, outcome: &mut CallOutcome) {
-    //     let succeeded = outcome.result.is_ok();
-    //     if !succeeded { return; }
-
-    //     if let Some(transfer_value) = inputs.transfer_value() {
-    //         if !transfer_value.is_zero() {
-    //             *self.used_state_trace
-    //                 .sent_amount
-    //                 .entry(inputs.transfer_from())
-    //                 .or_default() += transfer_value;
-    //             *self.used_state_trace
-    //                 .received_amount
-    //                 .entry(inputs.transfer_to())
-    //                 .or_default() += transfer_value;
-    //         }
-    //     }
-    // }
-
     fn create_end(
         &mut self,
         _context: &mut CTX,
@@ -392,13 +303,6 @@ where
             used_state_inspector.call(context, inputs)
         } else {
             None
-        }
-    }
-
-    #[inline]
-    fn call_end(&mut self, context: &mut CTX, inputs: &CallInputs, outcome: &mut CallOutcome) {
-        if let Some(used_state_inspector) = &mut self.used_state_inspector {
-            used_state_inspector.call_end(context, inputs, outcome);
         }
     }
 

@@ -482,8 +482,6 @@ impl ResolverContext {
             seq,
             profit: res.total_profit,
             gas: res.gas_used,
-            rank: 0,
-            crowding: 0.0,
         };
         Ok((ind, res))
     }
@@ -562,7 +560,7 @@ impl ResolverContext {
                     || local_ctx.clone(),
                     |thread_ctx, island| {
                         run_dc_generation(island, &best_seen, task, &params, &layout, self, thread_ctx)
-                            .map(|_| ()) // discard DCGenerationResult but keep errors
+                            .map(|_| ())
                     },
                 )?;
 

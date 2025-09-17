@@ -26,15 +26,6 @@ use std::{
 };
 use tokio::sync::Mutex;
 use tracing::{info, trace};
-use serde::Serialize;
-
-#[derive(Serialize)]
-struct FetchResults {
-    block_number: u64,
-    initial_mempool_size: usize,
-    orders_after_base_fee_filter: usize,
-    final_available_orders: usize,
-}
 
 /// Struct that brings block information ([BlockData]) from several [DataSource]s
 /// Filters txs already landed (onchain nonce > tx nonce)
@@ -230,44 +221,16 @@ impl HistoricalDataFetcher {
 
         info!(count = orders.len(), "Fetched orders, unfiltered");
 
-        let initial_mempool_size = orders.len();
-
         let base_fee_per_gas = onchain_block.header.base_fee_per_gas.unwrap_or_default();
         self.filter_orders_by_base_fee(base_fee_per_gas as u128, &mut orders);
         info!(orders_left = orders.len(), "Filtered orders by base fee");
-
-        let orders_after_base_fee_filter = orders.len();
 
         let mut available_orders = self.filter_order_by_nonces(orders, block_number).await?;
         info!(
             orders_left = available_orders.len(),
             "Filtered orders by nonces"
         );
-        let final_available_orders = available_orders.len();
         available_orders.sort_by_key(|o| o.timestamp_ms);
-
-        let results = FetchResults {
-            block_number,
-            initial_mempool_size,
-            orders_after_base_fee_filter,
-            final_available_orders,
-        };
-
-        // Construct the output path
-        let output_dir = PathBuf::from("rbuilder_results/fetch_outputs");
-        let output_filename = output_dir.join(format!("results_{}.json", block_number));
-
-        // Ensure the parent directory exists
-        if let Some(parent) = output_filename.parent() {
-            tokio::fs::create_dir_all(parent).await?;
-        }
-
-        // Serialize and write the file
-        let json_content = serde_json::to_string_pretty(&results)?;
-        tokio::fs::write(&output_filename, json_content).await?;
-        info!("Fetch results saved to {:?}", output_filename);
-
-
 
         Ok(BlockData {
             block_number,

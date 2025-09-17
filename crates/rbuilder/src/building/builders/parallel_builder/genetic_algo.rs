@@ -16,43 +16,15 @@ pub struct GAParams {
     pub seed: u64,
 }
 
-pub fn repair_to_nonce_valid(preferred: &[usize], layout: &NonceLayout) -> Vec<usize> {
-    // Project a single preference list onto a valid interleaving.
-    // Internally this uses the same ready-set selection as crossover.
-    ppx_build_child_from_parents_greedy(preferred, preferred, layout)
-}
-
 #[derive(Clone)]
 pub struct Individual {
     pub seq: Vec<usize>,
     pub profit: U256,
     pub gas: u64,
-    pub rank: u32,  // Pareto front index (1 = best)
-    pub crowding: f64,  // crowding distance
 }
 
 pub fn dominates(a: &Individual, b: &Individual) -> bool {
-    // let a_better_or_equal = a.profit >= b.profit && a.gas <= b.gas;
-    // let a_strictly_better = a.profit >  b.profit ||  a.gas  <  b.gas;
-    // a_better_or_equal && a_strictly_better
-
     a.profit > b.profit || (a.profit == b.profit && a.gas < b.gas)
-}
-
-pub fn tournament_select<'p>(
-    population: &'p [Individual],
-    k: usize,
-    rng: &mut SmallRng,
-) -> usize {
-    let mut best = rng.gen_range(0..population.len());
-    for _ in 1..k {
-        let i = rng.gen_range(0..population.len());
-        let a = &population[i];
-        let b = &population[best];
-        let better = (a.rank < b.rank) || (a.rank == b.rank && a.crowding > b.crowding);
-        if better { best = i; }
-    }
-    best
 }
 
 /// Count inversions via mergesort; returns inversions count.
@@ -256,7 +228,6 @@ pub fn ppx_build_child_from_parents(
                 let ra = *rank_in_a.get(&cand).unwrap_or(&LARGE_RANK);
                 let rb = *rank_in_b.get(&cand).unwrap_or(&LARGE_RANK);
 
-                // TODO: Tweak alpha and beta
                 let score = alpha * (ra.min(rb) as f64) + beta * ((ra + rb) as f64);
                 cands.push((cand, score));
             }
@@ -388,7 +359,7 @@ pub fn adapted_order_crossover(
     child
 }
 
-/// Helper to build the predecessor map from the nonce layout.
+/// Helper to build the predecessor map from the nonce layout
 fn build_predecessor_map(layout: &NonceLayout) -> StdHashMap<usize, Vec<usize>> {
     let mut map: StdHashMap<usize, Vec<usize>> = StdHashMap::new();
     for chain in &layout.chains {
@@ -406,16 +377,16 @@ fn build_predecessor_map(layout: &NonceLayout) -> StdHashMap<usize, Vec<usize>> 
     map
 }
 
-/// Helper to check if a transaction is ready to be placed.
+/// Helper to check if a transaction is ready to be placed
 fn is_ready(tx: &usize, predecessor_map: &StdHashMap<usize, Vec<usize>>, in_child: &HashSet<usize>) -> bool {
     match predecessor_map.get(tx) {
         Some(preds) => preds.iter().any(|pred| in_child.contains(pred)),
-        // If it has no predecessors, it's the start of a chain and is always ready.
+        // If it has no predecessors, it's the start of a chain and is always ready
         None => true,
     }
 }
 
-/// Helper to place a value in the next available slot of the child array.
+/// Helper to place a value in the next available slot of the child array
 fn place_in_next_slot(child: &mut [usize], val: usize, fill_idx: &mut usize, slice_start: usize, slice_end: usize) {
     while *fill_idx < child.len() {
         if *fill_idx >= slice_start && *fill_idx <= slice_end {
@@ -745,7 +716,7 @@ mod tests {
         let tau = kendall_tau_distance_slots_norm(&seq1, &seq2, &layout, &offs);
         assert!(
             (tau - 0.0).abs() < 1e-12,
-            "Kendall-τ over slots should be zero when slot order is identical (tau={})",
+            "Kendall-tau over slots should be zero when slot order is identical (tau={})",
             tau
         );
     }
@@ -763,7 +734,7 @@ mod tests {
         let seq_b = vec![chains_best[1][0], chains_best[0][0], chains_best[1][1], chains_best[0][1]];
         let offs = chain_offsets(&layout);
         let tau = kendall_tau_distance_slots_norm(&seq_a, &seq_b, &layout, &offs);
-        assert!(tau > 0.0, "Kendall-τ should be >0 when slot order differs, got {}", tau);
+        assert!(tau > 0.0, "Kendall-tau should be >0 when slot order differs, got {}", tau);
         assert!(tau <= 1.0 + 1e-12);
     }
 
@@ -886,7 +857,7 @@ mod tests {
 
         let mut rng = SmallRng::seed_from_u64(4242);
 
-        // Try multiple times to actually cause a change (bounded attempts)
+        // Try multiple times to actually cause a change
         let mut changed_once = false;
         for _ in 0..50 {
             let mut tmp = seq.clone();

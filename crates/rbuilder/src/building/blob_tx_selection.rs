@@ -257,9 +257,9 @@ fn greedy_once<'a>(classes: &'a [Class<'a>], blob_cap: u64, strategy: Strategy) 
     for (i, cls) in classes.iter().enumerate() {
         let k = chosen_prefix[i]; // number of blobs accepted for this signer
         if k >= cls.blob_idx.len() {
-            // selected all blobs -> keep entire RAW chain:
-            // - for blob nonces: keep ONLY the chosen blob (not all blob-alternatives)
-            // - for normal-only nonces: keep ALL normal duplicates
+            // selected all blobs -> keep entire chain:
+            // for blob nonces: keep only the chosen blob (not all blob-alternatives)
+            // for normal-only nonces: keep all normal tx duplicates
             for g in &cls.raw_groups {
                 if let Some(chosen_blob) = g.chosen_blob_id {
                     keep.insert(chosen_blob);

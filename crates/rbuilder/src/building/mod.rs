@@ -55,7 +55,7 @@ pub mod block_orders;
 pub mod builders;
 pub mod built_block_trace;
 pub mod cached_reads;
-// #[cfg(test)]
+#[cfg(test)]
 pub mod conflict;
 pub mod evm;
 pub mod evm_inspector;
@@ -74,8 +74,8 @@ pub use self::{
     order_commit::*, payout_tx::*, sim::simulate_order, tracers::SimulationTracer,
 };
 
-// #[cfg(test)]
-// pub use conflict::*;
+#[cfg(test)]
+pub use conflict::*;
 
 #[derive(Debug, Clone)]
 pub struct BlockBuildingContext {
@@ -100,7 +100,6 @@ pub struct BlockBuildingContext {
     pub payload_id: InternalPayloadId,
     pub shared_cached_reads: Arc<SharedCachedReads>,
     pub tx_execution_cache: Arc<TxExecutionCache>,
-    // Optional processing time for blob tx selection
     pub blob_tx_selection_duration: Option<Duration>,
 }
 
@@ -193,14 +192,6 @@ impl BlockBuildingContext {
             max_blob_gas_per_block,
             blob_tx_selection_duration: None,
         })
-    }
-
-    pub fn clone_with_empty_caches(&self) -> Self {
-        let mut cloned = self.clone();
-        cloned.shared_cached_reads = Arc::new(SharedCachedReads::default());
-        // disable tx execution cache to avoid DB probes during the experiment
-        cloned.tx_execution_cache = Arc::new(TxExecutionCache::new(false));
-        cloned
     }
 
     fn max_blob_gas_per_block_at(chain_spec: &ChainSpec, timestamp: u64) -> u64 {
@@ -335,7 +326,6 @@ impl BlockBuildingContext {
     }
 
     pub fn coinbase_is_suggested_fee_recipient(&self) -> bool {
-        // return true;
         self.evm_env.block_env.beneficiary == self.attributes.suggested_fee_recipient
     }
 }

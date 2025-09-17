@@ -159,11 +159,11 @@ fn discover_units<P: StateProviderFactory + Clone>(
                             .into_iter()
                             .map(|(address, nonce)| NonceKey { address, nonce })
                             .collect(),
-                        simulation_time: std::time::Duration::from_millis(0), // duration not needed here
+                        simulation_time: std::time::Duration::from_millis(0), // duration not relevant here
                     });
                 }
                 OrderSimResult::Failed(_err) => {
-                    // do not produce a unit, but still let sim_tree move on if needed
+                    // do not produce a unit, but still let sim_tree move on
                 }
             }
         }
@@ -282,7 +282,7 @@ where
         let u1_parents = u1.parents.iter().map(|o| o.id()).collect::<HashSet<_>>();
         let u2_parents = u2.parents.iter().map(|o| o.id()).collect::<HashSet<_>>();
         if u1_parents.contains(&u2.id()) || u2_parents.contains(&u1.id()) {
-            // arbitrary: tag with the child's sender if any, else zero address
+            // tag with the child's sender if any, else zero address
             let addr = u2
                 .target
                 .nonces()
@@ -435,7 +435,6 @@ where
     })
 }
 
-// Optional: same grouping helper as before
 pub fn conflict_sets_from_pairwise(
     conflicts: &HashMap<(OrderId, OrderId), Conflict>,
 ) -> Vec<HashSet<OrderId>> {

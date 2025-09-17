@@ -10,7 +10,6 @@ pub mod task;
 use alloy_primitives::U256;
 pub use groups::*;
 pub mod nonce_handling;
-pub mod metrics;
 pub mod genetic_algo;
 pub use conflict_task_generator::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -53,29 +52,6 @@ use self::{
 pub type GroupId = usize;
 pub type ConflictResolutionResultPerGroup = (GroupId, (ResolutionResult, ConflictGroup));
 
-use serde::Serialize;
-use std::fs;
-use std::path::Path;
-
-#[derive(Serialize)]
-struct BacktestPerfJson {
-    block_number: u64,
-    num_orders: usize,
-    groups_total: usize,
-    processing_duration_ms: u128,
-    blob_tx_processing_duration_ms: u128,
-    coinbase_reward: String,
-    // cache stats snapshot
-    cache_full_hits: usize,
-    cache_partial_hits: usize,
-    cache_saved: usize,
-    cache_requested: usize,
-    cache_requests: usize,
-    cache_rate_full_hits_pct: f64,
-    cache_rate_partial_hits_pct: f64,
-    cache_efficiency_pct: f64,
-}
-
 /// ParallelBuilderConfig configures parallel builder.
 /// * `num_threads` - number of threads to use for merging.
 /// * `merge_wait_time_ms` - time to wait for merging to finish before consuming new orders.
@@ -100,33 +76,6 @@ fn get_shared_data_structures() -> (Arc<BestResults>, TaskQueue) {
     let task_queue = Arc::new(SegQueue::new());
     (best_results, task_queue)
 }
-use std::fs::OpenOptions;
-use std::io::{Write, BufWriter};
-
-fn write_perf_json_append_ndjson(
-    out_dir: impl AsRef<Path>,
-    file_name: impl AsRef<Path>,
-    payload: &BacktestPerfJson,
-) -> eyre::Result<()> {
-    let dir = out_dir.as_ref();
-    if !dir.exists() {
-        fs::create_dir_all(dir)?;
-    }
-    let path = dir.join(file_name);
-
-    let file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)?;
-    let mut w = BufWriter::new(file);
-
-    let line = serde_json::to_string(payload)?; // compact JSON
-    w.write_all(line.as_bytes())?;
-    w.write_all(b"\n")?;
-    w.flush()?;
-    Ok(())
-}
-
 
 fn cmp_res(a: &ResolutionResult, b: &ResolutionResult) -> CmpOrdering {
     // Primary: total_profit desc
@@ -167,6 +116,7 @@ pub enum BuildMode {
     HeapMgp,        // interleave by per-tx MEV gas price
     HeapProfit,     // interleave by per-tx profit only
 }
+
 impl<P> ParallelBuilder<P>
 where
     P: StateProviderFactory + Clone + 'static,
@@ -391,10 +341,6 @@ where
         orders
     };
 
-    let total_simulated_gas_usage: u64 = sorted_orders.iter().map(|o| o.sim_value.gas_used).sum();
-
-    let num_orders = sorted_orders.len();
-
     let simulation_cache = Arc::new(SharedSimulationCache::new());
     let init_duration = init_start.elapsed();
 
@@ -423,14 +369,13 @@ where
     // Group processing
     conflict_finder.add_orders(sorted_orders);
     let groups = conflict_finder.get_order_groups();
-    let groups_total = groups.len();
 
     // Generate tasks using the same logic as live builder
     let mut task_generator = ConflictTaskGenerator::new(Arc::clone(&task_queue), group_result_sender_for_task_generator);
     let processing_start = Instant::now();
     task_generator.process_groups(groups.clone());
 
-    // Initialize outstanding from the actual number of enqueued tasks
+    // Initialise outstanding from the actual number of enqueued tasks
     let planned = task_queue.len();
     outstanding.store(planned, Ordering::Release);
 
@@ -520,14 +465,9 @@ where
     let val_greedy = if config.coinbase_payment { U256::ZERO } else { helper_greedy.true_block_value()? };
     let val_mgp    = if config.coinbase_payment { U256::ZERO } else { helper_mgp.true_block_value()? };
 
-    println!("Greedy block: {}", val_greedy);
-    println!("MGP block: {}", val_mgp);
-
     let (chosen_helper, mut chosen_asm) = if val_mgp > val_greedy {
-        println!("Winner is MGP");
         (helper_mgp, asm_mgp)
     } else {
-        println!("Winner is greedy");
         (helper_greedy, asm_greedy)
     };
 
@@ -548,42 +488,6 @@ where
     trace!("Best results collection time: {:?}", collection_duration);
     trace!("Block building time: {:?}", building_duration);
     trace!("Total time taken: {:?}", total_duration);
-
-    let coinbase_reward = finalize_block_result.block.trace.coinbase_reward.to_string();
-
-    let (
-        full_hits,
-        partial_hits,
-        saved,
-        requested,
-        requests,
-        rate_full_hits,
-        rate_partial_hits,
-        efficiency,
-    ) = simulation_cache.stats();
-
-    let perf = BacktestPerfJson {
-        block_number: input.ctx.block(),
-        num_orders,
-        groups_total,
-        processing_duration_ms: processing_duration.as_millis(),
-        blob_tx_processing_duration_ms: input.ctx.blob_tx_selection_duration.map_or(0, |d| d.as_millis()),
-        coinbase_reward,
-        cache_full_hits: full_hits,
-        cache_partial_hits: partial_hits,
-        cache_saved: saved,
-        cache_requested: requested,
-        cache_requests: requests,
-        cache_rate_full_hits_pct: rate_full_hits,
-        cache_rate_partial_hits_pct: rate_partial_hits,
-        cache_efficiency_pct: efficiency,
-    };
-
-    let _ = write_perf_json_append_ndjson(
-        "performance_testing/robust_permutation_handling",
-        format!("block_{:0>8}.ndjson", perf.block_number),
-        &perf,
-    );
 
     Ok(finalize_block_result.block)
 }
