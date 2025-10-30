@@ -1,4 +1,5 @@
 mod redistribution_algo;
+mod solver;
 
 use crate::{
     backtest::{
@@ -673,6 +674,7 @@ struct ExclusionResults {
     landed_orders: HashMap<OrderId, ExclusionResult>,
     identities: HashMap<Address, ExclusionResult>,
     joint_exclusion_result: HashMap<(Address, Address), ExclusionResult>,
+    joint_exclusion_result_all: HashMap<Vec<Address>, ExclusionResult>,
 }
 
 impl ExclusionResults {
@@ -698,6 +700,89 @@ impl ExclusionResults {
         result
     }
 }
+
+/// PoC implementation for improved sybil-resistance of redistribution calculator
+/// Form subsets of connected identities based on landed order exclusion results
+fn build_adjacency_map(pairs: &[(Address, Address)]) -> HashMap<Address, HashSet<Address>> {
+    let mut adj: HashMap<Address, HashSet<Address>> = HashMap::default();
+    for &(a, b) in pairs {
+        adj.entry(a).or_default().insert(b);
+        adj.entry(b).or_default().insert(a);
+    }
+    adj
+}
+
+fn connected_components(adj: &HashMap<Address, HashSet<Address>>) -> Vec<Vec<Address>> {
+    let mut visited: HashSet<Address> = HashSet::default();
+    let mut components = Vec::new();
+
+    for &start_node in adj.keys() {
+        if visited.contains(&start_node) { continue; }
+        let mut stack = vec![start_node];
+        let mut component = Vec::new();
+        visited.insert(start_node);
+
+        while let Some(current_node) = stack.pop() {
+            component.push(current_node);
+            if let Some(neighbors) = adj.get(&current_node) {
+                for &neighbor in neighbors {
+                    if visited.insert(neighbor) {
+                        stack.push(neighbor);
+                    }
+                }
+            }
+        }
+
+        component.sort();
+        components.push(component);
+    }
+    components
+}
+
+/// Enumerate all connected subsets (size >= 2) within a component
+fn enumerate_subsets(
+    component: &[Address],
+    adjacency: &HashMap<Address, HashSet<Address>>,
+) -> Vec<Vec<Address>> {
+    fn dfs(
+        component: &[Address],
+        adjacency: &HashMap<Address, HashSet<Address>>,
+        subset: &mut Vec<Address>,
+        next_start_index: usize,
+        out: &mut Vec<Vec<Address>>,
+    ) {
+        for i in next_start_index..component.len() {
+            let candidate = component[i];
+
+            // Candidate must connect to at least one node already in the subset
+            let connects = subset.iter().any(|&addr| {
+                adjacency.get(&addr).map_or(false, |neighbors| neighbors.contains(&candidate))
+            });
+            if !connects {
+                continue;
+            }
+            subset.push(candidate);
+            if subset.len() >= 2 {
+                out.push(subset.clone());
+            }
+
+            dfs(component, adjacency, subset, i + 1, out);
+            subset.pop();
+        }
+    }
+
+    let mut all_subsets = Vec::new();
+
+    // Root at each node: only the root with the smallest index can start any subset
+    // so each subset is produced only once
+    for (root_idx, &root) in component.iter().enumerate() {
+        let mut subset = vec![root];
+        dfs(component, adjacency, &mut subset, root_idx + 1, &mut all_subsets);
+    }
+
+    all_subsets
+}
+
 
 fn calculate_backtest_identity_and_order_exclusion<P, ConfigType>(
     ctx: BlockBuildingContext,
@@ -767,6 +852,7 @@ where
         landed_orders: result_after_landed_orders_exclusion,
         identities: result_after_identity_exclusion,
         joint_exclusion_result: HashMap::default(),
+        joint_exclusion_result_all: HashMap::default(),
     })
 }
 
@@ -868,6 +954,52 @@ where
         }
     }
 
+    // Form higher-order subsets of connected identities
+    let detected_pairs: Vec<(Address, Address)> = exclusion_results
+        .joint_exclusion_result
+        .keys()
+        .cloned()
+        .collect();
+
+    // Build adjacency map from detected pairs
+    let adjacency = build_adjacency_map(&detected_pairs);
+    let components = connected_components(&adjacency);
+    let mut subset_list: Vec<Vec<Address>> = Vec::new();
+    for comp in &components {
+        let mut subs = enumerate_subsets(comp, &adjacency);
+        subset_list.append(&mut subs);
+    }
+
+    // For each subset, jointly exclude all its identities’ orders and record the result
+    let higher_sets: Vec<(Vec<Address>, ExclusionResult)> = subset_list
+        .into_par_iter()
+        .filter_map(|subset| {
+            let mut orders = Vec::new();
+            for addr in &subset {
+                if let Some(v) = available_orders.all_orders_by_address.get(addr) {
+                    orders.extend(v.iter().cloned());
+                }
+            }
+            trace!(subset = ?subset, excluding = ?orders, "Calculating joint contribution (|S|>=2)");
+            match calc_profit_after_exclusion(
+                ctx.clone(),
+                provider.clone(),
+                config,
+                &block_data,
+                results_without_exclusion.exclusion_input(orders),
+            ) {
+                Ok(ok) => Some((subset, ok)),
+                Err(e) => {
+                    error!(err=?e, "Higher-order joint exclusion failed");
+                    None
+                }
+            }
+        })
+        .collect();
+
+    exclusion_results.joint_exclusion_result_all = higher_sets.into_iter().collect();
+
+
     Ok(exclusion_results)
 }
 
@@ -929,10 +1061,26 @@ fn apply_redistribution_formula(
         })
         .collect();
 
+    let joint_block_value_delta_all = exclusion_results
+        .joint_exclusion_result_all
+        .iter()
+        .filter_map(|(subset, result)| {
+            if result.block_value_delta.is_positive() {
+                Some((
+                    subset.clone(),
+                    result.block_value_delta.into_sign_and_abs().1,
+                ))
+            } else {
+                None
+            }
+        })
+        .collect();
+
     RedistributionCalculator {
         landed_block_profit: onchain_block_profit,
         identity_data,
         joint_block_value_delta,
+        joint_block_value_delta_all,
     }
     .calculate_redistribution()
 }

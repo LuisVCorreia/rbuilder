@@ -4,6 +4,7 @@
 use alloy_primitives::{Address, I256, U256};
 use rbuilder_primitives::OrderId;
 use std::cmp::{max, min};
+use super::solver::osqp_project_refunds;
 
 #[derive(Debug, Clone)]
 pub struct IncludedOrderData {
@@ -28,6 +29,7 @@ pub struct RedistributionCalculator {
     /// First element of the tuple is some subset of identities,
     /// second is block value delta after excluding all identities from the subset
     pub joint_block_value_delta: Vec<((Address, Address), U256)>,
+    pub joint_block_value_delta_all: Vec<(Vec<Address>, U256)>,
 }
 
 impl RedistributionCalculator {
@@ -109,35 +111,62 @@ pub fn calculate_redistribution(data: RedistributionCalculator) -> Redistributio
     }
 
     // r_i
-    let mut identity_payments = flat_tax_redistibution_value;
+    let mut identity_payments = flat_tax_redistibution_value.clone();
 
-    for j in 0..subsets.len() {
-        // sum r_i
-        let subset_payment = identity_payments[subsets[j].0] + identity_payments[subsets[j].1];
-        let delta = if subset_payment > subset_joint_marginal_contribution[j] {
-            subset_payment - subset_joint_marginal_contribution[j]
-        } else {
-            // we don't need to adjust that pair
-            continue;
-        };
-        let (a, b) = (
-            identity_payments[subsets[j].0],
-            identity_payments[subsets[j].1],
-        );
-        let (a, b) = (I256::try_from(a).unwrap(), I256::try_from(b).unwrap());
-        let (new_a, new_b) = adjust_contributions(a, b, I256::try_from(delta).unwrap());
-        let (new_a, new_b) = (
-            U256::try_from(new_a).unwrap(),
-            U256::try_from(new_b).unwrap(),
-        );
-        identity_payments[subsets[j].0] = new_a;
-        identity_payments[subsets[j].1] = new_b;
-    }
+    let used_osqp = if !data.joint_block_value_delta_all.is_empty() {
+        let identity_addrs: Vec<Address> = identity.iter().map(|d| d.address).collect();
+        tracing::info!("Running OSQP projection for redistribution");
+        match osqp_project_refunds(
+            &flat_tax_redistibution_value,
+            &realized_value,
+            &identity_addrs,
+            &data.joint_block_value_delta_all,
+            value_to_split,
+        ) {
+            Some(projected) => {
+                identity_payments = projected;
+                true
+            }
+            None => {
+                tracing::warn!("OSQP projection failed; falling back to pairwise adjustment");
+                false
+            }
+        }
+    } else {
+        false
+    };
 
-    // assert that all pairwise constraints are now done
-    for j in 0..subsets.len() {
-        let subset_payment = identity_payments[subsets[j].0] + identity_payments[subsets[j].1];
-        assert!(subset_payment <= subset_joint_marginal_contribution[j]);
+    if !used_osqp {
+        // adjust pairwise constraints
+
+        for j in 0..subsets.len() {
+            // sum r_i
+            let subset_payment = identity_payments[subsets[j].0] + identity_payments[subsets[j].1];
+            let delta = if subset_payment > subset_joint_marginal_contribution[j] {
+                subset_payment - subset_joint_marginal_contribution[j]
+            } else {
+                // we don't need to adjust that pair
+                continue;
+            };
+            let (a, b) = (
+                identity_payments[subsets[j].0],
+                identity_payments[subsets[j].1],
+            );
+            let (a, b) = (I256::try_from(a).unwrap(), I256::try_from(b).unwrap());
+            let (new_a, new_b) = adjust_contributions(a, b, I256::try_from(delta).unwrap());
+            let (new_a, new_b) = (
+                U256::try_from(new_a).unwrap(),
+                U256::try_from(new_b).unwrap(),
+            );
+            identity_payments[subsets[j].0] = new_a;
+            identity_payments[subsets[j].1] = new_b;
+        }
+
+        // assert that all pairwise constraints are now done
+        for j in 0..subsets.len() {
+            let subset_payment = identity_payments[subsets[j].0] + identity_payments[subsets[j].1];
+            assert!(subset_payment <= subset_joint_marginal_contribution[j]);
+        }
     }
 
     let mut total_value_redistributed = U256::ZERO;
@@ -324,6 +353,7 @@ mod tests {
                 },
             ],
             joint_block_value_delta: vec![],
+            joint_block_value_delta_all: vec![],
         };
 
         let output = RedistributionResult {
@@ -370,6 +400,7 @@ mod tests {
                 },
             ],
             joint_block_value_delta: vec![],
+            joint_block_value_delta_all: vec![],
         };
 
         let output = RedistributionResult {
@@ -433,6 +464,7 @@ mod tests {
                 },
             ],
             joint_block_value_delta: vec![],
+            joint_block_value_delta_all: vec![],
         };
 
         // here 1 + 2 got 900 although really their marginal contribution is 500
@@ -495,4 +527,128 @@ mod tests {
             output_with_joint_constraint
         );
     }
+
+    #[test]
+    fn test_calculate_redistribution_with_higher_order_joint_constraints() {
+        // we have 3 identities that are actually one split into 3 and one independent that pays 100
+        //
+        // we have bundle1 that pays 600 and bundles2 that pays 200 and bundle2 depends on bundle1
+        // bundle3 pays 200 and depends on bundle2. There is another bundles that pays 500 for the same opportunity
+        //
+        // block value delta:
+        // 1 -> 600 + 200 + 200 - 500 = 500
+        // 2 -> 200 + 200 = 400
+        // 3 -> 200
+        // 4 -> 100
+        //
+        // joint block value deltas:
+        // (1,2) -> 600 + 200 + 200 - 500 = 500
+        // (1,3) -> 600 + 200 + 200 - 500 = 500
+        // (2,3) -> 200 + 200 = 400
+        // (1,2,3) -> 600 + 200 + 200 - 500 = 500
+        let input_no_joint_contribution_data = RedistributionCalculator {
+            landed_block_profit: u256(1200),
+            identity_data: vec![
+                RedistributionIdentityData {
+                    address: addr(1),
+                    block_value_delta: u256(500),
+                    included_orders: vec![IncludedOrderData {
+                        id: order_id(1),
+                        realized_value: u256(600),
+                    }],
+                },
+                RedistributionIdentityData {
+                    address: addr(2),
+                    block_value_delta: u256(400),
+                    included_orders: vec![IncludedOrderData {
+                        id: order_id(2),
+                        realized_value: u256(400),
+                    }],
+                },
+                RedistributionIdentityData {
+                    address: addr(3),
+                    block_value_delta: u256(200),
+                    included_orders: vec![IncludedOrderData {
+                        id: order_id(3),
+                        realized_value: u256(200),
+                    }],
+                },
+                RedistributionIdentityData {
+                    address: addr(4),
+                    block_value_delta: u256(100),
+                    included_orders: vec![IncludedOrderData {
+                        id: order_id(4),
+                        realized_value: u256(100),
+                    }],
+                },
+            ],
+            joint_block_value_delta: vec![],
+            joint_block_value_delta_all: vec![],
+        };
+
+        fn r_of(res: &RedistributionResult, a: Address) -> U256 {
+            res.value_by_identity
+                .iter()
+                .find(|e| e.address == a)
+                .expect("address missing in result")
+                .redistribution_value
+        }
+
+        // Add only pairwise constraints
+        let mut input_with_pairwise_joint_contribution = input_no_joint_contribution_data;
+        input_with_pairwise_joint_contribution.joint_block_value_delta = vec![
+            ((addr(1), addr(2)), u256(500)),
+            ((addr(1), addr(3)), u256(500)),
+            ((addr(2), addr(3)), u256(400)),
+        ];
+
+        let res_pair = calculate_redistribution(input_with_pairwise_joint_contribution.clone());
+
+        let r1 = r_of(&res_pair, addr(1));
+        let r2 = r_of(&res_pair, addr(2));
+        let r3 = r_of(&res_pair, addr(3));
+        let r4 = r_of(&res_pair, addr(4));
+
+        // Pairwise constraints
+        assert!(r1 + r2 <= u256(500), "pair (1,2) violated");
+        assert!(r1 + r3 <= u256(500), "pair (1,3) violated");
+        assert!(r2 + r3 <= u256(400), "pair (2,3) violated");
+
+        // Check non-negativity and budget
+        assert!(r1 >= U256::ZERO && r2 >= U256::ZERO && r3 >= U256::ZERO && r4 >= U256::ZERO);
+        assert!(r1 + r2 + r3 + r4 <= u256(1200));
+
+        // Check that the triple constraint is violated
+        assert!(r1 + r2 + r3 > u256(500), "triple (1,2,3) should be violated");
+
+        // Add the triplet constraint
+        let mut input_with_joint_contribution = input_with_pairwise_joint_contribution;
+        input_with_joint_contribution.joint_block_value_delta_all = vec![
+            (vec![addr(1), addr(2)], u256(500)),
+            (vec![addr(1), addr(3)], u256(500)),
+            (vec![addr(2), addr(3)], u256(400)),
+            (vec![addr(1), addr(2), addr(3)], u256(500)),
+        ];
+
+        let res_all = calculate_redistribution(input_with_joint_contribution);
+
+        let s1 = r_of(&res_all, addr(1));
+        let s2 = r_of(&res_all, addr(2));
+        let s3 = r_of(&res_all, addr(3));
+        let s4 = r_of(&res_all, addr(4));
+
+        // Pairwise constraints still respected
+        assert!(s1 + s2 <= u256(500), "pair (1,2) violated after triplet");
+        assert!(s1 + s3 <= u256(500), "pair (1,3) violated after triplet");
+        assert!(s2 + s3 <= u256(400), "pair (2,3) violated after triplet");
+
+        // Triplet constraint
+        println!("s1: {}, s2: {}, s3: {}", s1, s2, s3);
+        assert!(s1 + s2 + s3 <= u256(500), "triplet (1,2,3) violated");
+
+        // Check non-negativity and budget
+        assert!(s1 >= U256::ZERO && s2 >= U256::ZERO && s3 >= U256::ZERO && s4 >= U256::ZERO);
+        assert!(s1 + s2 + s3 + s4 <= u256(1200));
+    }
+
 }
