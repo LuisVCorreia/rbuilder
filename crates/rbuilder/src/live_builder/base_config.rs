@@ -13,7 +13,7 @@ use crate::{
         http_state_provider::HttpStateProviderFactory, ipc_state_provider::{IpcProviderConfig, IpcStateProviderFactory}, StateProviderFactory
     },
     roothash::RootHashContext,
-    utils::{constants::{MINS_PER_HOUR, SECS_PER_MINUTE}, http_provider, tracing::{setup_tracing_subscriber, LoggerConfig}, ProviderFactoryReopener, Signer},
+    utils::{constants::{MINS_PER_HOUR, SECS_PER_MINUTE}, http_provider, ProviderFactoryReopener, Signer},
 };
 use alloy_primitives::{Address, B256};
 use alloy_provider::RootProvider;

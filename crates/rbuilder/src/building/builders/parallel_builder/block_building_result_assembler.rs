@@ -7,7 +7,8 @@ use alloy_primitives::{utils::format_ether, U256};
 use reth_provider::StateProvider;
 use std::{
     sync::Arc,
-    time::{Duration, Instant, cmp::Ordering},
+    time::{Duration, Instant},
+    cmp::Ordering,
 };
 use time::OffsetDateTime;
 use tokio_util::sync::CancellationToken;
@@ -149,7 +150,7 @@ fn pack_with_heap<H: BlockBuildingHelper + ?Sized>(
         let sim_order = &groups[cand.group_idx].group.orders[order_idx];
         match helper.commit_order(local_ctx, sim_order, &|_| Ok(()))? {
             Ok(res) => {
-                gas_used_accounted = gas_used_accounted.saturating_add(res.gas_used);
+                gas_used_accounted = gas_used_accounted.saturating_add(res.space_used.gas);
 
                 {
                     let group_cursor = &mut groups[cand.group_idx];
@@ -436,14 +437,6 @@ impl BlockBuildingResultAssembler {
             }
         });
 
-        let use_suggested_fee_recipient_as_coinbase =
-            self.coinbase_payment && !self.contains_refunds(&entries.iter().map(|(_, res, group)| (res.clone(), group.clone())).collect::<Vec<_>>());
-
-        let mut ctx = self.ctx.clone();
-        if use_suggested_fee_recipient_as_coinbase {
-            ctx.modify_use_suggested_fee_recipient_as_coinbase();
-        }
-
         let build_start = Instant::now();
 
         match mode {
@@ -545,7 +538,7 @@ impl BlockBuildingResultAssembler {
                 .any(|(order_idx, _, _)| {
                     !order_group.orders[*order_idx]
                         .sim_value
-                        .paid_kickbacks
+                        .paid_kickbacks()
                         .is_empty()
                 })
         })

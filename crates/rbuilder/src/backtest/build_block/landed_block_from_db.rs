@@ -10,9 +10,6 @@ use ahash::HashMap;
 use alloy_primitives::utils::format_ether;
 use rbuilder_config::load_toml_config;
 use rbuilder_primitives::OrderId;
-use reth_db::DatabaseEnv;
-use reth_node_api::NodeTypesWithDBAdapter;
-use reth_node_ethereum::EthereumNode;
 use tokio_util::sync::CancellationToken;
 
 use crate::{

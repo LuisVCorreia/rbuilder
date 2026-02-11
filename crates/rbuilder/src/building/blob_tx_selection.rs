@@ -1,6 +1,6 @@
 use ahash::{HashMap as AHashMap, HashSet as AHashSet};
 use alloy_primitives::{Address, U256};
-use crate::primitives::{OrderId, SimulatedOrder};
+use rbuilder_primitives::{OrderId, SimulatedOrder};
 use std::{cmp::Ordering, sync::Arc};
 
 #[derive(Clone, Debug)]
@@ -14,8 +14,8 @@ struct OrderDesc {
 
 fn build_descriptors(sim_orders: &[Arc<SimulatedOrder>]) -> Vec<OrderDesc> {
     sim_orders.iter().map(|o| {
-        let profit = o.sim_value.coinbase_profit;
-        let blob_gas = o.sim_value.blob_gas_used;
+        let profit = o.sim_value.full_profit_info().coinbase_profit();
+        let blob_gas = o.sim_value.blob_gas_used();
         let nonces = o.order.nonces();
         let (signer, nonce) = if nonces.len() == 1 {
             (Some(nonces[0].address), Some(nonces[0].nonce))

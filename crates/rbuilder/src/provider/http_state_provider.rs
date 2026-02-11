@@ -6,7 +6,7 @@ use alloy_primitives::{Address, B256, Bytes, StorageKey, StorageValue, BlockNumb
 use reth_errors::ProviderResult;
 use reth_primitives::{Account, Bytecode, Header};
 use reth_provider::{
-    errors::any::AnyError, AccountReader, BlockHashReader, ProviderError, StateProofProvider,
+    errors::any::AnyError, AccountReader, BlockHashReader, BytecodeReader, ProviderError, StateProofProvider,
     StateProvider, StateProviderBox, StateRootProvider, HashedPostStateProvider, StorageRootProvider,
 };
 use reth_trie::{
@@ -64,7 +64,7 @@ impl HttpStateProviderFactory {
     ) -> eyre::Result<Self> {
         let provider = ProviderBuilder::new()
             .network::<Ethereum>()
-            .on_http(url.parse()?);
+            .connect_http(url.parse()?);
 
         // async work executed on the long-lived runtime
         let state_cache = run_on_rt(rt, StateCache::new(&cache_path))?;
@@ -217,16 +217,18 @@ impl StateProvider for HttpStateProvider {
         Ok(Some(res.into()))
     }
 
-    fn bytecode_by_hash(&self, code_hash: &B256) -> ProviderResult<Option<Bytecode>> {
-        let cache_key = key_bytecode(self.hash, *code_hash);
-        Ok(run_on_rt(&self.rt, self.cache_db.bytecode.get(&cache_key)))
-    }
-
     fn account_nonce(&self, address: &Address) -> ProviderResult<Option<u64>> {
         match self.basic_account(address)? {
             Some(account) => Ok(Some(account.nonce)),
             None => Ok(None),
         }
+    }
+}
+
+impl BytecodeReader for HttpStateProvider {
+    fn bytecode_by_hash(&self, code_hash: &B256) -> ProviderResult<Option<Bytecode>> {
+        let cache_key = key_bytecode(self.hash, *code_hash);
+        Ok(run_on_rt(&self.rt, self.cache_db.bytecode.get(&cache_key)))
     }
 }
 

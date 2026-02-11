@@ -7,13 +7,12 @@ pub mod order_intake_store;
 pub mod results_aggregator;
 pub mod simulation_cache;
 pub mod task;
-use alloy_primitives::{U256, I256};
+use alloy_primitives::I256;
 pub use groups::*;
 pub mod nonce_handling;
 pub mod genetic_algo;
 pub use conflict_task_generator::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
 use std::sync::mpsc::RecvTimeoutError;
 use rayon::join;
 
@@ -379,7 +378,7 @@ where
     let groups = conflict_finder.get_order_groups();
 
     // Generate tasks using the same logic as live builder
-    let mut task_generator = ConflictTaskGenerator::new(Arc::clone(&task_queue), group_result_sender_for_task_generator);
+    let mut task_generator = ConflictTaskGenerator::new(config.safe_sorting_only, Arc::clone(&task_queue), group_result_sender_for_task_generator);
     let processing_start = Instant::now();
     task_generator.process_groups(groups.clone());
 
@@ -417,14 +416,16 @@ where
 
     // Block building result assembler creation
     let assembler_start = Instant::now();
-        let mut asm_greedy = BlockBuildingResultAssembler::new(
+    let built_block_id_source = Arc::new(BuiltBlockIdSource::new());
+    let mut asm_greedy = BlockBuildingResultAssembler::new(
         &config,
         Arc::clone(&best_results),
         block_state.clone(),
         input.ctx.clone(),
         CancellationToken::new(),
         "backtest_builder_greedy".into(),
-        true,
+        None,
+        Arc::clone(&built_block_id_source),
         None,
     );
 
@@ -435,7 +436,8 @@ where
         input.ctx.clone(),
         CancellationToken::new(),
         "backtest_builder_mgp".into(),
-        true,
+        None,
+        Arc::clone(&built_block_id_source),
         None,
     );
     let assembler_duration = assembler_start.elapsed();
@@ -470,16 +472,17 @@ where
     let helper_greedy = res_greedy?;
     let helper_mgp    = res_mgp?;
 
-    let val_greedy = if config.coinbase_payment { U256::ZERO } else { helper_greedy.true_block_value()? };
-    let val_mgp    = if config.coinbase_payment { U256::ZERO } else { helper_mgp.true_block_value()? };
+    // NOTE: coinbase_payment functionality has been removed, always use payout tx
+    let val_greedy = helper_greedy.true_block_value()?;
+    let val_mgp    = helper_mgp.true_block_value()?;
 
-    let (chosen_helper, mut chosen_asm) = if val_mgp > val_greedy {
+    let (mut chosen_helper, mut chosen_asm) = if val_mgp > val_greedy {
         (helper_mgp, asm_mgp)
     } else {
         (helper_greedy, asm_greedy)
     };
 
-    let payout_tx_value = if config.coinbase_payment { None } else { Some(chosen_helper.true_block_value()?) };
+    let payout_tx_value = chosen_helper.true_block_value()?;
     let finalize_block_result = chosen_helper.finalize_block(
         &mut chosen_asm.local_ctx,
         payout_tx_value,

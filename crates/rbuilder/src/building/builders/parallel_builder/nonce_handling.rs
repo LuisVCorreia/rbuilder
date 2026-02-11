@@ -15,7 +15,7 @@ use alloy_primitives::{Address, U256};
 use rand::Rng;
 use std::collections::BTreeMap;
 
-use crate::primitives::SimulatedOrder;
+use rbuilder_primitives::SimulatedOrder;
 use super::ConflictGroup;
 
 pub const ALL_PERMS_CAP: usize = 120;
@@ -131,8 +131,8 @@ pub enum GreedyKey { Profit, MevGasPrice }
 #[inline]
 pub fn value_for(key: GreedyKey, o: &SimulatedOrder) -> U256 {
     match key {
-        GreedyKey::Profit => o.sim_value.coinbase_profit,
-        GreedyKey::MevGasPrice => o.sim_value.mev_gas_price,
+        GreedyKey::Profit => o.sim_value.full_profit_info().coinbase_profit(),
+        GreedyKey::MevGasPrice => o.sim_value.full_profit_info().mev_gas_price(),
     }
 }
 

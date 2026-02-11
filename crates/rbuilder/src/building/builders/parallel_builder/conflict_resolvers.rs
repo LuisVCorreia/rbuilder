@@ -20,9 +20,12 @@ use super::{
 };
 
 use crate::building::{
-    BlockBuildingContext, BlockState, ExecutionError, ExecutionResult, PartialBlock,
+    BlockBuildingContext, BlockBuildingSpaceState, BlockState, ExecutionError, ExecutionResult, PartialBlock,
     ThreadBlockBuildingContext,
 };
+use rbuilder_primitives::BlockSpace;
+use rbuilder_primitives::{OrderId, SimulatedOrder};
+
 const ALL_PERMS_INCLUDE_DUPLICATE_NONCE_CHOICES: bool = true;
 
 fn build_nonce_layout(task: &ConflictTask) -> Option<NonceLayout> {
@@ -282,8 +285,10 @@ impl ResolverContext {
         }
         else {
             if let Some(cached) = &cached_state_option {
-                partial_block.gas_used = cached.cumulative_gas_used;
-                partial_block.blob_gas_used = cached.cumulative_blob_gas_used;
+                partial_block.space_state = BlockBuildingSpaceState::new(
+                    BlockSpace::new(cached.cumulative_gas_used, 0, cached.cumulative_blob_gas_used),
+                    BlockSpace::ZERO
+                );
                 partial_block.coinbase_profit = cached.coinbase_profit;
             }
         }
@@ -346,8 +351,8 @@ impl ResolverContext {
                             bundle_state,
                             total_profit,
                             per_order_profits_and_gas: per_order_profits_and_gas.clone(),
-                            cumulative_gas_used: partial_block.gas_used,
-                            cumulative_blob_gas_used: partial_block.blob_gas_used,
+                            cumulative_gas_used: partial_block.space_state.gas_used(),
+                            cumulative_blob_gas_used: partial_block.space_state.blob_gas_used(),
                             coinbase_profit: partial_block.coinbase_profit,
                         }
                     });
@@ -358,7 +363,7 @@ impl ResolverContext {
 
         let resolution_result = ResolutionResult::new(
             total_profit,
-            partial_block.gas_used,
+            partial_block.space_state.gas_used(),
             sequenced_order_result,
         );
         Ok((resolution_result, state))
@@ -384,8 +389,8 @@ impl ResolverContext {
         }
         let order_id = sim_order.order.id();
         *total_profit += res.coinbase_profit;
-        per_order_profits_and_gas.push((order_id, res.coinbase_profit, res.gas_used));
-        sequenced_order_result.push((order_idx, res.coinbase_profit, res.gas_used));
+        per_order_profits_and_gas.push((order_id, res.coinbase_profit, res.space_used.gas));
+        sequenced_order_result.push((order_idx, res.coinbase_profit, res.space_used.gas));
     }
 
     /// Helper function to handle an error in committing an order.
@@ -724,7 +729,7 @@ fn generate_greedy_sequence(task: &ConflictTask, reverse: bool) -> Vec<Vec<usize
             .iter()
             .enumerate()
             .filter(|(idx, _)| allowed.as_ref().map_or(true, |set| set.contains(idx)))
-            .map(|(idx, o)| (idx, o.sim_value.coinbase_profit, o.sim_value.mev_gas_price))
+            .map(|(idx, o)| (idx, o.sim_value.full_profit_info().coinbase_profit(), o.sim_value.full_profit_info().mev_gas_price()))
             .collect();
 
         rows.sort_by(|a, b| {
@@ -765,7 +770,7 @@ fn generate_length_based_sequence(task: &ConflictTask) -> Vec<Vec<usize>> {
         .iter()
         .enumerate()
         .filter(|(idx, _)| allowed.as_ref().map_or(true, |set| set.contains(idx)))
-        .map(|(idx, order)| (idx, order.order.list_txs().len(), order.sim_value.coinbase_profit))
+        .map(|(idx, order)| (idx, order.order.list_txs().len(), order.sim_value.full_profit_info().coinbase_profit()))
         .collect();
 
     order_data.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| b.2.cmp(&a.2)));

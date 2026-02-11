@@ -185,9 +185,9 @@ impl ConflictTaskGenerator {
     /// * `group` - The `ConflictGroup` to process.
     fn process_single_order_group(&mut self, group_id: GroupId, group: &ConflictGroup) {
         let sequence_of_orders = ResolutionResult::new(
-            group.orders[0].sim_value.coinbase_profit,
-            group.orders[0].sim_value.gas_used,
-            vec![(0, group.orders[0].sim_value.coinbase_profit, group.orders[0].sim_value.gas_used)],
+            group.orders[0].sim_value.full_profit_info().coinbase_profit(),
+            group.orders[0].sim_value.gas_used(),
+            vec![(0, group.orders[0].sim_value.full_profit_info().coinbase_profit(), group.orders[0].sim_value.gas_used())],
         );
         // We ignore the error since it means "receiver disconnected" and we expect the caller will detect the cancellation and stop calling us.
         let _ = self
