@@ -16,7 +16,8 @@ use rayon::prelude::*;
 use super::{
     simulation_cache::{CachedSimulationState, SharedSimulationCache},
     Algorithm, ConflictTask, ResolutionResult,
-    nonce_handling::*, genetic_algo::*,
+    nonce_handling::{GroupDeps, GreedyKey, allowed_indices_after_nonce_dedup, enumerate_all_with_choices, random_ordering_with_random_choices, ALL_PERMS_CAP},
+    genetic_algo::*,
 };
 
 use crate::building::{
@@ -26,14 +27,13 @@ use crate::building::{
 use rbuilder_primitives::BlockSpace;
 use rbuilder_primitives::{OrderId, SimulatedOrder};
 
-const ALL_PERMS_INCLUDE_DUPLICATE_NONCE_CHOICES: bool = true;
 
-fn build_nonce_layout(task: &ConflictTask) -> Option<NonceLayout> {
-    NonceLayout::from_group(&task.group)
+fn build_group_deps(task: &ConflictTask) -> Option<GroupDeps> {
+    GroupDeps::from_group(&task.group)
 }
 
 fn seed_initial_population(
-    layout: &NonceLayout,
+    deps: &GroupDeps,
     population_size: usize,
     rng: &mut SmallRng,
 ) -> Vec<Vec<usize>> {
@@ -43,8 +43,8 @@ fn seed_initial_population(
     let mut seen: AHashSet<Vec<usize>> = AHashSet::default();
 
     while seeds.len() < population_size {
-        let s = random_interleaving_with_random_choices(layout, rng);
-        if s.len() == layout.total_steps && seen.insert(s.clone()) {
+        let s = random_ordering_with_random_choices(deps, rng);
+        if !s.is_empty() && seen.insert(s.clone()) {
             seeds.push(s);
         }
     }
@@ -70,7 +70,7 @@ fn run_dc_generation(
     best_seen: &Option<ResolutionResult>,
     task: &ConflictTask,
     params: &GAParams,
-    layout: &NonceLayout,
+    deps: &GroupDeps,
     evaluator: &ResolverContext,
     local_ctx: &mut ThreadBlockBuildingContext,
 ) -> eyre::Result<DCGenerationResult> {
@@ -81,7 +81,6 @@ fn run_dc_generation(
     let rng = &mut island.rng;
 
     let mut next_population = Vec::with_capacity(population.len());
-    let offsets = chain_offsets(layout);
 
     let mut indices: Vec<usize> = (0..population.len()).collect();
     indices.shuffle(rng);
@@ -96,15 +95,14 @@ fn run_dc_generation(
         let p2_idx = indices[i+1];
         let (p1, p2) = (&population[p1_idx], &population[p2_idx]);
 
-        let mut c1_seq = adapted_order_crossover(&p1.seq, &p2.seq, layout, rng);
-        let mut c2_seq = adapted_order_crossover(&p2.seq, &p1.seq, layout, rng);
+        let mut c1_seq = adapted_order_crossover(&p1.seq, &p2.seq, deps, rng);
+        let mut c2_seq = adapted_order_crossover(&p2.seq, &p1.seq, deps, rng);
 
-        let multi_steps = layout.multi_steps();
         if rng.gen::<f64>() < params.mutation_rate {
-            mutate(&mut c1_seq, layout, rng, &multi_steps);
+            mutate(&mut c1_seq, deps, rng);
         }
         if rng.gen::<f64>() < params.mutation_rate {
-            mutate(&mut c2_seq, layout, rng, &multi_steps);
+            mutate(&mut c2_seq, deps, rng);
         }
 
         let (c1, res1) = evaluator.eval_to_individual(c1_seq, task, local_ctx)?;
@@ -117,10 +115,10 @@ fn run_dc_generation(
         let winner1;
         let winner2;
 
-        let dist_p1c1 = dc_distance(&p1.seq, &c1.seq, layout, &offsets, 0.5, 0.5);
-        let dist_p2c2 = dc_distance(&p2.seq, &c2.seq, layout, &offsets, 0.5, 0.5);
-        let dist_p1c2 = dc_distance(&p1.seq, &c2.seq, layout, &offsets, 0.5, 0.5);
-        let dist_p2c1 = dc_distance(&p2.seq, &c1.seq, layout, &offsets, 0.5, 0.5);
+        let dist_p1c1 = dc_distance(&p1.seq, &c1.seq, deps);
+        let dist_p2c2 = dc_distance(&p2.seq, &c2.seq, deps);
+        let dist_p1c2 = dc_distance(&p1.seq, &c2.seq, deps);
+        let dist_p2c1 = dc_distance(&p2.seq, &c1.seq, deps);
 
         if dist_p1c1 + dist_p2c2 <= dist_p1c2 + dist_p2c1 {
             winner1 = compete(p1, &c1, rng);
@@ -132,13 +130,13 @@ fn run_dc_generation(
 
         if winner1.seq == c1.seq || winner1.seq == c2.seq { children_who_won += 1; }
         if winner2.seq == c1.seq || winner2.seq == c2.seq { children_who_won += 1; }
-        
+
         next_population.push(winner1);
         next_population.push(winner2);
     }
 
     *population = next_population;
-    
+
     Ok(DCGenerationResult { new_best_hits, children_who_won, evals: evals_this_gen })
 }
 
@@ -489,12 +487,13 @@ impl ResolverContext {
     }
 
     fn run_genetic(&mut self, task: &ConflictTask, params: GAParams, local_ctx: &mut ThreadBlockBuildingContext) -> eyre::Result<ResolutionResult> {
-        let Some(layout) = build_nonce_layout(task) else {
+        println!("Running genetic algorithm with params: {:?}", params);
+        let Some(deps) = build_group_deps(task) else {
             return Ok(ResolutionResult::default());
         };
         let start = Instant::now();
         let deadline = start + std::time::Duration::from_millis(params.time_ms);
-        
+
         // Island model configuration
         let num_islands = 10;
         let migration_interval = 3; // Migrate every 3 generations
@@ -507,12 +506,12 @@ impl ResolverContext {
             .into_iter()
             .map(|i| {
                 let mut island_rng = SmallRng::seed_from_u64(params.seed.wrapping_add(i as u64));
-                let seed_seqs = seed_initial_population(&layout, population_per_island, &mut island_rng);
-                
+                let seed_seqs = seed_initial_population(&deps, population_per_island, &mut island_rng);
+
                 (seed_seqs, island_rng)
             })
             .collect();
-        
+
         for (seqs, rng) in initial_islands {
             let evaluated_results = seqs
                 .into_par_iter()
@@ -561,7 +560,7 @@ impl ResolverContext {
                 .try_for_each_init(
                     || local_ctx.clone(),
                     |thread_ctx, island| {
-                        run_dc_generation(island, &best_seen, task, &params, &layout, self, thread_ctx)
+                        run_dc_generation(island, &best_seen, task, &params, &deps, self, thread_ctx)
                             .map(|_| ())
                     },
                 )?;
@@ -666,11 +665,11 @@ fn generate_random_permutations(task: &ConflictTask, seed: u64, count: usize) ->
 }
 
 fn generate_random_permutations_with_nonce(task: &ConflictTask, seed: u64, count: usize) -> Vec<Vec<usize>> {
-    if let Some(layout) = build_nonce_layout(task) {
+    if let Some(deps) = build_group_deps(task) {
         let mut rng = SmallRng::seed_from_u64(seed);
         let mut out = Vec::with_capacity(count);
         for _ in 0..count {
-            out.push(random_interleaving_with_random_choices(&layout, &mut rng));
+            out.push(random_ordering_with_random_choices(&deps, &mut rng));
         }
 
         return out;
@@ -690,13 +689,8 @@ fn generate_random_permutations_with_nonce(task: &ConflictTask, seed: u64, count
 ///
 /// A vector of all possible sequences of order indices.
 fn generate_all_permutations(task: &ConflictTask) -> Vec<Vec<usize>> {
-    if let Some(layout) = build_nonce_layout(task) {
-        if ALL_PERMS_INCLUDE_DUPLICATE_NONCE_CHOICES {
-            return enumerate_all_interleavings_with_choices(&layout, ALL_PERMS_CAP);
-        } else {
-            let per_chain = build_chains_best(&layout, &task.group);
-            return enumerate_all_interleavings_best(&per_chain, ALL_PERMS_CAP);
-        }
+    if let Some(deps) = build_group_deps(task) {
+        return enumerate_all_with_choices(&deps, ALL_PERMS_CAP);
     }
 
     let sequences_of_orders = (0..task.group.orders.len()).collect::<Vec<_>>();

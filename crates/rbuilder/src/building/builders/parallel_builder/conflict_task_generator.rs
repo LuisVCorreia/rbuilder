@@ -6,7 +6,7 @@ use rbuilder_primitives::SimulatedOrder;
 use std::{sync::Arc, time::Instant};
 use tracing::trace;
 use super::nonce_handling::{
-    compute_interleaving_stats, NonceLayout, is_simple_chain,
+    GroupDeps, is_simple_chain, orderings_leq_cap,
     ALL_PERMS_CAP as MULTINOMIAL_ALL_PERMS_THRESHOLD,
 };
 use super::{
@@ -356,7 +356,7 @@ pub fn get_tasks_for_group(
     let mut tasks = vec![];
     let created_at = Instant::now();
 
-    if let Some(_layout) = NonceLayout::from_group(&group) {
+    if let Some(_deps) = GroupDeps::from_group(&group) {
         if is_simple_chain(&group) {
             // Single sender: only AllPermutations (no need for Greedy/others)
             tasks.push(ConflictTask {
@@ -378,10 +378,8 @@ pub fn get_tasks_for_group(
             created_at,
         });
 
-        if let Some(stats) = compute_interleaving_stats(group) {
-            let ln_cap = (MULTINOMIAL_ALL_PERMS_THRESHOLD as f64).ln();
-            let small = stats.ln_with_choice <= ln_cap + 1e-12;
-
+        // Check if we can enumerate all orderings within the cap
+        if let Some(small) = orderings_leq_cap(group, MULTINOMIAL_ALL_PERMS_THRESHOLD) {
             if small {
                 tasks.push(ConflictTask {
                     group_idx: group.id,
