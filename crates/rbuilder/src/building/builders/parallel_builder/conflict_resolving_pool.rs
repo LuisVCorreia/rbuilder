@@ -1,5 +1,4 @@
 use alloy_primitives::utils::format_ether;
-use crossbeam_queue::SegQueue;
 use eyre::Result;
 use reth_provider::StateProvider;
 use std::{
@@ -16,12 +15,11 @@ use super::{
     simulation_cache::SharedSimulationCache, ConflictGroup, ConflictResolutionResultPerGroup,
     ConflictTask, GroupId, ResolutionResult, TaskPriority,
 };
-use crate::{building::{BlockBuildingContext, ThreadBlockBuildingContext}, provider::StateProviderFactory, utils::elapsed_ms};
+use crate::{building::{BlockBuildingContext, ThreadBlockBuildingContext, builders::parallel_builder::TaskQueueReceiver}, provider::StateProviderFactory, utils::elapsed_ms};
 
-pub type TaskQueue = Arc<SegQueue<ConflictTask>>;
 
 pub struct ConflictResolvingPool<P> {
-    task_queue: TaskQueue,
+    task_queue: TaskQueueReceiver,
     group_result_sender: std_mpsc::Sender<ConflictResolutionResultPerGroup>,
     cancellation_token: CancellationToken,
     ctx: BlockBuildingContext,
@@ -39,7 +37,7 @@ where
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         num_threads: usize,
-        task_queue: TaskQueue,
+        task_queue: TaskQueueReceiver,
         safe_sorting_only: bool,
         group_result_sender: std_mpsc::Sender<ConflictResolutionResultPerGroup>,
         cancellation_token: CancellationToken,
@@ -81,46 +79,49 @@ where
                 .into();
             thread::spawn(move || {
                 let mut local_ctx = ThreadBlockBuildingContext::default();
-                while !cancellation_token.is_cancelled() {
-                    if let Some(task) = task_queue.pop() {
-                        if cancellation_token.is_cancelled() {
+                loop {
+                    match task_queue.recv_timeout(std::time::Duration::from_millis(100)) {
+                        Ok(task) => {
+                            println!("Popped task for group_idx {}, task algo {:?}", task.group_idx, task.algorithm);
+                            if cancellation_token.is_cancelled() {
+                                if let Some(ref o) = outstanding { o.fetch_sub(1, Ordering::AcqRel); }
+                                return;
+                            }
+                            let task_start = Instant::now();
+                            let processed = Self::process_task(
+                                task,
+                                &ctx,
+                                &mut local_ctx,
+                                block_state.clone(),
+                                cancellation_token.clone(),
+                                Arc::clone(&simulation_cache),
+                            );
                             if let Some(ref o) = outstanding { o.fetch_sub(1, Ordering::AcqRel); }
-                            return;
-                        }
-                        let task_start = Instant::now();
-                        let processed = Self::process_task(
-                            task,
-                            &ctx,
-                            &mut local_ctx,
-                            block_state.clone(),
-                            cancellation_token.clone(),
-                            Arc::clone(&simulation_cache),
-                        );
-                        if let Some(ref o) = outstanding { o.fetch_sub(1, Ordering::AcqRel); }
-                        if let Ok((task_id, result)) = processed {
-                            match group_result_sender.send((task_id, result)) {
-                                Ok(_) => {
-                                    trace!(
-                                                        task_id = %task_id,
-                                    time_taken_ms = %elapsed_ms(task_start),
-                                                        "Conflict resolving: successfully sent group result"
-                                                    );
-                                }
-                                Err(err) => {
-                                    warn!(
-                                                        task_id = %task_id,
-                                                        error = ?err,
-                                    time_taken_ms = %elapsed_ms(task_start),
-                                                        "Conflict resolving: failed to send group result"
-                                                    );
-                                    return;
+                            if let Ok((task_id, result)) = processed {
+                                match group_result_sender.send((task_id, result)) {
+                                    Ok(_) => {
+                                        trace!(
+                                            task_id = %task_id,
+                                            time_taken_ms = %elapsed_ms(task_start),
+                                            "Conflict resolving: successfully sent group result"
+                                        );
+                                    }
+                                    Err(err) => {
+                                        warn!(
+                                            task_id = %task_id,
+                                            error = ?err,
+                                            time_taken_ms = %elapsed_ms(task_start),
+                                            "Conflict resolving: failed to send group result"
+                                        );
+                                        return;
+                                    }
                                 }
                             }
                         }
-                    }
-                    else {
-                        // No task available, wait for a while before checking again
-                        std::thread::sleep(std::time::Duration::from_millis(100));
+                        Err(crossbeam::channel::RecvTimeoutError::Timeout) => {
+                            if cancellation_token.is_cancelled() { return; }
+                        }
+                        Err(crossbeam::channel::RecvTimeoutError::Disconnected) => return,
                     }
                 }
             });

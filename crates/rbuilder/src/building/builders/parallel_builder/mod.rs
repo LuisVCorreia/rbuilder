@@ -7,18 +7,19 @@ pub mod order_intake_store;
 pub mod results_aggregator;
 pub mod simulation_cache;
 pub mod task;
-use alloy_primitives::I256;
+use alloy_primitives::{Address, I256};
 pub use groups::*;
 pub mod nonce_handling;
 pub mod genetic_algo;
 pub use conflict_task_generator::*;
+use rbuilder_primitives::{Order, SimulatedOrder};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::RecvTimeoutError;
 use rayon::join;
 
 use ahash::HashMap;
-use conflict_resolving_pool::{ConflictResolvingPool, TaskQueue};
-use crossbeam::queue::SegQueue;
+use conflict_resolving_pool::ConflictResolvingPool;
+use crossbeam::channel::{Sender, Receiver};
 use eyre::Result;
 use results_aggregator::BestResults;
 use reth_provider::StateProvider;
@@ -52,6 +53,8 @@ use self::{
 
 pub type GroupId = usize;
 pub type ConflictResolutionResultPerGroup = (GroupId, (ResolutionResult, ConflictGroup));
+pub type TaskQueueSender = Sender<ConflictTask>;
+pub type TaskQueueReceiver = Receiver<ConflictTask>;
 
 /// ParallelBuilderConfig configures parallel builder.
 /// * `num_threads` - number of threads to use for merging.
@@ -74,10 +77,10 @@ fn get_communication_channels() -> (
     std_mpsc::channel()
 }
 
-fn get_shared_data_structures() -> (Arc<BestResults>, TaskQueue) {
+fn get_shared_data_structures() -> (Arc<BestResults>, TaskQueueSender, TaskQueueReceiver) {
     let best_results = Arc::new(BestResults::new());
-    let task_queue = Arc::new(SegQueue::new());
-    (best_results, task_queue)
+    let (sender, receiver) = crossbeam::channel::unbounded();
+    (best_results, sender, receiver)
 }
 
 fn cmp_res(a: &ResolutionResult, b: &ResolutionResult) -> CmpOrdering {
@@ -133,7 +136,7 @@ where
         let (group_result_sender, group_result_receiver) = get_communication_channels();
         let group_result_sender_for_task_generator = group_result_sender.clone();
 
-        let (best_results, task_queue) = get_shared_data_structures();
+        let (best_results, task_queue_sender, task_queue_receiver) = get_shared_data_structures();
 
         let simulation_cache = Arc::new(SharedSimulationCache::new());
 
@@ -141,13 +144,13 @@ where
 
         let conflict_task_generator = ConflictTaskGenerator::new(
             config.safe_sorting_only,
-            Arc::clone(&task_queue),
+            task_queue_sender,
             group_result_sender_for_task_generator,
         );
 
         let conflict_resolving_pool = ConflictResolvingPool::new(
             config.num_threads,
-            Arc::clone(&task_queue),
+            task_queue_receiver.clone(),
             config.safe_sorting_only,
             group_result_sender,
             input.cancel.clone(),
@@ -322,6 +325,45 @@ fn run_order_intake(
     }
 }
 
+fn dedup_by_bundle_signer_and_slots(orders: Vec<Arc<SimulatedOrder>>) -> Vec<Arc<SimulatedOrder>> {
+    use std::collections::HashMap;
+
+    let mut keyed: HashMap<(Address, Vec<(Address, u64)>), Arc<SimulatedOrder>> = HashMap::new();
+    let mut unkeyed: Vec<Arc<SimulatedOrder>> = Vec::new();
+
+    for order in orders {
+        // Only applies to bundles with a signer.
+        let signer = match order.order.as_ref() {
+            Order::Bundle(b) => match b.signer {
+                Some(s) => s,
+                None => { unkeyed.push(order); continue; }
+            },
+            _ => { unkeyed.push(order); continue; }
+        };
+
+        // Key on the sorted set of (sender, nonce) slots the bundle touches.
+        let txs = order.order.list_txs();
+        let mut slots: Vec<(Address, u64)> = txs
+            .iter()
+            .map(|(tx, _)| (tx.signer(), tx.nonce()))
+            .collect();
+        slots.sort_unstable();
+        slots.dedup();
+
+        let key = (signer, slots);
+        let entry = keyed.entry(key).or_insert_with(|| order.clone());
+        // Keep the more profitable one.
+        if order.sim_value.full_profit_info().coinbase_profit()
+            > entry.sim_value.full_profit_info().coinbase_profit()
+        {
+            *entry = order;
+        }
+    }
+
+    let mut result = unkeyed;
+    result.extend(keyed.into_values());
+    result
+}
 
 pub fn parallel_build_backtest<P>(
     input: BacktestSimulateBlockInput<'_, P>,
@@ -334,7 +376,7 @@ where
 
     // Initialization stage
     let init_start = Instant::now();
-    let (best_results, task_queue) = get_shared_data_structures();
+    let (best_results, task_queue_sender, task_queue_receiver) = get_shared_data_structures();
 
     let (group_result_sender, group_result_receiver) = get_communication_channels();
     let group_result_sender_for_task_generator = group_result_sender.clone();
@@ -347,6 +389,14 @@ where
         orders
     };
 
+    // println!("Num orders before dedup: {}", input.sim_orders.len());
+    // let sorted_orders = {
+    //     let mut orders = input.sim_orders.clone();
+    //     orders.sort_by_key(|o| o.order.id());
+    //     dedup_by_bundle_signer_and_slots(orders)
+    // };
+    // println!("After dedup: {}", sorted_orders.len());
+
     let simulation_cache = Arc::new(SharedSimulationCache::new());
     let init_duration = init_start.elapsed();
 
@@ -357,7 +407,7 @@ where
     let outstanding = Arc::new(AtomicUsize::new(0));
     let conflict_resolving_pool = ConflictResolvingPool::new(
         config.num_threads,
-        Arc::clone(&task_queue),
+        task_queue_receiver.clone(),
         config.safe_sorting_only,
         group_result_sender,
         cancel_token.clone(),
@@ -374,16 +424,47 @@ where
         .into();
 
     // Group processing
+    println!("Processing {} orders in conflict finder", sorted_orders.len());
     conflict_finder.add_orders(sorted_orders);
-    let groups = conflict_finder.get_order_groups();
+    let mut groups = conflict_finder.get_order_groups();
+    println!("Conflict finder produced {} groups", groups.len());
+
+    // // find which group bundle 4e83890d-cddc-54aa-8b26-12067c445393 belongs to for testing
+    // use uuid::Uuid;
+    // use rbuilder_primitives::OrderId;
+
+    // let target_uuid = Uuid::parse_str("4e83890d-cddc-54aa-8b26-12067c445393").unwrap();
+    // let mut target_group_id = None;
+    // for group in groups.iter() {
+    //     for sim_order in group.orders.iter() {
+    //         if sim_order.order.id() == OrderId::Bundle(target_uuid) {
+    //             target_group_id = Some(group.id);
+    //             println!("Found target bundle in group {}", group.id);
+    //         }
+    //     }
+    // }
+
+    // // remove all groups except target
+    // match target_group_id {
+    //     Some(id) => groups.retain(|group| group.id == id),
+    //     None => groups.clear(),
+    // }
+
+    // Keep orders only from the largest group
+    if let Some(largest_group) = groups.clone().into_iter().max_by_key(|group| group.orders.len()) {
+        groups.retain(|group| group.orders.len() == largest_group.orders.len());
+    }
+    println!("After keeping only largest group(s), {} groups remain with {} orders", groups.len(), groups.iter().map(|g| g.orders.len()).sum::<usize>());
 
     // Generate tasks using the same logic as live builder
-    let mut task_generator = ConflictTaskGenerator::new(config.safe_sorting_only, Arc::clone(&task_queue), group_result_sender_for_task_generator);
+    let mut task_generator = ConflictTaskGenerator::new(config.safe_sorting_only, task_queue_sender.clone(), group_result_sender_for_task_generator);
     let processing_start = Instant::now();
+    println!("Processing groups in conflict task generator");
     task_generator.process_groups(groups.clone());
+    println!("Conflict task generator produced {} tasks", task_queue_receiver.len());
 
     // Initialise outstanding from the actual number of enqueued tasks
-    let planned = task_queue.len();
+    let planned = task_queue_receiver.len();
     outstanding.store(planned, Ordering::Release);
 
     // Start worker threads (after tasks are enqueued)
@@ -447,6 +528,11 @@ where
 
     let mut best_results: HashMap<GroupId, (ResolutionResult, ConflictGroup)> = HashMap::default();
 
+    for (gid, (res, grp)) in results.iter() {
+        println!("Received result for group {}: profit {}", gid, res.total_profit);
+    }
+    println!("Total results received: {}", results.len());
+
     for (gid, (res, grp)) in results.into_iter() {
         match best_results.get_mut(&gid) {
             None => { best_results.insert(gid, (res, grp)); }
@@ -458,6 +544,17 @@ where
             }
         }
     }
+
+
+    // let mut total = 0;
+    // for (gid, (res, grp)) in best_results.iter() {
+    //     total += res.sequence_of_orders.len();
+    //     println!("Group {}: profit {}, gas {}, number of orders {}", gid, res.total_profit, res.gas_used, res.sequence_of_orders.len());
+    //     for (order_idx, profit, gas_used) in res.sequence_of_orders.iter() {
+    //         println!("  Order idx {}: id {}, profit {}, gas {}", order_idx, grp.orders[*order_idx].order.id(), profit, gas_used);
+    //     }
+    // }
+    // println!("Total orders in best results: {}", total);
 
     let collection_duration = collection_start.elapsed();
 

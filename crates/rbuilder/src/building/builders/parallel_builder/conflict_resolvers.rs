@@ -5,6 +5,8 @@ use eyre::Result;
 use itertools::Itertools;
 use rand::seq::SliceRandom;
 use reth::providers::StateProvider;
+use std::cmp::Reverse;
+use std::collections::BinaryHeap;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use tracing::trace;
@@ -16,24 +18,29 @@ use rayon::prelude::*;
 use super::{
     simulation_cache::{CachedSimulationState, SharedSimulationCache},
     Algorithm, ConflictTask, ResolutionResult,
-    nonce_handling::{GroupDeps, GreedyKey, allowed_indices_after_nonce_dedup, enumerate_all_with_choices, random_ordering_with_random_choices, ALL_PERMS_CAP},
+    nonce_handling::{GroupDeps, DependencyDag, GreedyKey, allowed_indices_after_nonce_dedup, enumerate_all_with_choices, random_ordering_with_random_choices, ALL_PERMS_CAP},
     genetic_algo::*,
 };
 
 use crate::building::{
     BlockBuildingContext, BlockBuildingSpaceState, BlockState, ExecutionError, ExecutionResult, PartialBlock,
-    ThreadBlockBuildingContext,
+    ThreadBlockBuildingContext, order_is_worth_executing,
 };
-use rbuilder_primitives::BlockSpace;
+use rbuilder_primitives::{BlockSpace, SimValue};
 use rbuilder_primitives::{OrderId, SimulatedOrder};
 
+#[derive(Clone, Copy)]
+enum GreedyHeapKey {
+    Profit,
+    MevGasPrice,
+}
 
 fn build_group_deps(task: &ConflictTask) -> Option<GroupDeps> {
     GroupDeps::from_group(&task.group)
 }
 
 fn seed_initial_population(
-    deps: &GroupDeps,
+    dag: &DependencyDag,
     population_size: usize,
     rng: &mut SmallRng,
 ) -> Vec<Vec<usize>> {
@@ -43,7 +50,7 @@ fn seed_initial_population(
     let mut seen: AHashSet<Vec<usize>> = AHashSet::default();
 
     while seeds.len() < population_size {
-        let s = random_ordering_with_random_choices(deps, rng);
+        let s = dag.sample_random_topo_sort(rng);
         if !s.is_empty() && seen.insert(s.clone()) {
             seeds.push(s);
         }
@@ -71,6 +78,7 @@ fn run_dc_generation(
     task: &ConflictTask,
     params: &GAParams,
     deps: &GroupDeps,
+    dag: &DependencyDag,       // <-- NEW parameter
     evaluator: &ResolverContext,
     local_ctx: &mut ThreadBlockBuildingContext,
 ) -> eyre::Result<DCGenerationResult> {
@@ -87,49 +95,57 @@ fn run_dc_generation(
 
     for i in (0..population.len()).step_by(2) {
         if i + 1 >= indices.len() {
-            if let Some(idx) = indices.get(i) { next_population.push(population[*idx].clone()); }
+            if let Some(idx) = indices.get(i) {
+                next_population.push(population[*idx].clone());
+            }
             continue;
         }
 
         let p1_idx = indices[i];
-        let p2_idx = indices[i+1];
+        let p2_idx = indices[i + 1];
         let (p1, p2) = (&population[p1_idx], &population[p2_idx]);
 
-        let mut c1_seq = adapted_order_crossover(&p1.seq, &p2.seq, deps, rng);
-        let mut c2_seq = adapted_order_crossover(&p2.seq, &p1.seq, deps, rng);
+        // ── Crossover uses the DAG ──
+        let mut c1_seq = adapted_order_crossover(&p1.seq, &p2.seq, dag, rng);
+        let mut c2_seq = adapted_order_crossover(&p2.seq, &p1.seq, dag, rng);
 
+        // ── Mutation uses both deps (for fallback) and dag ──
         if rng.gen::<f64>() < params.mutation_rate {
-            mutate(&mut c1_seq, deps, rng);
+            mutate(&mut c1_seq, deps, dag, rng);
         }
         if rng.gen::<f64>() < params.mutation_rate {
-            mutate(&mut c2_seq, deps, rng);
+            mutate(&mut c2_seq, deps, dag, rng);
         }
 
         let (c1, res1) = evaluator.eval_to_individual(c1_seq, task, local_ctx)?;
         let (c2, res2) = evaluator.eval_to_individual(c2_seq, task, local_ctx)?;
         evals_this_gen += 2;
 
-        if best_seen.as_ref().map_or(true, |b| res1.total_profit > b.total_profit) { new_best_hits += 1; }
-        if best_seen.as_ref().map_or(true, |b| res2.total_profit > b.total_profit) { new_best_hits += 1; }
+        if best_seen.as_ref().map_or(true, |b| res1.total_profit > b.total_profit) {
+            new_best_hits += 1;
+        }
+        if best_seen.as_ref().map_or(true, |b| res2.total_profit > b.total_profit) {
+            new_best_hits += 1;
+        }
 
-        let winner1;
-        let winner2;
-
+        // ── Deterministic crowding pairing ──
         let dist_p1c1 = dc_distance(&p1.seq, &c1.seq, deps);
         let dist_p2c2 = dc_distance(&p2.seq, &c2.seq, deps);
         let dist_p1c2 = dc_distance(&p1.seq, &c2.seq, deps);
         let dist_p2c1 = dc_distance(&p2.seq, &c1.seq, deps);
 
-        if dist_p1c1 + dist_p2c2 <= dist_p1c2 + dist_p2c1 {
-            winner1 = compete(p1, &c1, rng);
-            winner2 = compete(p2, &c2, rng);
+        let (winner1, winner2) = if dist_p1c1 + dist_p2c2 <= dist_p1c2 + dist_p2c1 {
+            (compete(p1, &c1, rng), compete(p2, &c2, rng))
         } else {
-            winner1 = compete(p1, &c2, rng);
-            winner2 = compete(p2, &c1, rng);
-        }
+            (compete(p1, &c2, rng), compete(p2, &c1, rng))
+        };
 
-        if winner1.seq == c1.seq || winner1.seq == c2.seq { children_who_won += 1; }
-        if winner2.seq == c1.seq || winner2.seq == c2.seq { children_who_won += 1; }
+        if winner1.seq == c1.seq || winner1.seq == c2.seq {
+            children_who_won += 1;
+        }
+        if winner2.seq == c1.seq || winner2.seq == c2.seq {
+            children_who_won += 1;
+        }
 
         next_population.push(winner1);
         next_population.push(winner2);
@@ -137,7 +153,11 @@ fn run_dc_generation(
 
     *population = next_population;
 
-    Ok(DCGenerationResult { new_best_hits, children_who_won, evals: evals_this_gen })
+    Ok(DCGenerationResult {
+        new_best_hits,
+        children_who_won,
+        evals: evals_this_gen,
+    })
 }
 
 
@@ -181,7 +201,12 @@ impl ResolverContext {
             task.algorithm
         );
 
-        match task.algorithm {
+        let start = Instant::now();
+        let algo = format!("{:?}", task.algorithm);
+        let group_id = task.group.id;
+        let order_count = task.group.orders.len();
+
+        let result = match task.algorithm {
             Algorithm::Genetic {
                 population,
                 crossover_rate,
@@ -208,17 +233,43 @@ impl ResolverContext {
                 );
                 Ok(res)
             }
-            _ => {
-                let sequence_to_try = generate_sequences_of_orders_to_try(&task);
-
-                let mut best_resolution_result = ResolutionResult::new(U256::ZERO, 0,  vec![]);
-
-                for sequence_of_orders in sequence_to_try {
-                    let (resolution_result, _state) =
-                        self.process_sequence_of_orders(sequence_of_orders, &task, self.state.clone(), local_ctx)?;
-                    self.update_best_result(resolution_result, &mut best_resolution_result);
+            Algorithm::GreedyHeap => {
+                let (res_profit, res_mgp) = rayon::join(
+                    || self.process_orders_greedy(&task, self.state.clone(), &mut local_ctx.clone(), GreedyHeapKey::Profit),
+                    || self.process_orders_greedy(&task, self.state.clone(), &mut local_ctx.clone(), GreedyHeapKey::MevGasPrice),
+                );
+                
+                let mut resolution_result = res_profit?.0;
+                if let Ok((mgp_res, _)) = res_mgp {
+                    self.update_best_result(mgp_res, &mut resolution_result);
                 }
 
+                trace!(
+                    "Resolved greedy task {:?} with profit: {:?}",
+                    task.group.id,
+                    resolution_result.total_profit
+                );
+                Ok(resolution_result)
+            }
+            _ => {
+                let sequences = generate_sequences_of_orders_to_try(&task);
+                
+                let results: Vec<ResolutionResult> = sequences
+                    .into_par_iter()
+                    .map_init(
+                        || local_ctx.clone(),
+                        |thread_ctx, sequence_of_orders| {
+                            self.process_sequence_of_orders(sequence_of_orders, &task, self.state.clone(), thread_ctx)
+                                .map(|(resolution_result, _)| resolution_result)
+                        },
+                    )
+                    .filter_map(|r| r.ok())
+                    .collect();
+
+                let mut best_resolution_result = ResolutionResult::new(U256::ZERO, 0, vec![]);
+                for resolution_result in results {
+                    self.update_best_result(resolution_result, &mut best_resolution_result);
+                }
                 trace!(
                     "Resolved conflict task {:?} with profit: {:?} and algorithm: {:?}",
                     task.group.id,
@@ -226,8 +277,27 @@ impl ResolverContext {
                     task.algorithm
                 );
                 Ok(best_resolution_result)
+            //     let sequence_to_try = generate_sequences_of_orders_to_try(&task);
+
+            //     let mut best_resolution_result = ResolutionResult::new(U256::ZERO, 0,  vec![]);
+
+            //     for sequence_of_orders in sequence_to_try {
+            //         let (resolution_result, _state) =
+            //             self.process_sequence_of_orders(sequence_of_orders, &task, self.state.clone(), local_ctx)?;
+            //         self.update_best_result(resolution_result, &mut best_resolution_result);
+            //     }
+
+            //     trace!(
+            //         "Resolved conflict task {:?} with profit: {:?} and algorithm: {:?}",
+            //         task.group.id,
+            //         best_resolution_result.total_profit,
+            //         task.algorithm
+            //     );
+            //     Ok(best_resolution_result)
             }
-        }
+        };
+        println!("run_conflict_task group={} algo={} orders={} time={:.2?}", group_id, algo, order_count, start.elapsed());
+        result
     }
 
 
@@ -248,6 +318,12 @@ impl ResolverContext {
         {
             *best_result = new_result;
         }
+    }
+
+    fn is_simulation_too_low(&self, original: &SimValue, inplace: &SimValue) -> bool {
+        let orig = original.full_profit_info().coinbase_profit();
+        let new = inplace.full_profit_info().coinbase_profit();
+        new * U256::from(100) < orig * U256::from(95)
     }
 
     /// Processes a single sequence of orders, utilizing the simulation cache.
@@ -486,28 +562,151 @@ impl ResolverContext {
         Ok((ind, res))
     }
 
-    fn run_genetic(&mut self, task: &ConflictTask, params: GAParams, local_ctx: &mut ThreadBlockBuildingContext) -> eyre::Result<ResolutionResult> {
-        println!("Running genetic algorithm with params: {:?}", params);
+    fn process_orders_greedy(
+        &self,
+        task: &ConflictTask,
+        state_provider: Arc<dyn StateProvider>,
+        local_ctx: &mut ThreadBlockBuildingContext,
+        heap_key: GreedyHeapKey
+    ) -> Result<(ResolutionResult, BlockState)> {
+        let mut heap: BinaryHeap<(U256, Reverse<OrderId>, usize)> = task.group.orders
+            .iter()
+            .enumerate()
+            .filter(|(_, o)| o.sim_value.gas_used() > 0)
+            .map(|(i, o)| {
+                let key = match heap_key {
+                    GreedyHeapKey::Profit => o.sim_value.full_profit_info().coinbase_profit(),
+                    GreedyHeapKey::MevGasPrice => o.sim_value.full_profit_info().mev_gas_price(),
+                };
+                (key, Reverse(o.order.id()), i)
+            })
+            .collect();
+
+        let mut partial_block = PartialBlock::new(true);
+        let mut state = BlockState::new_arc(state_provider);
+        partial_block.pre_block_call(&self.ctx, local_ctx, &mut state)?;
+
+        let mut sequenced_order_result: Vec<(usize, U256, u64)> = Vec::new();
+        let mut total_profit = U256::ZERO;
+        let mut per_order_profits_and_gas: Vec<(OrderId, U256, u64)> = Vec::new();
+        let mut prefix_ids: Vec<OrderId> = Vec::new();
+        let mut pending_orders: HashMap<(Address, u64), usize> = HashMap::default();
+        let mut retry_counts: HashMap<usize, usize> = HashMap::default();
+        let mut overridden_sim_values: HashMap<usize, SimValue> = HashMap::default();
+        const MAX_RETRIES: usize = 1;
+
+        while let Some((_, _, order_idx)) = heap.pop() {  // fix: destructure all three
+            if self.cancellation_token.is_cancelled() {
+                return Err(eyre::eyre!("Cancelled"));
+            }
+
+            let sim_order = &task.group.orders[order_idx];
+            let original_sim_value = overridden_sim_values
+                .get(&order_idx)
+                .cloned()
+                .unwrap_or_else(|| sim_order.sim_value.clone());
+
+            match partial_block.commit_order(
+                sim_order,
+                &self.ctx,
+                local_ctx,
+                &mut state,
+                &|new_sim_value| {
+                    if !sim_order.order.metadata().is_system
+                        && self.is_simulation_too_low(&original_sim_value, new_sim_value)
+                    {
+                        Err(ExecutionError::LowerInsertedValue {
+                            before: original_sim_value.clone(),
+                            inplace: new_sim_value.clone(),
+                        })
+                    } else {
+                        Ok(())
+                    }
+                },
+            )? {
+                Ok(res) => {
+                    for (address, nonce) in &res.nonces_updated {
+                        if let Some(pending_idx) = pending_orders.remove(&(*address, *nonce)) {
+                            let pending_order = &task.group.orders[pending_idx];
+                            let pending_profit = pending_order.sim_value.full_profit_info().coinbase_profit();
+                            // fix: include Reverse<OrderId> in re-insertion
+                            heap.push((pending_profit, Reverse(pending_order.order.id()), pending_idx));
+                        }
+                    }
+                    let order_id = sim_order.order.id();
+                    total_profit += res.coinbase_profit;
+                    per_order_profits_and_gas.push((order_id.clone(), res.coinbase_profit, res.space_used.gas));
+                    sequenced_order_result.push((order_idx, res.coinbase_profit, res.space_used.gas));
+                    prefix_ids.push(order_id);
+
+                    let _ = self.simulation_cache.ensure_cached_with(&prefix_ids, || {
+                        CachedSimulationState {
+                            bundle_state: state.clone_bundle(),
+                            total_profit,
+                            per_order_profits_and_gas: per_order_profits_and_gas.clone(),
+                            cumulative_gas_used: partial_block.space_state.gas_used(),
+                            cumulative_blob_gas_used: partial_block.space_state.blob_gas_used(),
+                            coinbase_profit: partial_block.coinbase_profit,
+                        }
+                    });
+                }
+                Err(ExecutionError::LowerInsertedValue { inplace, .. }) => {
+                    let retries = retry_counts.entry(order_idx).or_insert(0);
+                    if order_is_worth_executing(&inplace).is_ok() && *retries < MAX_RETRIES {
+                        *retries += 1;
+                        let inplace_profit = inplace.full_profit_info().coinbase_profit();
+                        overridden_sim_values.insert(order_idx, inplace.clone());
+                        // fix: include Reverse<OrderId> in re-insertion
+                        heap.push((inplace_profit, Reverse(sim_order.order.id()), order_idx));
+                    }
+                }
+                Err(err) => {
+                    self.handle_err(&err, sim_order, &mut pending_orders, order_idx);
+                }
+            }
+        }
+
+        let resolution_result = ResolutionResult::new(
+            total_profit,
+            partial_block.space_state.gas_used(),
+            sequenced_order_result,
+        );
+        Ok((resolution_result, state))
+    }
+
+    fn run_genetic(
+        &mut self,
+        task: &ConflictTask,
+        params: GAParams,
+        local_ctx: &mut ThreadBlockBuildingContext,
+    ) -> eyre::Result<ResolutionResult> {
         let Some(deps) = build_group_deps(task) else {
             return Ok(ResolutionResult::default());
         };
+
+        // Build the DAG once for the entire GA run
+        let dag = if deps.has_conflicts() {
+            let active = deps.dedup_best(&task.group, GreedyKey::Profit, false);
+            deps.build_dag(&active)
+        } else {
+            deps.build_dag_all()
+        };
+
         let start = Instant::now();
         let deadline = start + std::time::Duration::from_millis(params.time_ms);
 
-        // Island model configuration
         let num_islands = 10;
-        let migration_interval = 3; // Migrate every 3 generations
+        let migration_interval = 3;
         let population_per_island = (params.population / num_islands).max(2);
 
         let mut islands: Vec<Island> = Vec::with_capacity(num_islands);
         let mut best_seen: Option<ResolutionResult> = None;
 
+        // Seed populations
         let initial_islands: Vec<(Vec<Vec<usize>>, SmallRng)> = (0..num_islands)
-            .into_iter()
             .map(|i| {
                 let mut island_rng = SmallRng::seed_from_u64(params.seed.wrapping_add(i as u64));
-                let seed_seqs = seed_initial_population(&deps, population_per_island, &mut island_rng);
-
+                let seed_seqs = seed_initial_population(&dag, population_per_island, &mut island_rng);
                 (seed_seqs, island_rng)
             })
             .collect();
@@ -522,14 +721,16 @@ impl ResolverContext {
                             return Err(eyre::eyre!("Cancelled during initial evaluation"));
                         }
                         self.eval_to_individual(s, task, thread_ctx)
-                    }
+                    },
                 )
                 .collect::<Result<Vec<_>, _>>()?;
 
             let mut population = Vec::with_capacity(population_per_island);
-            // Process results sequentially to safely update shared state
             for (ind, res) in evaluated_results {
-                if best_seen.as_ref().map_or(true, |b| res.total_profit > b.total_profit) {
+                if best_seen
+                    .as_ref()
+                    .map_or(true, |b| res.total_profit > b.total_profit)
+                {
                     best_seen = Some(res.clone());
                 }
                 population.push(ind);
@@ -537,86 +738,104 @@ impl ResolverContext {
             islands.push(Island { population, rng });
         }
 
-        // main generational loop
+        // Main generational loop
         let mut generation = 0usize;
         let mut generations_without_improvement = 0usize;
         const EARLY_STOPPING_LIMIT: usize = 10;
-        loop{
+
+        loop {
             if generation >= params.max_generations {
-                tracing::info!("Terminating at generation {} due to max generations.", generation);
                 break;
             }
             if Instant::now() >= deadline {
-                tracing::info!("Terminating at generation {} due to time limit.", generation);
+                println!(
+                    "Stopping GA at generation {} due to time limit of {} ms",
+                    generation, params.time_ms
+                );
                 break;
             }
-            if self.cancellation_token.is_cancelled() { return Err(eyre::eyre!("Cancelled")); }
+            if self.cancellation_token.is_cancelled() {
+                return Err(eyre::eyre!("Cancelled"));
+            }
 
-            let profit_before_gen = best_seen.as_ref().map(|b| b.total_profit).unwrap_or_default();
+            let profit_before = best_seen
+                .as_ref()
+                .map(|b| b.total_profit)
+                .unwrap_or_default();
 
-            // Run one generation on each island in parallel
-            islands
-                .par_iter_mut()
-                .try_for_each_init(
-                    || local_ctx.clone(),
-                    |thread_ctx, island| {
-                        run_dc_generation(island, &best_seen, task, &params, &deps, self, thread_ctx)
-                            .map(|_| ())
-                    },
-                )?;
+            // Run one DC generation on each island — pass `dag`
+            islands.par_iter_mut().try_for_each_init(
+                || local_ctx.clone(),
+                |thread_ctx, island| {
+                    run_dc_generation(
+                        island, &best_seen, task, &params, &deps, &dag,
+                        self, thread_ctx,
+                    )
+                    .map(|_| ())
+                },
+            )?;
 
             if generation > 0 && generation % migration_interval == 0 {
-                let mut migrants: Vec<Individual> = Vec::with_capacity(num_islands);
-                // Select the best individual from each island to be a migrant
-                for island in &islands {
-                    let best_migrant = island.population.iter().max_by_key(|ind| ind.profit).unwrap().clone();
-                    migrants.push(best_migrant);
-                }
+                let mut migrants: Vec<Individual> = islands
+                    .iter()
+                    .map(|island| {
+                        island
+                            .population
+                            .iter()
+                            .max_by_key(|ind| ind.profit)
+                            .unwrap()
+                            .clone()
+                    })
+                    .collect();
 
                 let mut island_indices: Vec<usize> = (0..num_islands).collect();
                 island_indices.shuffle(&mut islands[0].rng);
 
-                // Apply the ring topology to the shuffled list of indices
                 for i in 0..num_islands {
-                    let target_island_idx = island_indices[i];
-                    let source_island_idx = island_indices[(i + num_islands - 1) % num_islands];
+                    let target = island_indices[i];
+                    let source = island_indices[(i + num_islands - 1) % num_islands];
+                    let migrant = migrants[source].clone();
 
-                    let migrant = migrants[source_island_idx].clone();
-
-                    // Replace the worst individual in the target island
-                    if let Some(worst_idx) = islands[target_island_idx]
+                    if let Some(worst_idx) = islands[target]
                         .population
                         .iter()
                         .enumerate()
                         .min_by_key(|(_, ind)| ind.profit)
                         .map(|(idx, _)| idx)
                     {
-                        islands[target_island_idx].population[worst_idx] = migrant;
+                        islands[target].population[worst_idx] = migrant;
                     }
                 }
             }
 
+            // Update global best
             for island in &islands {
                 if let Some(island_best) = island.population.iter().max_by_key(|ind| ind.profit) {
-                    if best_seen.as_ref().map_or(true, |b| island_best.profit > b.total_profit) {
-                        let (_, res) = self.eval_to_individual(island_best.seq.clone(), task, local_ctx)?;
+                    if best_seen
+                        .as_ref()
+                        .map_or(true, |b| island_best.profit > b.total_profit)
+                    {
+                        let (_, res) =
+                            self.eval_to_individual(island_best.seq.clone(), task, local_ctx)?;
                         best_seen = Some(res);
                     }
                 }
             }
 
-            let profit_after_gen = best_seen.as_ref().map(|b| b.total_profit).unwrap_or_default();
-            if profit_after_gen > profit_before_gen {
+            let profit_after = best_seen
+                .as_ref()
+                .map(|b| b.total_profit)
+                .unwrap_or_default();
+            if profit_after > profit_before {
                 generations_without_improvement = 0;
             } else {
                 generations_without_improvement += 1;
             }
 
             if generations_without_improvement >= EARLY_STOPPING_LIMIT {
-                tracing::info!(
-                    "Terminating at generation {} due to early stopping ({} gens without improvement).",
-                    generation,
-                    EARLY_STOPPING_LIMIT
+                println!(
+                    "Early stopping at generation {} due to no improvement in profit for {} generations",
+                    generation, EARLY_STOPPING_LIMIT
                 );
                 break;
             }
@@ -641,6 +860,10 @@ impl ResolverContext {
 pub fn generate_sequences_of_orders_to_try(task: &ConflictTask) -> Vec<Vec<usize>> {
     match task.algorithm {
         Algorithm::Greedy => generate_greedy_sequence(task, false),
+        Algorithm::GreedyHeap => {
+            // Handled separately in ResolverContext::run_conflict_task
+            vec![]
+        }
         Algorithm::ReverseGreedy => generate_greedy_sequence(task, true),
         Algorithm::Length => generate_length_based_sequence(task),
         Algorithm::AllPermutations => generate_all_permutations(task),
@@ -711,48 +934,47 @@ fn generate_all_permutations(task: &ConflictTask) -> Vec<Vec<usize>> {
 ///
 /// A vector of static sequences of order indices, sorted by coinbase profit and mev_gas_price.
 fn generate_greedy_sequence(task: &ConflictTask, reverse: bool) -> Vec<Vec<usize>> {
-    let group = &task.group;
+    let order_group = &task.group;
 
-    // Build a single greedy preference list for the given key
-    let build_for = |key: GreedyKey| {
-        let allowed = allowed_indices_after_nonce_dedup(group, key, reverse);
-
-        // Collect indices with both metrics so we can do a stable secondary tie-break.
-        let mut rows: Vec<(usize, U256, U256)> = group
+    let create_sequence = |value_extractor: fn(&SimulatedOrder) -> U256| -> Vec<usize> {
+        let mut ids_and_value: Vec<_> = order_group
             .orders
             .iter()
             .enumerate()
-            .filter(|(idx, _)| allowed.as_ref().map_or(true, |set| set.contains(idx)))
-            .map(|(idx, o)| (idx, o.sim_value.full_profit_info().coinbase_profit(), o.sim_value.full_profit_info().mev_gas_price()))
+            .map(|(idx, order)| (idx, value_extractor(order)))
             .collect();
 
-        rows.sort_by(|a, b| {
-            // a: (idx, profit, gas), b: (idx, profit, gas)
-            let (pa, sa) = match key {
-                GreedyKey::Profit     => (a.1, a.2),
-                GreedyKey::MevGasPrice=> (a.2, a.1),
-            };
-            let (pb, sb) = match key {
-                GreedyKey::Profit     => (b.1, b.2),
-                GreedyKey::MevGasPrice=> (b.2, b.1),
-            };
-
-            let ord1 = if reverse { pa.cmp(&pb) } else { pb.cmp(&pa) };
-            if ord1 != std::cmp::Ordering::Equal { return ord1; }
-
-            let ord2 = if reverse { sa.cmp(&sb) } else { sb.cmp(&sa) };
-            if ord2 != std::cmp::Ordering::Equal { return ord2; }
-
-            a.0.cmp(&b.0)
+        ids_and_value.sort_by(|a, b| {
+            if reverse {
+                a.1.cmp(&b.1)
+            } else {
+                b.1.cmp(&a.1)
+            }
         });
-
-        rows.into_iter().map(|(idx, _, _)| idx).collect::<Vec<_>>()
+        ids_and_value.into_iter().map(|(idx, _)| idx).collect()
     };
 
-    vec![
-        build_for(GreedyKey::Profit),
-        build_for(GreedyKey::MevGasPrice),
-    ]
+    let vector: Vec<Vec<usize>> = vec![
+        create_sequence(|sim_order| sim_order.sim_value.full_profit_info().coinbase_profit()),
+        create_sequence(|sim_order| sim_order.sim_value.full_profit_info().mev_gas_price()),
+    ];
+
+    println!(
+        "Generated greedy sequences for task {:?}: top by coinbase profit: {:?}, top by mev_gas_price: {:?}",
+        task.group.id,
+        vector[0]
+            .iter()
+            .take(5)
+            .map(|&i| task.group.orders[i].order.id())
+            .collect::<Vec<_>>(),
+        vector[1]
+            .iter()
+            .take(5)
+            .map(|&i| task.group.orders[i].order.id())
+            .collect::<Vec<_>>(),
+    );
+
+    vector
 }
 
 fn generate_length_based_sequence(task: &ConflictTask) -> Vec<Vec<usize>> {
@@ -785,12 +1007,10 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
-    use crate::{
-        building::builders::parallel_builder::{ConflictGroup, GroupId, TaskPriority},
-        primitives::{
-            Bundle, Metadata, Order, SimValue, SimulatedOrder, MempoolTx,
-            TransactionSignedEcRecoveredWithBlobs, LAST_BUNDLE_VERSION,
-        },
+    use crate::building::builders::parallel_builder::{ConflictGroup, GroupId, TaskPriority};
+    use rbuilder_primitives::{
+        Bundle, Metadata, Order, SimValue, SimulatedOrder, MempoolTx,
+        TransactionSignedEcRecoveredWithBlobs, LAST_BUNDLE_VERSION,
     };
 
     struct DataGenerator {
@@ -914,10 +1134,10 @@ mod tests {
     fn mk_order_single_tx(sender: Address, nonce: u64, profit: u64, dg: &mut DataGenerator) -> Arc<SimulatedOrder> {
         let rec = mk_tx_with(sender, nonce, dg.create_hash());
         let with_blobs = TransactionSignedEcRecoveredWithBlobs::new_no_blobs(rec).unwrap();
-        let sim_value = SimValue { coinbase_profit: U256::from(profit), ..Default::default() };
+        let sim_value = SimValue::new_test(U256::from(profit), U256::from(profit), 0);
 
         Arc::new(SimulatedOrder {
-            order: Order::Tx(MempoolTx { tx_with_blobs: with_blobs }),
+            order: Arc::new(Order::Tx(MempoolTx { tx_with_blobs: with_blobs })),
             used_state_trace: None,
             sim_value,
         })
@@ -951,31 +1171,32 @@ mod tests {
         create_mock_order_group(42, orders, HashSet::default())
     }
 
-    /// Assert sequence is a valid interleaving:
-    /// - length == total_slots
-    /// - uses exactly one candidate per (chain, slot)
-    /// - per-chain slot order strictly increasing by slot index
-    fn assert_nonce_valid(seq: &[usize], layout: &NonceLayout) {
-        assert_eq!(seq.len(), layout.total_steps, "length mismatch");
-
-        let _k = layout.chains.len();
-        let mut expected_slot: Vec<usize> = layout.chains.iter().map(|_ch| 0usize).collect();
-        let mut seen: HashSet<usize> = HashSet::default();
-
-        for &idx in seq {
-            assert!(seen.insert(idx), "duplicate index in sequence");
-            let (c, s) = layout.index_of[&idx];
-            // Must be the next expected slot for this chain
-            assert_eq!(s, expected_slot[c], "slot order broken for chain {}", c);
-            // idx must belong to that bucket
-            assert!(layout.chains[c].steps[s].candidates.contains(&idx), "idx not in its bucket");
-            expected_slot[c] += 1;
-        }
-
-        for (c, exp) in expected_slot.into_iter().enumerate() {
-            assert_eq!(exp, layout.chains[c].steps.len(), "did not cover all slots for chain {}", c);
-        }
-    }
+    // Commented out: NonceLayout no longer exists
+    // /// Assert sequence is a valid interleaving:
+    // /// - length == total_slots
+    // /// - uses exactly one candidate per (chain, slot)
+    // /// - per-chain slot order strictly increasing by slot index
+    // fn assert_nonce_valid(seq: &[usize], layout: &NonceLayout) {
+    //     assert_eq!(seq.len(), layout.total_steps, "length mismatch");
+    //
+    //     let _k = layout.chains.len();
+    //     let mut expected_slot: Vec<usize> = layout.chains.iter().map(|_ch| 0usize).collect();
+    //     let mut seen: HashSet<usize> = HashSet::default();
+    //
+    //     for &idx in seq {
+    //         assert!(seen.insert(idx), "duplicate index in sequence");
+    //         let (c, s) = layout.index_of[&idx];
+    //         // Must be the next expected slot for this chain
+    //         assert_eq!(s, expected_slot[c], "slot order broken for chain {}", c);
+    //         // idx must belong to that bucket
+    //         assert!(layout.chains[c].steps[s].candidates.contains(&idx), "idx not in its bucket");
+    //         expected_slot[c] += 1;
+    //     }
+    //
+    //     for (c, exp) in expected_slot.into_iter().enumerate() {
+    //         assert_eq!(exp, layout.chains[c].steps.len(), "did not cover all slots for chain {}", c);
+    //     }
+    // }
 
     #[test]
     fn test_all_permutations() {
@@ -1124,22 +1345,5 @@ mod tests {
         assert_ne!(a, c);
     }
 
-    #[test]
-    fn test_seed_initial_population_validity_and_uniqueness() {
-        let group = make_group_with_duplicate_buckets();
-        let task = create_mock_task(0, group.clone(), Algorithm::Greedy, TaskPriority::Low, Instant::now());
-        let layout = NonceLayout::from_group(&group).unwrap();
-
-        let mut rng = SmallRng::seed_from_u64(999);
-        let population_size = 2;
-        let seeds = seed_initial_population(&layout, population_size, &mut rng);
-
-        assert_eq!(seeds.len(), population_size);
-        let mut uniq: HashSet<Vec<usize>> = HashSet::default();
-        for s in &seeds {
-            assert_nonce_valid(s, &layout);
-            assert!(uniq.insert(s.clone()), "duplicate initial individual");
-        }
-    }
 
 }

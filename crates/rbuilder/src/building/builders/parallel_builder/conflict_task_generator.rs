@@ -11,7 +11,7 @@ use super::nonce_handling::{
 };
 use super::{
     task::ConflictTask, Algorithm, ConflictGroup, ConflictResolutionResultPerGroup, GroupId,
-    ResolutionResult, TaskPriority, TaskQueue,
+    ResolutionResult, TaskPriority, TaskQueueSender,
 };
 use std::sync::mpsc as std_mpsc;
 
@@ -22,7 +22,7 @@ const NUMBER_OF_RANDOM_TASKS: usize = 50;
 /// Manages conflicts and updates for conflict groups, coordinating with a worker pool to process tasks.
 pub struct ConflictTaskGenerator {
     existing_groups: HashMap<GroupId, ConflictGroup>,
-    task_queue: TaskQueue,
+    task_queue: TaskQueueSender,
     group_result_sender: std_mpsc::Sender<ConflictResolutionResultPerGroup>,
     safe_sorting_only: bool,
 }
@@ -36,7 +36,7 @@ impl ConflictTaskGenerator {
     /// * `group_result_sender` - The sender to send the results of the conflict resolution.
     pub fn new(
         safe_sorting_only: bool,
-        task_queue: TaskQueue,
+        task_queue: TaskQueueSender,
         group_result_sender: std_mpsc::Sender<ConflictResolutionResultPerGroup>,
     ) -> Self {
         Self {
@@ -310,17 +310,17 @@ impl ConflictTaskGenerator {
 
     /// Cancels all tasks for a given group
     fn cancel_tasks_for_group(&mut self, group_id: GroupId) {
-        let temp_queue = SegQueue::new();
+        // let temp_queue = SegQueue::new();
 
-        while let Some(task) = self.task_queue.pop() {
-            if task.group_idx != group_id {
-                temp_queue.push(task);
-            }
-        }
+        // while let Some(task) = self.task_queue.pop() {
+        //     if task.group_idx != group_id {
+        //         temp_queue.push(task);
+        //     }
+        // }
 
-        while let Some(task) = temp_queue.pop() {
-            self.task_queue.push(task);
-        }
+        // while let Some(task) = temp_queue.pop() {
+        //     let _ = self.task_queue.send(task);
+        // }
     }
 
     /// Creates and spawns new tasks for a given order group.
@@ -332,7 +332,7 @@ impl ConflictTaskGenerator {
     fn create_new_tasks(&mut self, new_group: &ConflictGroup, priority: TaskPriority) {
         let tasks = get_tasks_for_group(new_group, priority, self.safe_sorting_only);
         for task in tasks {
-            self.task_queue.push(task);
+            let _ = self.task_queue.send(task);
         }
     }
 }
@@ -372,15 +372,24 @@ pub fn get_tasks_for_group(
         // Always try Greedy first (fast baseline)
         tasks.push(ConflictTask {
             group_idx: group.id,
-            algorithm: Algorithm::Greedy,
+            algorithm: Algorithm::GreedyHeap,
             priority,
             group: group.clone(),
             created_at,
         });
 
         // Check if we can enumerate all orderings within the cap
+        println!(
+            "Group {}... Checking if it has orderings <= cap of {}.",
+            group.id,
+            MULTINOMIAL_ALL_PERMS_THRESHOLD
+         );
         if let Some(small) = orderings_leq_cap(group, MULTINOMIAL_ALL_PERMS_THRESHOLD) {
             if small {
+                println!(
+                    "Group {} has less than 120 orderings. Adding AllPermutations task.",
+                    group.id
+                );
                 tasks.push(ConflictTask {
                     group_idx: group.id,
                     algorithm: Algorithm::AllPermutations,
@@ -389,21 +398,25 @@ pub fn get_tasks_for_group(
                     created_at,
                 });
             } else {
-                tasks.push(ConflictTask {
-                    group_idx: group.id,
-                    algorithm: Algorithm::Genetic {
-                        population: 30,
-                        crossover_rate: 0.9,
-                        mutation_rate: 0.2,
-                        tourn_k: 3,
-                        max_generations: 50,
-                        time_ms: 6000,
-                        seed: group.id as u64,
-                    },
-                    priority: TaskPriority::Medium,
-                    group: group.clone(),
-                    created_at,
-                });
+                println!(
+                    "Group {} has more than 120 orderings. Adding Greedy, Random and Length tasks.",
+                    group.id
+                );
+                // tasks.push(ConflictTask {
+                //     group_idx: group.id,
+                //     algorithm: Algorithm::Genetic {
+                //         population: 30,
+                //         crossover_rate: 0.9,
+                //         mutation_rate: 0.2,
+                //         tourn_k: 3,
+                //         max_generations: 50,
+                //         time_ms: 6000,
+                //         seed: group.id as u64,
+                //     },
+                //     priority: TaskPriority::Medium,
+                //     group: group.clone(),
+                //     created_at,
+                // });
 
                 // tasks.push(ConflictTask {
                 //     group_idx: group.id,
@@ -416,31 +429,31 @@ pub fn get_tasks_for_group(
                 //     created_at,
                 // });
 
-                tasks.push(ConflictTask {
-                    group_idx: group.id,
-                    algorithm: Algorithm::RandomImproved {
-                        seed: group.id as u64,
-                        count: NUMBER_OF_RANDOM_TASKS,
-                    },
-                    priority: TaskPriority::Low,
-                    group: group.clone(),
-                    created_at,
-                });
+                // tasks.push(ConflictTask {
+                //     group_idx: group.id,
+                //     algorithm: Algorithm::RandomImproved {
+                //         seed: group.id as u64,
+                //         count: NUMBER_OF_RANDOM_TASKS,
+                //     },
+                //     priority: TaskPriority::Low,
+                //     group: group.clone(),
+                //     created_at,
+                // });
 
-                tasks.push(ConflictTask {
-                    group_idx: group.id,
-                    algorithm: Algorithm::Length,
-                    priority: TaskPriority::Low,
-                    group: group.clone(),
-                    created_at,
-                });
-                tasks.push(ConflictTask {
-                    group_idx: group.id,
-                    algorithm: Algorithm::ReverseGreedy,
-                    priority: TaskPriority::Low,
-                    group: group.clone(),
-                    created_at,
-                });
+                // tasks.push(ConflictTask {
+                //     group_idx: group.id,
+                //     algorithm: Algorithm::Length,
+                //     priority: TaskPriority::Low,
+                //     group: group.clone(),
+                //     created_at,
+                // });
+                // tasks.push(ConflictTask {
+                //     group_idx: group.id,
+                //     algorithm: Algorithm::ReverseGreedy,
+                //     priority: TaskPriority::Low,
+                //     group: group.clone(),
+                //     created_at,
+                // });
             }
             return tasks;
         }
@@ -599,15 +612,16 @@ mod tests {
         Arc::new(SegQueue::new())
     }
 
-    fn create_task_generator() -> ConflictTaskGenerator {
+    fn create_task_generator() -> (ConflictTaskGenerator, crossbeam::channel::Receiver<ConflictTask>) {
         let (sender, _receiver) = mpsc::channel();
-        ConflictTaskGenerator::new(false, create_task_queue(), sender)
+        let (task_sender, task_receiver) = crossbeam::channel::unbounded();
+        (ConflictTaskGenerator::new(false, task_sender, sender), task_receiver)
     }
+
 
     #[test]
     fn test_process_single_group_new() {
-        let mut conflict_manager = create_task_generator();
-
+        let (mut conflict_manager, _task_rx) = create_task_generator();
         let mut data_generator = DataGenerator::new();
         let group = create_conflict_group(
             1,
@@ -626,7 +640,7 @@ mod tests {
 
     #[test]
     fn test_process_single_group_update() {
-        let mut conflict_manager = create_task_generator();
+        let (mut conflict_manager, _task_rx) = create_task_generator();
 
         let mut data_generator = DataGenerator::new();
 
@@ -656,7 +670,7 @@ mod tests {
 
     #[test]
     fn test_conflicting_groups_remove_tasks() {
-        let mut conflict_manager = create_task_generator();
+        let (mut conflict_manager, task_rx) = create_task_generator();
 
         let mut data_generator = DataGenerator::new();
 
@@ -689,7 +703,7 @@ mod tests {
 
     #[test]
     fn test_process_groups() {
-        let mut conflict_manager = create_task_generator();
+        let (mut conflict_manager, task_rx) = create_task_generator();
 
         let mut data_generator = DataGenerator::new();
 
@@ -733,7 +747,7 @@ mod tests {
 
     #[test]
     fn test_has_significant_changes() {
-        let conflict_manager = create_task_generator();
+        let (conflict_manager, _task_rx) = create_task_generator();
 
         let mut data_generator = DataGenerator::new();
 
@@ -774,7 +788,7 @@ mod tests {
 
     #[test]
     fn has_group_changed() {
-        let conflict_manager = create_task_generator();
+        let (conflict_manager, _task_rx) = create_task_generator();
 
         let mut data_generator = DataGenerator::new();
 
@@ -797,7 +811,7 @@ mod tests {
 
     #[test]
     fn test_single_order_group() {
-        let mut conflict_manager = create_task_generator();
+        let (mut conflict_manager, _task_rx) = create_task_generator();
 
         let mut data_generator = DataGenerator::new();
 

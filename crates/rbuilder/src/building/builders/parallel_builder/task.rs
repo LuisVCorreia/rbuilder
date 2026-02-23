@@ -61,6 +61,8 @@ impl Ord for ConflictTask {
 pub enum Algorithm {
     /// `Greedy` checks the following ordrerings: max profit, mev gas price
     Greedy,
+    /// `HeapGreedy` checks the following ordrerings: max profit, mev gas price using a heap like the ordering builder
+    GreedyHeap,
     /// `ReverseGreedy` checks the reverse greedy orderings: e.g. min profit, min mev gas price first
     ReverseGreedy,
     /// `Length` checks the length based orderings
@@ -79,6 +81,7 @@ impl Algorithm {
     pub fn display(&self) -> &str {
         match self {
             Algorithm::Greedy => "Greedy",
+            Algorithm::GreedyHeap => "HeapGreedy",
             Algorithm::ReverseGreedy => "ReverseGreedy",
             Algorithm::Length => "Length",
             Algorithm::AllPermutations => "AllPermutations",
