@@ -18,8 +18,6 @@
 //! they are mutually exclusive — at most one can be active.  We handle this via
 //! either greedy dedup (pick the best candidate) or branching enumeration.
 //!
-//! For single-tx-only groups the DAG degenerates into independent chains and
-//! the behaviour is identical to the previous `NonceLayout` approach.
 
 use ahash::{HashMap, HashSet as AHashSet};
 use alloy_primitives::{Address, U256};
@@ -316,20 +314,26 @@ impl DependencyDag {
         self.count_topo_sorts_up_to(cap) <= cap
     }
 
-    /// Count topological sorts, stopping as soon as the count exceeds `cap`.
+    /// Count topological sorts, stopping as soon as `count > cap`.
+    ///
+    /// Uses an incremental ready set so each step costs O(ready set size)
+    /// rather than O(n).  Finding `cap + 1` results takes O(cap × n) steps
+    /// in the worst case, so callers should ensure n is reasonable (the
+    /// heuristics in [`orderings_leq_cap`] handle this).
     pub fn count_topo_sorts_up_to(&self, cap: usize) -> usize {
         let n = self.nodes.len();
         if n == 0 {
             return 0;
         }
+
         let mut in_deg = self.in_degree.clone();
-        let mut used = vec![false; n];
         let mut count = 0usize;
+        let mut ready: Vec<usize> = (0..n).filter(|&i| in_deg[i] == 0).collect();
 
         fn dfs(
             succ: &[Vec<usize>],
             in_deg: &mut [usize],
-            used: &mut [bool],
+            ready: &mut Vec<usize>,
             depth: usize,
             n: usize,
             count: &mut usize,
@@ -342,30 +346,44 @@ impl DependencyDag {
                 *count += 1;
                 return;
             }
-            for i in 0..n {
-                if !used[i] && in_deg[i] == 0 {
-                    used[i] = true;
-                    for &s in &succ[i] {
-                        in_deg[s] -= 1;
-                    }
 
-                    dfs(succ, in_deg, used, depth + 1, n, count, cap);
+            let ready_snapshot: Vec<usize> = ready.clone();
 
-                    used[i] = false;
-                    for &s in &succ[i] {
-                        in_deg[s] += 1;
-                    }
-                    if *count > cap {
-                        return;
+            for &i in &ready_snapshot {
+                if *count > cap {
+                    return;
+                }
+
+                // Remove i from ready set
+                ready.retain(|&x| x != i);
+
+                // Place i: decrement successors' in-degrees, add newly ready
+                let mut newly_ready = Vec::new();
+                for &s in &succ[i] {
+                    in_deg[s] -= 1;
+                    if in_deg[s] == 0 {
+                        ready.push(s);
+                        newly_ready.push(s);
                     }
                 }
+
+                dfs(succ, in_deg, ready, depth + 1, n, count, cap);
+
+                // Undo: restore in-degrees, remove newly ready, re-add i
+                for &s in &succ[i] {
+                    in_deg[s] += 1;
+                }
+                for &s in &newly_ready {
+                    ready.retain(|&x| x != s);
+                }
+                ready.push(i);
             }
         }
 
         dfs(
             &self.successors,
             &mut in_deg,
-            &mut used,
+            &mut ready,
             0,
             n,
             &mut count,
@@ -384,15 +402,15 @@ impl DependencyDag {
             return vec![];
         }
         let mut in_deg = self.in_degree.clone();
-        let mut used = vec![false; n];
         let mut current: Vec<usize> = Vec::with_capacity(n);
         let mut results: Vec<Vec<usize>> = Vec::new();
+        let mut ready: Vec<usize> = (0..n).filter(|&i| in_deg[i] == 0).collect();
 
         fn dfs(
             nodes: &[usize],
             succ: &[Vec<usize>],
             in_deg: &mut [usize],
-            used: &mut [bool],
+            ready: &mut Vec<usize>,
             current: &mut Vec<usize>,
             n: usize,
             out: &mut Vec<Vec<usize>>,
@@ -402,29 +420,39 @@ impl DependencyDag {
                 return;
             }
             if current.len() == n {
-                // Map node ids back to original order indices.
                 out.push(current.iter().map(|&ni| nodes[ni]).collect());
                 return;
             }
-            for i in 0..n {
-                if !used[i] && in_deg[i] == 0 {
-                    used[i] = true;
-                    current.push(i);
-                    for &s in &succ[i] {
-                        in_deg[s] -= 1;
-                    }
 
-                    dfs(nodes, succ, in_deg, used, current, n, out, cap);
+            let ready_snapshot: Vec<usize> = ready.clone();
 
-                    current.pop();
-                    used[i] = false;
-                    for &s in &succ[i] {
-                        in_deg[s] += 1;
-                    }
-                    if out.len() >= cap {
-                        return;
+            for &i in &ready_snapshot {
+                if out.len() >= cap {
+                    return;
+                }
+
+                ready.retain(|&x| x != i);
+
+                let mut newly_ready = Vec::new();
+                for &s in &succ[i] {
+                    in_deg[s] -= 1;
+                    if in_deg[s] == 0 {
+                        ready.push(s);
+                        newly_ready.push(s);
                     }
                 }
+                current.push(i);
+
+                dfs(nodes, succ, in_deg, ready, current, n, out, cap);
+
+                current.pop();
+                for &s in &succ[i] {
+                    in_deg[s] += 1;
+                }
+                for &s in &newly_ready {
+                    ready.retain(|&x| x != s);
+                }
+                ready.push(i);
             }
         }
 
@@ -432,7 +460,7 @@ impl DependencyDag {
             &self.nodes,
             &self.successors,
             &mut in_deg,
-            &mut used,
+            &mut ready,
             &mut current,
             n,
             &mut results,
@@ -472,6 +500,83 @@ impl DependencyDag {
 
         seq
     }
+
+    /// Sample a topo sort biased toward high-value orders.
+    ///
+    /// `order_values[oi]` is the value of original order index `oi`
+    /// (e.g. coinbase profit as a `f64`). Higher values are placed earlier.
+    ///
+    /// Internally converts values to **ranks** so the softmax temperature
+    /// is scale-independent:
+    ///   - `temperature = 0.0` → fully greedy (always pick highest-value ready)
+    ///   - `temperature = 1.0` → strong greedy bias, occasional swaps
+    ///   - `temperature = 5.0` → moderate randomness
+    ///   - `temperature = 50.0` → nearly uniform
+    ///
+    /// Uses softmax: `P(node) ∝ exp(-rank / temperature)`.
+    pub fn sample_weighted_topo_sort<R: Rng + ?Sized>(
+        &self,
+        order_values: &[f64],
+        temperature: f64,
+        rng: &mut R,
+    ) -> Vec<usize> {
+        let n = self.nodes.len();
+        let mut in_deg = self.in_degree.clone();
+        let mut used = vec![false; n];
+        let mut seq: Vec<usize> = Vec::with_capacity(n);
+
+        for _ in 0..n {
+            let ready: Vec<usize> = (0..n)
+                .filter(|&i| !used[i] && in_deg[i] == 0)
+                .collect();
+            debug_assert!(!ready.is_empty());
+
+            let chosen = if ready.len() == 1 || temperature <= 0.0 {
+                // Greedy: pick the highest-value ready node.
+                *ready.iter().max_by(|&&a, &&b| {
+                    let va = order_values.get(self.nodes[a]).copied().unwrap_or(0.0);
+                    let vb = order_values.get(self.nodes[b]).copied().unwrap_or(0.0);
+                    va.partial_cmp(&vb).unwrap_or(std::cmp::Ordering::Equal)
+                }).unwrap()
+            } else {
+                // Rank the ready nodes by value (highest value = rank 0).
+                let mut ranked: Vec<(usize, f64)> = ready.iter()
+                    .map(|&ni| (ni, order_values.get(self.nodes[ni]).copied().unwrap_or(0.0)))
+                    .collect();
+                ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+                // Softmax over negative rank: P(node) ∝ exp(-rank / temperature).
+                let weights: Vec<f64> = ranked.iter().enumerate()
+                    .map(|(rank, _)| (-(rank as f64) / temperature).exp())
+                    .collect();
+                let sum: f64 = weights.iter().sum();
+
+                if sum <= 0.0 {
+                    *ready.choose(rng).unwrap()
+                } else {
+                    let r = rng.gen::<f64>() * sum;
+                    let mut acc = 0.0;
+                    let mut picked = ranked.last().unwrap().0;
+                    for (i, &w) in weights.iter().enumerate() {
+                        acc += w;
+                        if r <= acc {
+                            picked = ranked[i].0;
+                            break;
+                        }
+                    }
+                    picked
+                }
+            };
+
+            used[chosen] = true;
+            seq.push(self.nodes[chosen]);
+            for &s in &self.successors[chosen] {
+                in_deg[s] -= 1;
+            }
+        }
+
+        seq
+    }
 }
 
 // ─── Enumeration with duplicate-nonce branching ─────────────────────────
@@ -479,6 +584,8 @@ impl DependencyDag {
 /// Enumerate all valid orderings, branching over **both** slot-conflict
 /// choices (which candidate fills each duplicate-nonce slot) **and**
 /// topological sort orderings.  Capped at `cap` total results.
+///
+/// Also respects a work budget so it won't hang on large inputs.
 ///
 /// Each result is a `Vec<usize>` of original order indices.
 pub fn enumerate_all_with_choices(
@@ -492,9 +599,12 @@ pub fn enumerate_all_with_choices(
         return dag.enumerate_topo_sorts(cap);
     }
 
+    const WORK_BUDGET: usize = 1_000_000;
+
     let mut results: Vec<Vec<usize>> = Vec::new();
     let mut taken_slots: AHashSet<NonceKey> = AHashSet::default();
     let mut excluded: AHashSet<usize> = AHashSet::default();
+    let mut work = 0usize;
 
     choices_dfs(
         group_deps,
@@ -504,6 +614,8 @@ pub fn enumerate_all_with_choices(
         &mut excluded,
         &mut results,
         cap,
+        &mut work,
+        WORK_BUDGET,
     );
 
     results
@@ -517,8 +629,10 @@ fn choices_dfs(
     excluded: &mut AHashSet<usize>,
     results: &mut Vec<Vec<usize>>,
     cap: usize,
+    work: &mut usize,
+    budget: usize,
 ) {
-    if results.len() >= cap {
+    if results.len() >= cap || *work >= budget {
         return;
     }
 
@@ -532,11 +646,13 @@ fn choices_dfs(
         return;
     }
 
+    *work += 1;
+
     let (ref slot, ref candidates) = conflicts[ci];
 
     // A previously chosen bundle may already provide this slot.
     if taken_slots.contains(&slot) {
-        choices_dfs(deps, conflicts, ci + 1, taken_slots, excluded, results, cap);
+        choices_dfs(deps, conflicts, ci + 1, taken_slots, excluded, results, cap, work, budget);
         return;
     }
 
@@ -555,7 +671,7 @@ fn choices_dfs(
                 newly_taken.push(s.clone());
             }
             // Exclude every *other* provider of slots this order fills.
-            if let Some(providers) = deps.slot_providers.get(s) {
+            if let Some(providers) = deps.slot_providers.get(&s) {
                 for &other in providers {
                     if other != chosen && excluded.insert(other) {
                         newly_excluded.push(other);
@@ -564,7 +680,7 @@ fn choices_dfs(
             }
         }
 
-        choices_dfs(deps, conflicts, ci + 1, taken_slots, excluded, results, cap);
+        choices_dfs(deps, conflicts, ci + 1, taken_slots, excluded, results, cap, work, budget);
 
         // Backtrack.
         for s in &newly_taken {
@@ -574,7 +690,7 @@ fn choices_dfs(
             excluded.remove(&e);
         }
 
-        if results.len() >= cap {
+        if results.len() >= cap || *work >= budget {
             return;
         }
     }
@@ -641,18 +757,49 @@ pub fn allowed_indices_after_nonce_dedup(
 
 /// Quick check: can we enumerate all orderings within `cap`?
 ///
-/// Uses bounded enumeration (general, works for bundles).
-/// Falls back to the multinomial shortcut when the group is tx-only with no
-/// conflicts (all independent chains, no cross-chain bundle edges).
+/// Uses fast heuristics to reject obviously-large groups, then falls
+/// back to work-budgeted DFS enumeration for the rest.
 pub fn orderings_leq_cap(group: &ConflictGroup, cap: usize) -> Option<bool> {
     let deps = GroupDeps::from_group(group)?;
 
+    // After dedup, build the DAG to reason about structure.
+    let active = deps.dedup_best(group, GreedyKey::Profit, false);
+    let dag = deps.build_dag(&active);
+    let n = dag.len();
+
+    // Trivial cases.
+    if n <= 1 {
+        return Some(true);
+    }
+
+    // Fast rejection: root count lower bound
+    // If there are r roots (in-degree 0), the ordering count is at least
+    // r! (roots are mutually independent). Check cheaply with ln
+    let n_roots = dag.in_degree.iter().filter(|&&d| d == 0).count();
+    if n_roots > 1 {
+        let ln_roots_fact = ln_fact(n_roots);
+        if ln_roots_fact > (cap as f64).ln() + 1e-12 {
+            return Some(false);
+        }
+    }
+
+    // Fast rejection: conflict branching multiplier
+    // Each conflict with k candidates multiplies orderings by k.
+    // If that alone exceeds cap, bail out
     if deps.has_conflicts() {
-        // Must count with choices — bounded enumeration is the only option.
+        let conflicts = deps.conflicting_slots();
+        let mut ln_choices: f64 = 0.0;
+        for (_, candidates) in &conflicts {
+            ln_choices += (candidates.len() as f64).ln();
+        }
+        if ln_choices > (cap as f64).ln() + 1e-12 {
+            return Some(false);
+        }
+        // Few conflicts — enumerate with the work-budgeted DFS
         let count = enumerate_all_with_choices(&deps, cap + 1).len();
         Some(count <= cap)
     } else {
-        let dag = deps.build_dag_all();
+        // No conflicts — work-budgeted topo sort count
         Some(dag.topo_sorts_leq(cap))
     }
 }
@@ -710,6 +857,7 @@ pub fn is_simple_chain(group: &ConflictGroup) -> bool {
         .collect();
     unique_nonces.len() <= 1
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -776,7 +924,7 @@ mod tests {
         Arc::new(SimulatedOrder {
             order: Order::Tx(MempoolTx {
                 tx_with_blobs: with_blobs,
-            }),
+            }).into(),
             used_state_trace: None,
             sim_value: SimValue {
                 coinbase_profit: U256::from(profit),
@@ -1171,6 +1319,7 @@ mod tests {
         assert!(active.contains(&1));
         assert!(!active.contains(&0));
     }
+
     #[test]
     fn dedup_reverse_picks_lowest() {
         let mut gen = IdGen::new();

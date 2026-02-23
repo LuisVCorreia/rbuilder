@@ -372,6 +372,13 @@ pub fn get_tasks_for_group(
         // Always try Greedy first (fast baseline)
         tasks.push(ConflictTask {
             group_idx: group.id,
+            algorithm: Algorithm::Greedy,
+            priority,
+            group: group.clone(),
+            created_at,
+        });
+        tasks.push(ConflictTask {
+            group_idx: group.id,
             algorithm: Algorithm::GreedyHeap,
             priority,
             group: group.clone(),
@@ -405,12 +412,12 @@ pub fn get_tasks_for_group(
                 // tasks.push(ConflictTask {
                 //     group_idx: group.id,
                 //     algorithm: Algorithm::Genetic {
-                //         population: 30,
-                //         crossover_rate: 0.9,
+                //         population: 50,
+                //         crossover_rate: 0.8,
                 //         mutation_rate: 0.2,
-                //         tourn_k: 3,
+                //         tourn_k: 5,
                 //         max_generations: 50,
-                //         time_ms: 6000,
+                //         time_ms: 20000,
                 //         seed: group.id as u64,
                 //     },
                 //     priority: TaskPriority::Medium,

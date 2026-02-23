@@ -29,12 +29,6 @@ use crate::building::{
 use rbuilder_primitives::{BlockSpace, SimValue};
 use rbuilder_primitives::{OrderId, SimulatedOrder};
 
-#[derive(Clone, Copy)]
-enum GreedyHeapKey {
-    Profit,
-    MevGasPrice,
-}
-
 fn build_group_deps(task: &ConflictTask) -> Option<GroupDeps> {
     GroupDeps::from_group(&task.group)
 }
@@ -235,8 +229,8 @@ impl ResolverContext {
             }
             Algorithm::GreedyHeap => {
                 let (res_profit, res_mgp) = rayon::join(
-                    || self.process_orders_greedy(&task, self.state.clone(), &mut local_ctx.clone(), GreedyHeapKey::Profit),
-                    || self.process_orders_greedy(&task, self.state.clone(), &mut local_ctx.clone(), GreedyHeapKey::MevGasPrice),
+                    || self.process_orders_greedy(&task, self.state.clone(), &mut local_ctx.clone(), GreedyKey::Profit),
+                    || self.process_orders_greedy(&task, self.state.clone(), &mut local_ctx.clone(), GreedyKey::MevGasPrice),
                 );
                 
                 let mut resolution_result = res_profit?.0;
@@ -296,7 +290,7 @@ impl ResolverContext {
             //     Ok(best_resolution_result)
             }
         };
-        println!("run_conflict_task group={} algo={} orders={} time={:.2?}", group_id, algo, order_count, start.elapsed());
+        println!("run_conflict_task group={} algo={} orders={} time={:.2?} result={:?}", group_id, algo, order_count, start.elapsed(), result.as_ref().map(|r| r.total_profit));
         result
     }
 
@@ -546,7 +540,7 @@ impl ResolverContext {
         Ok(res)
     }
 
-    /// Evaluate a sequence and build an Individual (+ return its full result if you need it).
+    /// Evaluate a sequence and build an Individual
     fn eval_to_individual(
         &self,
         seq: Vec<usize>,
@@ -567,7 +561,7 @@ impl ResolverContext {
         task: &ConflictTask,
         state_provider: Arc<dyn StateProvider>,
         local_ctx: &mut ThreadBlockBuildingContext,
-        heap_key: GreedyHeapKey
+        heap_key: GreedyKey
     ) -> Result<(ResolutionResult, BlockState)> {
         let mut heap: BinaryHeap<(U256, Reverse<OrderId>, usize)> = task.group.orders
             .iter()
@@ -575,8 +569,8 @@ impl ResolverContext {
             .filter(|(_, o)| o.sim_value.gas_used() > 0)
             .map(|(i, o)| {
                 let key = match heap_key {
-                    GreedyHeapKey::Profit => o.sim_value.full_profit_info().coinbase_profit(),
-                    GreedyHeapKey::MevGasPrice => o.sim_value.full_profit_info().mev_gas_price(),
+                    GreedyKey::Profit => o.sim_value.full_profit_info().coinbase_profit(),
+                    GreedyKey::MevGasPrice => o.sim_value.full_profit_info().mev_gas_price(),
                 };
                 (key, Reverse(o.order.id()), i)
             })
@@ -595,7 +589,7 @@ impl ResolverContext {
         let mut overridden_sim_values: HashMap<usize, SimValue> = HashMap::default();
         const MAX_RETRIES: usize = 1;
 
-        while let Some((_, _, order_idx)) = heap.pop() {  // fix: destructure all three
+        while let Some((_, _, order_idx)) = heap.pop() {
             if self.cancellation_token.is_cancelled() {
                 return Err(eyre::eyre!("Cancelled"));
             }
@@ -629,7 +623,6 @@ impl ResolverContext {
                         if let Some(pending_idx) = pending_orders.remove(&(*address, *nonce)) {
                             let pending_order = &task.group.orders[pending_idx];
                             let pending_profit = pending_order.sim_value.full_profit_info().coinbase_profit();
-                            // fix: include Reverse<OrderId> in re-insertion
                             heap.push((pending_profit, Reverse(pending_order.order.id()), pending_idx));
                         }
                     }
@@ -656,7 +649,6 @@ impl ResolverContext {
                         *retries += 1;
                         let inplace_profit = inplace.full_profit_info().coinbase_profit();
                         overridden_sim_values.insert(order_idx, inplace.clone());
-                        // fix: include Reverse<OrderId> in re-insertion
                         heap.push((inplace_profit, Reverse(sim_order.order.id()), order_idx));
                     }
                 }
@@ -890,15 +882,49 @@ fn generate_random_permutations(task: &ConflictTask, seed: u64, count: usize) ->
 fn generate_random_permutations_with_nonce(task: &ConflictTask, seed: u64, count: usize) -> Vec<Vec<usize>> {
     if let Some(deps) = build_group_deps(task) {
         let mut rng = SmallRng::seed_from_u64(seed);
+
+        // Build value table for weighted sampling
+        let order_values: Vec<f64> = task.group.orders.iter()
+            .map(|o| {
+                let profit = o.sim_value.full_profit_info().coinbase_profit();
+                let lo = profit.as_limbs()[0] as f64;
+                let hi = profit.as_limbs()[1] as f64;
+                hi * (u64::MAX as f64 + 1.0) + lo
+            })
+            .collect();
+
+        // Dedup once, build DAG once
+        let active = deps.dedup_best(&task.group, GreedyKey::Profit, false);
+        let dag = deps.build_dag(&active);
+
         let mut out = Vec::with_capacity(count);
-        for _ in 0..count {
-            out.push(random_ordering_with_random_choices(&deps, &mut rng));
+
+        // First 2: pure greedy
+        for _ in 0..2.min(count) {
+            out.push(dag.sample_weighted_topo_sort(&order_values, 0.0, &mut rng));
+        }
+
+        // Next 60%: tight exploration (temp 0.5 to 2.0)
+        // At temp=1 with 2 ready nodes, top node is picked ~73% of the time
+        // With 5 ready nodes, top node ~55%, top-2 ~90%
+        // This finds orderings differing from greedy by a few swaps
+        let tight_count = ((count as f64 * 0.6) as usize).min(count.saturating_sub(out.len()));
+        for i in 0..tight_count {
+            let t = 0.5 + 1.5 * (i as f64) / (tight_count.max(1) as f64);
+            out.push(dag.sample_weighted_topo_sort(&order_values, t, &mut rng));
+        }
+
+        // Remaining ~30%: broader exploration
+        while out.len() < count {
+            let remaining = count - out.len();
+            let i = count - remaining;
+            let t = 3.0 + 5.0 * (i as f64) / (count.max(1) as f64);
+            out.push(dag.sample_weighted_topo_sort(&order_values, t, &mut rng));
         }
 
         return out;
     }
 
-    // Fallback
     generate_random_permutations(task, seed, count)
 }
 
@@ -936,62 +962,73 @@ fn generate_all_permutations(task: &ConflictTask) -> Vec<Vec<usize>> {
 fn generate_greedy_sequence(task: &ConflictTask, reverse: bool) -> Vec<Vec<usize>> {
     let order_group = &task.group;
 
+    // Dedup to remove duplicate-nonce losers — no point executing them.
+    let allowed = allowed_indices_after_nonce_dedup(
+        order_group,
+        if reverse { GreedyKey::MevGasPrice } else { GreedyKey::Profit },
+        reverse,
+    );
+
     let create_sequence = |value_extractor: fn(&SimulatedOrder) -> U256| -> Vec<usize> {
-        let mut ids_and_value: Vec<_> = order_group
-            .orders
-            .iter()
-            .enumerate()
+        let mut ids_and_value: Vec<_> = order_group.orders.iter().enumerate()
+            .filter(|(idx, _)| allowed.as_ref().map_or(true, |set| set.contains(idx)))
             .map(|(idx, order)| (idx, value_extractor(order)))
             .collect();
 
         ids_and_value.sort_by(|a, b| {
-            if reverse {
-                a.1.cmp(&b.1)
-            } else {
-                b.1.cmp(&a.1)
-            }
+            if reverse { a.1.cmp(&b.1) } else { b.1.cmp(&a.1) }
         });
         ids_and_value.into_iter().map(|(idx, _)| idx).collect()
     };
 
-    let vector: Vec<Vec<usize>> = vec![
+    vec![
         create_sequence(|sim_order| sim_order.sim_value.full_profit_info().coinbase_profit()),
         create_sequence(|sim_order| sim_order.sim_value.full_profit_info().mev_gas_price()),
-    ];
-
-    println!(
-        "Generated greedy sequences for task {:?}: top by coinbase profit: {:?}, top by mev_gas_price: {:?}",
-        task.group.id,
-        vector[0]
-            .iter()
-            .take(5)
-            .map(|&i| task.group.orders[i].order.id())
-            .collect::<Vec<_>>(),
-        vector[1]
-            .iter()
-            .take(5)
-            .map(|&i| task.group.orders[i].order.id())
-            .collect::<Vec<_>>(),
-    );
-
-    vector
+    ]
 }
 
+// fn generate_length_based_sequence(task: &ConflictTask) -> Vec<Vec<usize>> {
+//     let order_group = &task.group;
+//     let allowed = allowed_indices_after_nonce_dedup(order_group, GreedyKey::Profit, false);
+
+//     let mut order_data: Vec<(usize, usize, U256)> = order_group
+//         .orders
+//         .iter()
+//         .enumerate()
+//         .filter(|(idx, _)| allowed.as_ref().map_or(true, |set| set.contains(idx)))
+//         .map(|(idx, order)| (idx, order.order.list_txs().len(), order.sim_value.full_profit_info().coinbase_profit()))
+//         .collect();
+
+//     order_data.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| b.2.cmp(&a.2)));
+//     let seq: Vec<usize> = order_data.into_iter().map(|(idx, _, _)| idx).collect();
+//     vec![seq]
+// }
+
 fn generate_length_based_sequence(task: &ConflictTask) -> Vec<Vec<usize>> {
+    let mut sequences_of_orders = vec![];
     let order_group = &task.group;
-    let allowed = allowed_indices_after_nonce_dedup(order_group, GreedyKey::Profit, false);
 
     let mut order_data: Vec<(usize, usize, U256)> = order_group
         .orders
         .iter()
         .enumerate()
-        .filter(|(idx, _)| allowed.as_ref().map_or(true, |set| set.contains(idx)))
-        .map(|(idx, order)| (idx, order.order.list_txs().len(), order.sim_value.full_profit_info().coinbase_profit()))
+        .map(|(idx, order)| {
+            (
+                idx,
+                order.order.list_txs().len(),
+                order.sim_value.full_profit_info().coinbase_profit(),
+            )
+        })
         .collect();
 
+    // Sort by length (descending) and then by profit (descending) as a tie-breaker
     order_data.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| b.2.cmp(&a.2)));
-    let seq: Vec<usize> = order_data.into_iter().map(|(idx, _, _)| idx).collect();
-    vec![seq]
+
+    // Extract the sorted indices
+    let length_based_sequence: Vec<usize> = order_data.into_iter().map(|(idx, _, _)| idx).collect();
+
+    sequences_of_orders.push(length_based_sequence);
+    sequences_of_orders
 }
 
 #[cfg(test)]
@@ -1170,33 +1207,6 @@ mod tests {
 
         create_mock_order_group(42, orders, HashSet::default())
     }
-
-    // Commented out: NonceLayout no longer exists
-    // /// Assert sequence is a valid interleaving:
-    // /// - length == total_slots
-    // /// - uses exactly one candidate per (chain, slot)
-    // /// - per-chain slot order strictly increasing by slot index
-    // fn assert_nonce_valid(seq: &[usize], layout: &NonceLayout) {
-    //     assert_eq!(seq.len(), layout.total_steps, "length mismatch");
-    //
-    //     let _k = layout.chains.len();
-    //     let mut expected_slot: Vec<usize> = layout.chains.iter().map(|_ch| 0usize).collect();
-    //     let mut seen: HashSet<usize> = HashSet::default();
-    //
-    //     for &idx in seq {
-    //         assert!(seen.insert(idx), "duplicate index in sequence");
-    //         let (c, s) = layout.index_of[&idx];
-    //         // Must be the next expected slot for this chain
-    //         assert_eq!(s, expected_slot[c], "slot order broken for chain {}", c);
-    //         // idx must belong to that bucket
-    //         assert!(layout.chains[c].steps[s].candidates.contains(&idx), "idx not in its bucket");
-    //         expected_slot[c] += 1;
-    //     }
-    //
-    //     for (c, exp) in expected_slot.into_iter().enumerate() {
-    //         assert_eq!(exp, layout.chains[c].steps.len(), "did not cover all slots for chain {}", c);
-    //     }
-    // }
 
     #[test]
     fn test_all_permutations() {
