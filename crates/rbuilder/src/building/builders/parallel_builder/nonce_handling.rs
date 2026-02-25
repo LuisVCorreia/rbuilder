@@ -743,6 +743,130 @@ pub fn random_ordering_with_random_choices<R: Rng + ?Sized>(
     dag.sample_random_topo_sort(rng)
 }
 
+
+/// Pick a random valid ordering:
+/// - randomly resolves duplicate-nonce conflicts (one provider per slot),
+/// - respects bundle atomicity (choosing a bundle excludes rivals for all its slots),
+/// - then returns a topo sort of the resulting DAG.
+///
+/// `order_values[oi]` should be a monotone "goodness" score (e.g. profit as f64).
+/// `choice_temperature` controls how greedy the candidate-choice is:
+///   - 0.0 => always pick best eligible candidate for the slot
+///   - 1-3 => biased random
+///   - large => near-uniform among eligible candidates
+///
+/// `topo_temperature` is passed to `sample_weighted_topo_sort` to bias ordering.
+pub fn ordering_with_biased_choices_and_weighted_topo<R: Rng + ?Sized>(
+    deps: &GroupDeps,
+    order_values: &[f64],
+    choice_temperature: f64,
+    topo_temperature: f64,
+    rng: &mut R,
+) -> Vec<usize> {
+    // Resolve slot conflicts with exclusion tracking.
+    let mut taken_slots: AHashSet<NonceKey> = AHashSet::default();
+    let mut excluded: AHashSet<usize> = AHashSet::default();
+
+    // Shuffle conflicts to avoid structural bias.
+    let mut conflicts = deps.conflicting_slots();
+    conflicts.shuffle(rng);
+
+    for (slot, candidates) in &conflicts {
+        if taken_slots.contains(slot) {
+            continue; // already satisfied by an earlier-picked bundle
+        }
+
+        // Eligible = not excluded.
+        let eligible: Vec<usize> = candidates
+            .iter()
+            .copied()
+            .filter(|c| !excluded.contains(c))
+            .collect();
+        if eligible.is_empty() {
+            continue;
+        }
+
+        let chosen = pick_weighted_by_value(&eligible, order_values, choice_temperature, rng);
+
+        // Include chosen: mark all its provided slots as taken, exclude all rivals for those slots.
+        for s in &deps.order_deps[chosen].provides {
+            taken_slots.insert(s.clone());
+
+            if let Some(providers) = deps.slot_providers.get(s) {
+                for &other in providers {
+                    if other != chosen {
+                        excluded.insert(other);
+                    }
+                }
+            }
+        }
+    }
+
+    // Active set = all orders not excluded.
+    let active: AHashSet<usize> = (0..deps.n)
+        .filter(|i| !excluded.contains(i))
+        .collect();
+
+    let dag: DependencyDag = deps.build_dag(&active);
+
+    // If you want ordering also profit-biased, use weighted topo sort.
+    // If you want uniform interleavings, use sample_random_topo_sort instead.
+    dag.sample_weighted_topo_sort(order_values, topo_temperature, rng)
+}
+
+/// Pick one candidate from `eligible`, biased toward higher `order_values`.
+/// Uses rank-softmax so it's scale-insensitive (like your weighted topo sort).
+fn pick_weighted_by_value<R: Rng + ?Sized>(
+    eligible: &[usize],
+    order_values: &[f64],
+    temperature: f64,
+    rng: &mut R,
+) -> usize {
+    if eligible.len() == 1 {
+        return eligible[0];
+    }
+
+    // Greedy if temperature <= 0
+    if temperature <= 0.0 {
+        return *eligible
+            .iter()
+            .max_by(|&&a, &&b| {
+                let va = order_values.get(a).copied().unwrap_or(0.0);
+                let vb = order_values.get(b).copied().unwrap_or(0.0);
+                va.partial_cmp(&vb).unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .unwrap();
+    }
+
+    // Rank eligible by value descending (best rank = 0).
+    let mut ranked: Vec<(usize, f64)> = eligible
+        .iter()
+        .map(|&oi| (oi, order_values.get(oi).copied().unwrap_or(0.0)))
+        .collect();
+    ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    // Softmax over -rank / temperature
+    let weights: Vec<f64> = ranked
+        .iter()
+        .enumerate()
+        .map(|(rank, _)| (-(rank as f64) / temperature).exp())
+        .collect();
+    let sum: f64 = weights.iter().sum();
+
+    if sum <= 0.0 {
+        return eligible[rng.gen_range(0..eligible.len())];
+    }
+
+    let mut r = rng.gen::<f64>() * sum;
+    for (i, &w) in weights.iter().enumerate() {
+        if r <= w {
+            return ranked[i].0;
+        }
+        r -= w;
+    }
+    ranked.last().unwrap().0
+}
+
 // ─── Convenience wrappers (backward-compatible signatures) ──────────────
 
 /// Set of order indices surviving the best-per-slot dedup.
