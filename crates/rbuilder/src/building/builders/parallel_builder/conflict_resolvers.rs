@@ -1,4 +1,4 @@
-use ahash::HashMap;
+use ahash::{HashMap, HashSet};
 use alloy_primitives::{Address, U256};
 use derivative::Derivative;
 use eyre::Result;
@@ -140,6 +140,11 @@ impl ResolverContext {
             }
             _ => {
                 let sequences = generate_sequences_of_orders_to_try(&task);
+
+                // Print up to 5 sequences for debugging
+                for (i, seq) in sequences.iter().take(5).enumerate() {
+                    println!("Sequence {}: {:?}", i, seq);
+                }
                 
                 let results: Vec<ResolutionResult> = sequences
                     .into_par_iter()
@@ -165,23 +170,23 @@ impl ResolverContext {
                 );
                 Ok(best_resolution_result)
 
-            //     let sequence_to_try = generate_sequences_of_orders_to_try(&task);
+                // let sequence_to_try = generate_sequences_of_orders_to_try(&task);
 
-            //     let mut best_resolution_result = ResolutionResult::new(U256::ZERO, 0,  vec![]);
+                // let mut best_resolution_result = ResolutionResult::new(U256::ZERO, 0,  vec![]);
 
-            //     for sequence_of_orders in sequence_to_try {
-            //         let (resolution_result, _state) =
-            //             self.process_sequence_of_orders(sequence_of_orders, &task, self.state.clone(), local_ctx)?;
-            //         self.update_best_result(resolution_result, &mut best_resolution_result);
-            //     }
+                // for sequence_of_orders in sequence_to_try {
+                //     let (resolution_result, _state) =
+                //         self.process_sequence_of_orders(sequence_of_orders, &task, self.state.clone(), local_ctx)?;
+                //     self.update_best_result(resolution_result, &mut best_resolution_result);
+                // }
 
-            //     trace!(
-            //         "Resolved conflict task {:?} with profit: {:?} and algorithm: {:?}",
-            //         task.group.id,
-            //         best_resolution_result.total_profit,
-            //         task.algorithm
-            //     );
-            //     Ok(best_resolution_result)
+                // trace!(
+                //     "Resolved conflict task {:?} with profit: {:?} and algorithm: {:?}",
+                //     task.group.id,
+                //     best_resolution_result.total_profit,
+                //     task.algorithm
+                // );
+                // Ok(best_resolution_result)
             }
         };
         println!("run_conflict_task group={} algo={} orders={} time={:.2?} result={:?}", group_id, algo, order_count, start.elapsed(), result.as_ref().map(|r| r.total_profit));
@@ -566,6 +571,27 @@ impl ResolverContext {
             return Ok(ResolutionResult::default());
         };
 
+        // ─── Problem structure summary ───
+        {
+            let n_orders = deps.n;
+            let n_slots = deps.slot_providers.len();
+            let conflicting = deps.conflicting_slots();
+            let n_conflicting_slots = conflicting.len();
+            let max_candidates_per_slot = conflicting.iter().map(|(_, c)| c.len()).max().unwrap_or(0);
+            let total_candidates: usize = conflicting.iter().map(|(_, c)| c.len()).sum();
+            let has_deps = deps.order_deps.iter().any(|d| !d.requires.is_empty());
+            let orders_with_deps = deps.order_deps.iter().filter(|d| !d.requires.is_empty()).count();
+            let orders_with_multi_provides = deps.order_deps.iter().filter(|d| d.provides.len() > 1).count();
+            println!("GA problem structure:");
+            println!("  orders={}, slots={}, conflicting_slots={}, max_candidates_per_slot={}, total_conflict_candidates={}",
+                n_orders, n_slots, n_conflicting_slots, max_candidates_per_slot, total_candidates);
+            println!("  has_nonce_deps={}, orders_with_deps={}, orders_with_multi_provides (bundles)={}",
+                has_deps, orders_with_deps, orders_with_multi_provides);
+            println!("  params: pop={}, crossover={}, mutation={}, tourn_k={}, max_gens={}, time_ms={}, islands={}, migration_interval={}",
+                params.population, params.crossover_rate, params.mutation_rate, params.tourn_k,
+                params.max_generations, params.time_ms, params.num_islands, params.migration_interval);
+        }
+
         let start = Instant::now();
         let deadline = start + std::time::Duration::from_millis(params.time_ms);
 
@@ -574,11 +600,16 @@ impl ResolverContext {
         let population_per_island = (params.population / num_islands).max(4);
         let total_pop = num_islands * population_per_island;
 
-        let all_seed_seqs = generate_random_permutations_with_nonce(task, params.seed, total_pop);
-        let all_seed_inds: Vec<Individual> = all_seed_seqs.into_iter()
-            .map(|seq| individual_from_seq(seq, &deps))
+        println!("About to begin...");
+        // --- Seeding: raw permutations (length = all orders), decode each into a valid Individual.
+        let all_seed_raw = seed_initial_population(task, params.seed, total_pop);
+        let all_seed_inds: Vec<Individual> = all_seed_raw
+            .into_iter()
+            .map(|raw| individual_from_raw_seq(raw, &deps))
             .collect();
+        println!("Generated {} seed individuals, starting evaluation...", all_seed_inds.len());
 
+        // --- Evaluate seeds in parallel (eval_individual must use ind.seq (decoded) as before).
         let all_evaluated: Vec<(Individual, ResolutionResult)> = all_seed_inds
             .into_par_iter()
             .map_init(
@@ -616,6 +647,8 @@ impl ResolverContext {
             total_pop, start.elapsed(), best_result.total_profit,
         );
 
+        print_population_stats("initial", &islands, &deps);
+
         let mut generation = 0usize;
         let mut gens_without_improvement = 0usize;
         const EARLY_STOPPING_LIMIT: usize = 10;
@@ -630,15 +663,13 @@ impl ResolverContext {
 
             let profit_before = best_result.total_profit;
 
-            // Phase 1: Generate all children
+            // Phase 1: Generate all children (now uses simplified operators on raw_seq).
             let t_phase1 = Instant::now();
             let mut all_children: Vec<PendingChild> = Vec::new();
             let mut all_pair_infos: Vec<(usize, Vec<ParentPairInfo>)> = Vec::new();
 
             for (island_idx, island) in islands.iter_mut().enumerate() {
-                let (children, pair_infos) = generate_dc_children(
-                    island, island_idx, &params, &deps,
-                );
+                let (children, pair_infos) = generate_dc_children(island, island_idx, &params, &deps);
                 all_children.extend(children);
                 all_pair_infos.push((island_idx, pair_infos));
             }
@@ -664,22 +695,84 @@ impl ResolverContext {
             let phase2_dur = t_phase2.elapsed();
 
             // Track best from children + scatter to per-island arrays
-            let mut island_children: Vec<Vec<Option<Individual>>> = all_pair_infos.iter()
+            let mut island_children: Vec<Vec<Option<Individual>>> = all_pair_infos
+                .iter()
                 .map(|(_, infos)| vec![None; infos.len() * 2])
                 .collect();
 
+            // ─── Child evaluation diagnostics ───
+            let mut child_profits: Vec<U256> = Vec::new();
+            let mut child_better_count = 0usize;
+            let mut child_worse_count = 0usize;
+            let mut child_equal_count = 0usize;
+            let mut child_zero_profit = 0usize;
+            let mut eval_fail_count = 0usize;
+
             for (island_idx, pair_idx, child_slot, eval_opt) in eval_results {
-                let island_pos = all_pair_infos.iter().position(|(idx, _)| *idx == island_idx).unwrap();
+                let island_pos = all_pair_infos
+                    .iter()
+                    .position(|(idx, _)| *idx == island_idx)
+                    .unwrap();
+
                 if let Some((ind, res)) = eval_opt {
+                    // Compare child to its corresponding parent
+                    let parent_idx = if child_slot == 0 {
+                        all_pair_infos[island_pos].1[pair_idx].p1_idx
+                    } else {
+                        all_pair_infos[island_pos].1[pair_idx].p2_idx
+                    };
+                    let parent_profit = islands[island_idx].population[parent_idx].profit;
+
+                    if res.total_profit > parent_profit {
+                        child_better_count += 1;
+                    } else if res.total_profit < parent_profit {
+                        child_worse_count += 1;
+                    } else {
+                        child_equal_count += 1;
+                    }
+                    if res.total_profit == U256::ZERO {
+                        child_zero_profit += 1;
+                    }
+                    child_profits.push(res.total_profit);
+
                     if res.total_profit > best_result.total_profit {
                         best_individual = Some(ind.clone());
                         best_result = res;
                     }
                     island_children[island_pos][pair_idx * 2 + child_slot] = Some(ind);
+                } else {
+                    eval_fail_count += 1;
                 }
             }
 
-            // Phase 3: DC competition per island
+            // Print child diagnostics
+            {
+                child_profits.sort();
+                let cn = child_profits.len();
+                let child_min = if cn > 0 { child_profits[0] } else { U256::ZERO };
+                let child_max = if cn > 0 { child_profits[cn - 1] } else { U256::ZERO };
+                let child_median = if cn > 0 { child_profits[cn / 2] } else { U256::ZERO };
+                println!(
+                    "  gen {} children: evaluated={}, failed={}, zero_profit={}",
+                    generation, cn, eval_fail_count, child_zero_profit,
+                );
+                println!(
+                    "  gen {} children vs parents: better={}, equal={}, worse={}",
+                    generation, child_better_count, child_equal_count, child_worse_count,
+                );
+                println!(
+                    "  gen {} child profit: min={:?} median={:?} max={:?}",
+                    generation, child_min, child_median, child_max,
+                );
+            }
+
+            // ─── Snapshot parent profits before DC to measure competition outcomes ───
+            let pre_dc_profits: Vec<Vec<U256>> = islands
+                .iter()
+                .map(|isl| isl.population.iter().map(|ind| ind.profit).collect())
+                .collect();
+
+            // Phase 3: DC competition per island (distance uses decoded seq + choices)
             let t_phase3 = Instant::now();
             for (island_pos, (island_idx, pair_infos)) in all_pair_infos.iter().enumerate() {
                 apply_dc_competition(
@@ -691,20 +784,48 @@ impl ResolverContext {
             }
             let phase3_dur = t_phase3.elapsed();
 
+            // ─── DC competition outcome diagnostics ───
+            {
+                let mut dc_replacements = 0usize;
+                let mut dc_kept = 0usize;
+                for (isl_idx, pre_profits) in pre_dc_profits.iter().enumerate() {
+                    let post_profits: Vec<U256> = islands[isl_idx].population.iter().map(|ind| ind.profit).collect();
+                    for (pre, post) in pre_profits.iter().zip(post_profits.iter()) {
+                        if pre != post {
+                            dc_replacements += 1;
+                        } else {
+                            dc_kept += 1;
+                        }
+                    }
+                }
+                println!(
+                    "  gen {} DC competition: replaced={}, kept={} ({:.1}% replacement rate)",
+                    generation, dc_replacements, dc_kept,
+                    if dc_replacements + dc_kept > 0 { 100.0 * dc_replacements as f64 / (dc_replacements + dc_kept) as f64 } else { 0.0 },
+                );
+            }
+
+            // Migration
             let t_migration = Instant::now();
             if generation > 0 && generation % migration_interval == 0 {
-                let migrants: Vec<Individual> = islands.iter_mut().map(|island| {
-                    let mut sorted_indices: Vec<usize> = (0..island.population.len()).collect();
-                    sorted_indices.sort_by(|&a, &b| island.population[b].profit.cmp(&island.population[a].profit));
-                    let top_k = sorted_indices.len().min(3);
-                    let pick = island.rng.gen_range(0..top_k);
-                    island.population[sorted_indices[pick]].clone()
-                }).collect();
+                let migrants: Vec<Individual> = islands
+                    .iter_mut()
+                    .map(|island| {
+                        let mut sorted_indices: Vec<usize> = (0..island.population.len()).collect();
+                        sorted_indices.sort_by(|&a, &b| island.population[b].profit.cmp(&island.population[a].profit));
+                        let top_k = sorted_indices.len().min(3);
+                        let pick = island.rng.gen_range(0..top_k);
+                        island.population[sorted_indices[pick]].clone()
+                    })
+                    .collect();
 
                 for i in 0..num_islands {
                     let source = (i + num_islands - 1) % num_islands;
                     let migrant = migrants[source].clone();
-                    if let Some(worst_idx) = islands[i].population.iter().enumerate()
+                    if let Some(worst_idx) = islands[i]
+                        .population
+                        .iter()
+                        .enumerate()
                         .min_by_key(|(_, ind)| ind.profit)
                         .map(|(idx, _)| idx)
                     {
@@ -714,16 +835,24 @@ impl ResolverContext {
                     }
                 }
             }
-
             let migration_dur = t_migration.elapsed();
 
             let improved = best_result.total_profit > profit_before;
             println!(
                 "GA gen {}: {} children, best = {:?}{}  (gen={:.2?} eval={:.2?} dc={:.2?} mig={:.2?} total={:.2?})",
-                generation, num_children, best_result.total_profit,
+                generation,
+                num_children,
+                best_result.total_profit,
                 if improved { " [NEW]" } else { "" },
-                phase1_dur, phase2_dur, phase3_dur, migration_dur, start.elapsed(),
+                phase1_dur,
+                phase2_dur,
+                phase3_dur,
+                migration_dur,
+                start.elapsed(),
             );
+
+            // Print full population diversity every 5 generations (and gen 0)
+            print_population_stats(&format!("gen {}", generation), &islands, &deps);
 
             if improved {
                 gens_without_improvement = 0;
@@ -738,6 +867,7 @@ impl ResolverContext {
                 );
                 break;
             }
+
             generation += 1;
         }
 
@@ -750,6 +880,123 @@ impl ResolverContext {
     }
 }
 
+/// Print diversity and fitness statistics for a population across all islands.
+fn print_population_stats(
+    label: &str,
+    islands: &[Island],
+    deps: &GroupDeps,
+) {
+    let all_inds: Vec<&Individual> = islands.iter().flat_map(|isl| isl.population.iter()).collect();
+    let n = all_inds.len();
+    if n == 0 {
+        println!("  [{}] empty population", label);
+        return;
+    }
+
+    // Profit stats
+    let mut profits: Vec<U256> = all_inds.iter().map(|ind| ind.profit).collect();
+    profits.sort();
+    let min_profit = profits[0];
+    let max_profit = profits[n - 1];
+    let median_profit = profits[n / 2];
+    let unique_profits = profits.iter().collect::<ahash::HashSet<_>>().len();
+    let zero_profit_count = profits.iter().filter(|&&p| p == U256::ZERO).count();
+
+    // Gas stats
+    let mut gas_vals: Vec<u64> = all_inds.iter().map(|ind| ind.gas).collect();
+    gas_vals.sort();
+    let min_gas = gas_vals[0];
+    let max_gas = gas_vals[n - 1];
+    let median_gas = gas_vals[n / 2];
+
+    // Seq length stats
+    let mut seq_lens: Vec<usize> = all_inds.iter().map(|ind| ind.seq.len()).collect();
+    seq_lens.sort();
+    let min_seq = seq_lens[0];
+    let max_seq = seq_lens[n - 1];
+    let avg_seq = seq_lens.iter().sum::<usize>() as f64 / n as f64;
+
+    // Active set size stats
+    let mut active_sizes: Vec<usize> = all_inds.iter().map(|ind| ind.active.len()).collect();
+    active_sizes.sort();
+    let min_active = active_sizes[0];
+    let max_active = active_sizes[n - 1];
+
+    // Choice diversity: how many unique choice sets
+    let unique_choices = all_inds
+        .iter()
+        .map(|ind| {
+            let mut pairs: Vec<_> = ind.choices.iter().map(|(k, v)| (k.clone(), *v)).collect();
+            pairs.sort_by(|a, b| a.0.address.cmp(&b.0.address).then(a.0.nonce.cmp(&b.0.nonce)));
+            pairs
+        })
+        .collect::<ahash::HashSet<_>>()
+        .len();
+
+    // Pairwise DC distance (sample up to 50 pairs to keep it fast)
+    let sample_size = 50.min(n * (n - 1) / 2);
+    let mut dist_sum = 0.0f64;
+    let mut dist_count = 0usize;
+    let mut dist_min = f64::MAX;
+    let mut dist_max = 0.0f64;
+    if n > 1 {
+        let step = ((n * (n - 1) / 2) as f64 / sample_size as f64).ceil() as usize;
+        let mut pair_idx = 0usize;
+        'outer: for i in 0..n {
+            for j in (i + 1)..n {
+                if pair_idx % step.max(1) == 0 {
+                    let d = dc_distance(all_inds[i], all_inds[j], deps);
+                    dist_sum += d;
+                    dist_count += 1;
+                    if d < dist_min { dist_min = d; }
+                    if d > dist_max { dist_max = d; }
+                }
+                pair_idx += 1;
+                if dist_count >= sample_size { break 'outer; }
+            }
+        }
+    }
+    let avg_dist = if dist_count > 0 { dist_sum / dist_count as f64 } else { 0.0 };
+
+    // Unique raw_seq (full genome identity)
+    let unique_genomes = all_inds
+        .iter()
+        .map(|ind| ind.raw_seq.clone())
+        .collect::<ahash::HashSet<_>>()
+        .len();
+
+    // Per-island best
+    let island_bests: Vec<String> = islands
+        .iter()
+        .enumerate()
+        .map(|(i, isl)| {
+            let best = isl.population.iter().map(|ind| ind.profit).max().unwrap_or(U256::ZERO);
+            format!("isl{}={:?}", i, best)
+        })
+        .collect();
+
+    println!(
+        "  [{}] pop={}, unique_genomes={}, unique_profits={}, zero_profit={}",
+        label, n, unique_genomes, unique_profits, zero_profit_count,
+    );
+    println!(
+        "  [{}] profit: min={:?} median={:?} max={:?}",
+        label, min_profit, median_profit, max_profit,
+    );
+    println!(
+        "  [{}] gas: min={} median={} max={}",
+        label, min_gas, median_gas, max_gas,
+    );
+    println!(
+        "  [{}] seq_len: min={} avg={:.1} max={}, active: min={} max={}",
+        label, min_seq, avg_seq, max_seq, min_active, max_active,
+    );
+    println!(
+        "  [{}] unique_choices={}, dc_dist: avg={:.4} min={:.4} max={:.4} (sampled {} pairs)",
+        label, unique_choices, avg_dist, dist_min, dist_max, dist_count,
+    );
+    println!("  [{}] island_bests: {}", label, island_bests.join(", "));
+}
 
 /// Generates different sequences of orders to try based on the conflict task command.
 ///
@@ -940,30 +1187,55 @@ fn generate_all_permutations(task: &ConflictTask) -> Vec<Vec<usize>> {
 ///
 /// A vector of static sequences of order indices, sorted by coinbase profit and mev_gas_price.
 fn generate_greedy_sequence(task: &ConflictTask, reverse: bool) -> Vec<Vec<usize>> {
-    let order_group = &task.group;
-    let allowed = allowed_indices_after_nonce_dedup(
-        order_group,
-        if reverse { GreedyKey::MevGasPrice } else { GreedyKey::Profit },
-        reverse,
-    );
+    let g = &task.group;
 
-    let create_sequence = |value_extractor: fn(&SimulatedOrder) -> U256| -> Vec<usize> {
-        let mut ids_and_value: Vec<_> = order_group.orders.iter().enumerate()
-            .filter(|(idx, _)| allowed.as_ref().map_or(true, |set| set.contains(idx)))
-            .map(|(idx, order)| (idx, value_extractor(order)))
+    let allowed_profit =
+        allowed_indices_after_nonce_dedup(g, GreedyKey::Profit, reverse);
+    let allowed_mgp =
+        allowed_indices_after_nonce_dedup(g, GreedyKey::MevGasPrice, reverse);
+
+    let build = |allowed: &Option<AHashSet<usize>>,
+                 value_extractor: fn(&SimulatedOrder) -> U256| -> Vec<usize> {
+        let mut v: Vec<_> = g.orders.iter().enumerate()
+            .filter(|(idx, _)| allowed.as_ref().map_or(true, |s| s.contains(idx)))
+            .map(|(idx, o)| (idx, value_extractor(o)))
             .collect();
 
-        ids_and_value.sort_by(|a, b| {
-            if reverse { a.1.cmp(&b.1) } else { b.1.cmp(&a.1) }
-        });
-        ids_and_value.into_iter().map(|(idx, _)| idx).collect()
+        v.sort_by(|a, b| if reverse { a.1.cmp(&b.1) } else { b.1.cmp(&a.1) });
+        v.into_iter().map(|(idx, _)| idx).collect()
     };
 
     vec![
-        create_sequence(|sim_order| sim_order.sim_value.full_profit_info().coinbase_profit()),
-        create_sequence(|sim_order| sim_order.sim_value.full_profit_info().mev_gas_price()),
+        build(&allowed_profit, |o| o.sim_value.full_profit_info().coinbase_profit()),
+        build(&allowed_mgp, |o| o.sim_value.full_profit_info().mev_gas_price()),
     ]
 }
+// fn generate_greedy_sequence(task: &ConflictTask, reverse: bool) -> Vec<Vec<usize>> {
+//     let order_group = &task.group;
+
+//     let create_sequence = |value_extractor: fn(&SimulatedOrder) -> U256| {
+//         let mut ids_and_value: Vec<_> = order_group
+//             .orders
+//             .iter()
+//             .enumerate()
+//             .map(|(idx, order)| (idx, value_extractor(order)))
+//             .collect();
+
+//         ids_and_value.sort_by(|a, b| {
+//             if reverse {
+//                 a.1.cmp(&b.1)
+//             } else {
+//                 b.1.cmp(&a.1)
+//             }
+//         });
+//         ids_and_value.into_iter().map(|(idx, _)| idx).collect()
+//     };
+
+//     vec![
+//         create_sequence(|sim_order| sim_order.sim_value.full_profit_info().coinbase_profit()),
+//         create_sequence(|sim_order| sim_order.sim_value.full_profit_info().mev_gas_price()),
+//     ]
+// }
 
 // fn generate_length_based_sequence(task: &ConflictTask) -> Vec<Vec<usize>> {
 //     let order_group = &task.group;
@@ -1007,6 +1279,12 @@ fn generate_length_based_sequence(task: &ConflictTask) -> Vec<Vec<usize>> {
 
     sequences_of_orders.push(length_based_sequence);
     sequences_of_orders
+}
+
+fn seed_initial_population(task: &ConflictTask, seed: u64, total_pop: usize) -> Vec<Vec<usize>> {
+    let mut seeds = generate_greedy_sequence(task, false);
+    seeds.extend(generate_random_permutations(task, seed, total_pop - seeds.len()));
+    seeds
 }
 
 #[cfg(test)]

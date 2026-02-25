@@ -176,9 +176,6 @@ impl GroupDeps {
     /// Greedy dedup: iterate orders by value and greedily include each order
     /// whose provided slots are all still free.  Returns the set of active
     /// (selected) order indices.
-    ///
-    /// For single-tx orders this is equivalent to the old per-step best pick.
-    /// For bundles it correctly treats the bundle as atomic (all-or-nothing).
     pub fn dedup_best(
         &self,
         group: &ConflictGroup,
