@@ -4,33 +4,12 @@ use rand::rngs::SmallRng;
 use rand::seq::SliceRandom;
 use rand::Rng;
 
-use super::nonce_handling::{DependencyDag, GroupDeps, GreedyKey};
-use crate::building::sim::NonceKey;
-
-// ─── Individual representation ──────────────────────────────────────────
-
-/// Maps each conflicting slot to the chosen candidate order index.
-/// Non-conflicting slots (single provider) don't need entries here — they're
-/// always included.
-pub type CandidateChoices = HashMap<NonceKey, usize>;
-
+use super::nonce_handling::DependencyDag;
 #[derive(Clone)]
 pub struct Individual {
-    /// Raw GA genome: permutation of ALL orders (0..deps.n).
-    /// Used for crossover + mutation.
-    pub raw_seq: Vec<usize>,
-
-    /// Decoded, valid execution order (conflict-free + topo-valid) derived from raw_seq.
-    /// Used for fitness eval + distance.
+    /// A valid topological sort of the shared DAG. Contains original order indices.
     pub seq: Vec<usize>,
-
-    /// Active set of orders included by decoding (subset of 0..deps.n).
-    pub active: AHashSet<usize>,
-
-    /// For each conflicting slot, which candidate was chosen (derived from decoded seq).
-    pub choices: CandidateChoices,
-
-    /// Fitness values (filled after evaluation).
+    /// Fitness values (filled after evaluation)
     pub profit: U256,
     pub gas: u64,
 }
@@ -40,7 +19,6 @@ pub struct GAParams {
     pub population: usize,
     pub crossover_rate: f64,
     pub mutation_rate: f64,
-    pub tourn_k: usize,
     pub max_generations: usize,
     pub time_ms: u64,
     pub seed: u64,
@@ -57,243 +35,23 @@ pub fn dominates(a: &Individual, b: &Individual) -> bool {
     a.profit > b.profit || (a.profit == b.profit && a.gas < b.gas)
 }
 
-// ─── Choice resolution helpers ──────────────────────────────────────────
-
-/// Given candidate choices, compute the full active set.
-/// This includes all non-conflicting orders plus chosen candidates,
-/// minus anything excluded by the chosen candidates' slot claims.
-pub fn active_set_from_choices(
-    deps: &GroupDeps,
-    choices: &CandidateChoices,
-) -> AHashSet<usize> {
-    // Start with all orders.
-    let mut excluded: AHashSet<usize> = AHashSet::default();
-
-    // For each conflicting slot, exclude non-chosen candidates.
-    for (slot, providers) in &deps.slot_providers {
-        if providers.len() <= 1 {
-            continue;
-        }
-        if let Some(&chosen) = choices.get(slot) {
-            for &other in providers {
-                if other != chosen {
-                    excluded.insert(other);
-                }
-            }
-        }
-    }
-
-    // Also handle bundle atomicity: if a chosen candidate provides multiple
-    // slots, all rival providers for ALL those slots must be excluded.
-    // (This is already handled above if choices is consistent, but let's
-    // be defensive.)
-    let chosen_orders: AHashSet<usize> = choices.values().copied().collect();
-    for &chosen_idx in &chosen_orders {
-        for slot in &deps.order_deps[chosen_idx].provides {
-            if let Some(providers) = deps.slot_providers.get(slot) {
-                for &other in providers {
-                    if other != chosen_idx {
-                        excluded.insert(other);
-                    }
-                }
-            }
-        }
-    }
-
-    (0..deps.n).filter(|i| !excluded.contains(i)).collect()
-}
-
-pub fn choices_from_decoded_seq(seq: &[usize], deps: &GroupDeps) -> CandidateChoices {
-    let mut choices = CandidateChoices::default();
-
-    for &oi in seq {
-        for slot in &deps.order_deps[oi].provides {
-            if deps
-                .slot_providers
-                .get(slot)
-                .map_or(false, |p| p.len() > 1)
-            {
-                // First provider encountered in execution order wins.
-                choices.entry(slot.clone()).or_insert(oi);
-            }
-        }
-    }
-
-    choices
-}
-
-/// Decode a raw permutation into a valid schedule:
-/// 1) Greedy "packing" pass: include an order iff none of its provided slots are already taken.
-///    - This resolves duplicate nonces and enforces bundle atomicity naturally.
-/// 2) Build DAG over included orders.
-/// 3) Repair topo sort biased by the packed order (preserve raw priorities where possible).
-pub fn decode_raw_sequence(raw: &[usize], deps: &GroupDeps) -> (AHashSet<usize>, Vec<usize>, CandidateChoices) {
-    let mut taken: AHashSet<NonceKey> = AHashSet::default();
-    let mut packed: Vec<usize> = Vec::new();
-
-    for &oi in raw {
-        let provides = &deps.order_deps[oi].provides;
-
-        // If any slot already taken, we cannot include this order.
-        if provides.iter().any(|s| taken.contains(s)) {
-            continue;
-        }
-
-        // Include it; claim all its slots.
-        for s in provides {
-            taken.insert(s.clone());
-        }
-        packed.push(oi);
-    }
-
-    let active: AHashSet<usize> = packed.iter().copied().collect();
-    if active.is_empty() {
-        return (active, Vec::new(), CandidateChoices::default());
-    }
-
-    let dag = deps.build_dag(&active);
-    let decoded = repair_topo_sort(&packed, &dag);
-    let choices = choices_from_decoded_seq(&decoded, deps);
-
-    (active, decoded, choices)
-}
-
-pub fn individual_from_raw_seq(raw_seq: Vec<usize>, deps: &GroupDeps) -> Individual {
-    let (active, seq, choices) = decode_raw_sequence(&raw_seq, deps);
-
+pub fn individual_from_seq(seq: Vec<usize>) -> Individual {
     Individual {
-        raw_seq,
         seq,
-        active,
-        choices,
         profit: U256::ZERO,
         gas: 0,
     }
 }
 
-pub fn crossover_simple_ox(
-    parent_a: &Individual,
-    parent_b: &Individual,
-    deps: &GroupDeps,
-    rng: &mut SmallRng,
-) -> Individual {
-    let n = deps.n;
-    debug_assert_eq!(parent_a.raw_seq.len(), n);
-    debug_assert_eq!(parent_b.raw_seq.len(), n);
-
-    if n <= 1 {
-        return individual_from_raw_seq(parent_a.raw_seq.clone(), deps);
-    }
-
-    let lo = rng.gen_range(0..n);
-    let hi = rng.gen_range(lo..=n);
-
-    // Core segment from A
-    let mut child = vec![usize::MAX; n];
-    let mut in_child: AHashSet<usize> = AHashSet::default();
-
-    for i in lo..hi {
-        let g = parent_a.raw_seq[i];
-        child[i] = g;
-        in_child.insert(g);
-    }
-
-    // Fill remaining positions in order from B, skipping already present genes.
-    let mut write = hi % n;
-    for &g in &parent_b.raw_seq {
-        if in_child.contains(&g) {
-            continue;
-        }
-        // Find next empty slot
-        while child[write] != usize::MAX {
-            write = (write + 1) % n;
-        }
-        child[write] = g;
-        write = (write + 1) % n;
-    }
-
-    // Decode
-    individual_from_raw_seq(child, deps)
-}
-
-pub fn mutate_simple_swap(
-    ind: &mut Individual,
-    deps: &GroupDeps,
-    rng: &mut SmallRng,
-    mutation_rate: f64,
-) {
-    let n = deps.n;
-    if n <= 1 {
-        return;
-    }
-
-    // Number of swaps ~ mutation_rate * n (at least 1 sometimes).
-    let expected = mutation_rate * (n as f64);
-    let num_swaps = if expected < 1.0 {
-        if rng.gen::<f64>() < expected { 1 } else { 0 }
-    } else {
-        expected.round() as usize
-    };
-
-    for _ in 0..num_swaps {
-        let i = rng.gen_range(0..n);
-        let j = rng.gen_range(0..n);
-        ind.raw_seq.swap(i, j);
-    }
-
-    // Re-decode after mutation
-    let (active, seq, choices) = decode_raw_sequence(&ind.raw_seq, deps);
-    ind.active = active;
-    ind.seq = seq;
-    ind.choices = choices;
-}
-
-// /// Build a valid Individual from just a set of candidate choices.
-// /// Constructs the DAG and produces a random topo sort.
-// pub fn individual_from_choices(
-//     choices: CandidateChoices,
-//     deps: &GroupDeps,
-//     rng: &mut SmallRng,
-// ) -> Individual {
-//     let active = active_set_from_choices(deps, &choices);
-//     let dag = deps.build_dag(&active);
-//     let seq = dag.sample_random_topo_sort(rng);
-
-//     Individual {
-//         choices,
-//         active,
-//         seq,
-//         profit: U256::ZERO,
-//         gas: 0,
-//     }
-// }
-
-// /// Build a valid Individual from a sequence (extracts choices from it).
-// pub fn individual_from_seq(seq: Vec<usize>, deps: &GroupDeps) -> Individual {
-//     let choices = choices_from_seq(&seq, deps);
-//     let active = active_set_from_choices(deps, &choices);
-
-//     Individual {
-//         choices,
-//         active,
-//         seq,
-//         profit: U256::ZERO,
-//         gas: 0,
-//     }
-// }
-
-/// Validate that an individual's sequence is a valid topo sort of its DAG.
-/// Used in debug/test builds.
+/// Validate that an individual's sequence is a valid topo sort of the DAG.
 #[cfg(debug_assertions)]
-pub fn validate_individual(ind: &Individual, deps: &GroupDeps) -> bool {
-    // Check seq contains exactly the active set.
+pub fn validate_individual(ind: &Individual, dag: &DependencyDag) -> bool {
     let seq_set: AHashSet<usize> = ind.seq.iter().copied().collect();
-    if seq_set != ind.active {
+    let dag_set: AHashSet<usize> = dag.nodes.iter().copied().collect();
+    if seq_set != dag_set {
         return false;
     }
 
-    // Check it's a valid topo sort.
-    let dag = deps.build_dag(&ind.active);
     let pos: HashMap<usize, usize> = ind.seq.iter().enumerate()
         .map(|(p, &oi)| (oi, p)).collect();
 
@@ -307,21 +65,8 @@ pub fn validate_individual(ind: &Individual, deps: &GroupDeps) -> bool {
         }
     }
 
-    // Check no two orders in seq compete for the same slot.
-    for (slot, providers) in &deps.slot_providers {
-        if providers.len() <= 1 {
-            continue;
-        }
-        let count = providers.iter().filter(|idx| seq_set.contains(idx)).count();
-        if count > 1 {
-            return false;
-        }
-    }
-
     true
 }
-
-// ─── ReadyTracker (reused from before, but now always on a correctly-built DAG) ─
 
 struct ReadyTracker<'a> {
     dag: &'a DependencyDag,
@@ -346,15 +91,6 @@ impl<'a> ReadyTracker<'a> {
         !self.placed[ni] && self.in_deg[ni] == 0
     }
 
-    #[inline]
-    fn is_ready_order(&self, oi: usize) -> bool {
-        if let Some(&ni) = self.dag.node_of.get(&oi) {
-            self.is_ready_node(ni)
-        } else {
-            false
-        }
-    }
-
     fn ready_orders(&self) -> Vec<usize> {
         (0..self.n)
             .filter(|&ni| self.is_ready_node(ni))
@@ -370,226 +106,66 @@ impl<'a> ReadyTracker<'a> {
             self.in_deg[succ] -= 1;
         }
     }
+}
 
-    #[inline]
-    fn is_placed_order(&self, oi: usize) -> bool {
-        if let Some(&ni) = self.dag.node_of.get(&oi) {
-            self.placed[ni]
-        } else {
-            true // not in DAG, treat as already placed
-        }
+// Two-point Order Crossover (OX):
+//   1. Copy a random contiguous slice from parent A.
+//   2. Fill remaining positions with orders from parent B (preserving B's
+//      relative order), skipping any already in the slice.
+//   3. Repair the result into a valid topological sort.
+//
+// All individuals share the same active set and DAG, so no candidate-level
+// merging is needed.
+
+pub fn crossover(
+    parent_a: &Individual,
+    parent_b: &Individual,
+    dag: &DependencyDag,
+    rng: &mut SmallRng,
+) -> Individual {
+    let n = parent_a.seq.len();
+    if n <= 1 {
+        return Individual {
+            seq: parent_a.seq.clone(),
+            profit: U256::ZERO,
+            gas: 0,
+        };
+    }
+
+    // Pick two crossover points
+    let lo = rng.gen_range(0..n);
+    let hi = rng.gen_range(lo..=n);
+
+    // Core segment from parent A
+    let core: Vec<usize> = parent_a.seq[lo..hi].to_vec();
+    let core_set: AHashSet<usize> = core.iter().copied().collect();
+
+    // Remainder from parent B, preserving B's relative order
+    let remainder: Vec<usize> = parent_b.seq.iter().copied()
+        .filter(|oi| !core_set.contains(oi))
+        .collect();
+
+    let split = lo.min(remainder.len());
+    let mut proposed = Vec::with_capacity(n);
+    proposed.extend_from_slice(&remainder[..split]);
+    proposed.extend_from_slice(&core);
+    proposed.extend_from_slice(&remainder[split..]);
+
+    // Repair to a valid topological sort
+    let seq = repair_topo_sort(&proposed, dag);
+
+    Individual {
+        seq,
+        profit: U256::ZERO,
+        gas: 0,
     }
 }
 
-// // ─── Crossover ──────────────────────────────────────────────────────────
-// //
-// // The crossover works in two phases:
-// //   Phase 1: Merge candidate choices from both parents (nonce conflict resolution).
-// //   Phase 2: Two-point Order Crossover (OX) on the ordering, repaired to be
-// //            a valid topological sort.
-
-// /// Main crossover operator.
-// ///
-// /// 1. Merge candidate choices (randomly pick from parent A or B for each slot).
-// /// 2. Build the child's active set and DAG from the merged choices.
-// /// 3. Apply two-point OX on both parents' filtered orderings, then repair the
-// ///    result into a valid topological sort (using repair_topo_sort).
-// pub fn crossover(
-//     parent_a: &Individual,
-//     parent_b: &Individual,
-//     deps: &GroupDeps,
-//     rng: &mut SmallRng,
-// ) -> Individual {
-//     // Phase 1: Merge candidate choices.
-//     let choices = merge_choices(
-//         &parent_a.choices,
-//         &parent_b.choices,
-//         deps,
-//         rng,
-//     );
-
-//     let active = active_set_from_choices(deps, &choices);
-//     let dag = deps.build_dag(&active);
-
-//     if dag.is_empty() {
-//         return Individual {
-//             choices,
-//             active,
-//             seq: Vec::new(),
-//             profit: U256::ZERO,
-//             gas: 0,
-//         };
-//     }
-
-//     // Phase 2: Two-point Order Crossover (OX) on filtered sequences.
-//     //
-//     // Filter both parents' sequences to only the orders in the child's active set.
-//     // Every child-active order appears in at least one parent's filtered sequence
-//     // (since each choice came from either parent A or parent B).
-//     let pa: Vec<usize> = parent_a.seq.iter().copied()
-//         .filter(|oi| active.contains(oi))
-//         .collect();
-//     let pb: Vec<usize> = parent_b.seq.iter().copied()
-//         .filter(|oi| active.contains(oi))
-//         .collect();
-
-//     let n = active.len();
-//     let seq = if n == 0 || pa.is_empty() {
-//         // Parent A contributed no ordering info — use parent B's ordering.
-//         if pb.is_empty() {
-//             dag.sample_random_topo_sort(rng)
-//         } else {
-//             repair_topo_sort(&pb, &dag)
-//         }
-//     } else {
-//         // Pick two crossover points within parent A's filtered sequence.
-//         let lo = rng.gen_range(0..pa.len());
-//         let hi = rng.gen_range(lo..=pa.len());
-
-//         // Core: the segment [lo, hi) from parent A.
-//         let core: Vec<usize> = pa[lo..hi].to_vec();
-//         let core_set: AHashSet<usize> = core.iter().copied().collect();
-
-//         // Remainder: orders not in core, taken from parent B first (in B's order),
-//         // then any active orders not covered by either (from parent A, in A's order).
-//         let mut remainder: Vec<usize> = Vec::with_capacity(n.saturating_sub(core.len()));
-//         let mut covered: AHashSet<usize> = core_set.clone();
-
-//         for &oi in &pb {
-//             if !core_set.contains(&oi) {
-//                 remainder.push(oi);
-//                 covered.insert(oi);
-//             }
-//         }
-//         for &oi in &pa {
-//             if !covered.contains(&oi) {
-//                 remainder.push(oi);
-//             }
-//         }
-
-//         // Classic OX layout: remainder[..lo] | core | remainder[lo..]
-//         let split = lo.min(remainder.len());
-//         let mut proposed = Vec::with_capacity(n);
-//         proposed.extend_from_slice(&remainder[..split]);
-//         proposed.extend_from_slice(&core);
-//         proposed.extend_from_slice(&remainder[split..]);
-
-//         // Repair to a valid topological sort while preserving proposed order.
-//         repair_topo_sort(&proposed, &dag)
-//     };
-
-//     Individual {
-//         choices,
-//         active,
-//         seq,
-//         profit: U256::ZERO,
-//         gas: 0,
-//     }
-// }
-
-// /// Merge candidate choices from two parents.
-// ///
-// /// For each conflicting slot:
-// /// - If both parents chose the same candidate, keep it.
-// /// - If they differ, randomly pick one (50/50).
-// /// - If only one parent has a choice (the other excluded it), use that one.
-// ///
-// /// After initial merge, we need to fix inconsistencies from bundle atomicity:
-// /// if choosing candidate X for slot S forces candidate X for slot T (because X
-// /// is a bundle providing both S and T), we must respect that.
-// fn merge_choices(
-//     choices_a: &CandidateChoices,
-//     choices_b: &CandidateChoices,
-//     deps: &GroupDeps,
-//     rng: &mut SmallRng,
-// ) -> CandidateChoices {
-//     let mut merged = CandidateChoices::default();
-
-//     // Collect all conflicting slots.
-//     let all_slots: AHashSet<NonceKey> = deps.slot_providers.iter()
-//         .filter(|(_, providers)| providers.len() > 1)
-//         .map(|(slot, _)| slot.clone())
-//         .collect();
-
-//     // Slots already decided (by bundle atomicity propagation).
-//     let mut decided_slots: AHashSet<NonceKey> = AHashSet::default();
-//     // Orders already chosen (to detect conflicts).
-//     let mut chosen_orders: AHashSet<usize> = AHashSet::default();
-//     // Orders excluded by chosen bundles.
-//     let mut excluded_orders: AHashSet<usize> = AHashSet::default();
-
-//     // Process slots in random order to avoid bias.
-//     let mut slot_list: Vec<NonceKey> = all_slots.into_iter().collect();
-//     slot_list.shuffle(rng);
-
-//     for slot in &slot_list {
-//         if decided_slots.contains(slot) {
-//             continue;
-//         }
-
-//         let ca = choices_a.get(slot).copied();
-//         let cb = choices_b.get(slot).copied();
-
-//         // Filter out already-excluded candidates.
-//         let ca = ca.filter(|&c| !excluded_orders.contains(&c));
-//         let cb = cb.filter(|&c| !excluded_orders.contains(&c));
-
-//         let chosen = match (ca, cb) {
-//             (Some(a), Some(b)) if a == b => Some(a),
-//             (Some(a), Some(b)) => {
-//                 // Both valid but different — pick randomly.
-//                 Some(if rng.gen_bool(0.5) { a } else { b })
-//             }
-//             (Some(a), None) => Some(a),
-//             (None, Some(b)) => Some(b),
-//             (None, None) => {
-//                 // Neither parent had a valid choice. Pick from available providers.
-//                 if let Some(providers) = deps.slot_providers.get(slot) {
-//                     let eligible: Vec<usize> = providers.iter()
-//                         .copied()
-//                         .filter(|&p| !excluded_orders.contains(&p))
-//                         .collect();
-//                     eligible.choose(rng).copied()
-//                 } else {
-//                     None
-//                 }
-//             }
-//         };
-
-//         if let Some(chosen_idx) = chosen {
-//             // Record this choice and propagate bundle atomicity.
-//             chosen_orders.insert(chosen_idx);
-
-//             // For every slot this order provides, mark it as decided
-//             // and exclude rival candidates.
-//             for provided_slot in &deps.order_deps[chosen_idx].provides {
-//                 if let Some(providers) = deps.slot_providers.get(provided_slot) {
-//                     if providers.len() > 1 {
-//                         merged.insert(provided_slot.clone(), chosen_idx);
-//                         decided_slots.insert(provided_slot.clone());
-
-//                         for &rival in providers {
-//                             if rival != chosen_idx {
-//                                 excluded_orders.insert(rival);
-//                             }
-//                         }
-//                     }
-//                 }
-//             }
-//         }
-//     }
-
-//     merged
-// }
-
-/// Repair a proposed sequence to produce a valid topological sort of `dag`.
+/// Repair a proposed sequence into a valid topological sort of `dag`.
 ///
 /// At each step, among all "ready" orders (predecessors already placed),
 /// picks the one appearing earliest in `proposed`. This maximises preservation
 /// of the proposed ordering while guaranteeing topological validity.
-///
-/// Orders in the DAG but absent from `proposed` are treated as having the
-/// lowest priority (placed as late as valid constraints allow).
 fn repair_topo_sort(proposed: &[usize], dag: &DependencyDag) -> Vec<usize> {
     let n = dag.len();
     if n == 0 {
@@ -608,7 +184,6 @@ fn repair_topo_sort(proposed: &[usize], dag: &DependencyDag) -> Vec<usize> {
         let ready = tracker.ready_orders();
         debug_assert!(!ready.is_empty(), "No ready orders; DAG has a cycle");
 
-        // Among ready orders, pick the one appearing earliest in proposed.
         let best = *ready.iter()
             .min_by_key(|&&oi| pos.get(&oi).copied().unwrap_or(usize::MAX))
             .unwrap();
@@ -620,21 +195,17 @@ fn repair_topo_sort(proposed: &[usize], dag: &DependencyDag) -> Vec<usize> {
     result
 }
 
-// ─── Mutation operators ─────────────────────────────────────────────────
+// Mutation operators
 
-/// Per-gene mutation that operates at both levels:
-/// - Candidate-level: flip a conflicting slot to a different candidate
-/// - Order-level: adjacent swap or bubble move
-///
-/// After any candidate flip, the DAG changes, so we rebuild and repair.
+/// Per-gene mutation: adjacent swap or bubble move, respecting DAG constraints.
 pub fn mutate(
     ind: &mut Individual,
-    deps: &GroupDeps,
+    dag: &DependencyDag,
     rng: &mut SmallRng,
     mutation_rate: f64,
 ) {
     let n = ind.seq.len();
-    if n == 0 {
+    if n < 2 {
         return;
     }
 
@@ -645,93 +216,17 @@ pub fn mutate(
         expected.round() as usize
     };
 
-    let has_conflicts = deps.has_conflicts();
-
     for _ in 0..num_mutations {
-        let roll = rng.gen_range(0..100);
-
-        if has_conflicts && roll < 25 {
-            // Candidate-level mutation: flip a conflicting slot.
-            mut_candidate_flip(ind, deps, rng);
-        } else if roll < 55 {
-            // Order-level mutation: adjacent swap.
-            let dag = deps.build_dag(&ind.active);
-            mut_adjacent_swap(&mut ind.seq, &dag, rng);
+        if rng.gen_bool(0.5) {
+            mut_adjacent_swap(&mut ind.seq, dag, rng);
         } else {
-            // Order-level mutation: bubble move.
-            let dag = deps.build_dag(&ind.active);
             let max_steps = rng.gen_range(2..=(n / 4).max(3));
-            mut_bubble_move(&mut ind.seq, &dag, rng, max_steps);
+            mut_bubble_move(&mut ind.seq, dag, rng, max_steps);
         }
     }
 }
 
-/// Flip a candidate at a conflicting slot and rebuild the sequence.
-fn mut_candidate_flip(
-    ind: &mut Individual,
-    deps: &GroupDeps,
-    rng: &mut SmallRng,
-) {
-    let conflicts = deps.conflicting_slots();
-    if conflicts.is_empty() {
-        return;
-    }
-
-    let (slot, candidates) = &conflicts[rng.gen_range(0..conflicts.len())];
-
-    let current = ind.choices.get(slot).copied();
-    let alts: Vec<usize> = candidates.iter().copied()
-        .filter(|&c| Some(c) != current)
-        .collect();
-
-    if alts.is_empty() {
-        return;
-    }
-
-    let new_choice = alts[rng.gen_range(0..alts.len())];
-
-    // Build updated choices:
-    let mut new_choices = ind.choices.clone();
-
-    // 1. Remove every slot claimed by the old candidate (if any).
-    if let Some(old) = current {
-        for provided_slot in &deps.order_deps[old].provides {
-            if deps.slot_providers.get(provided_slot).map_or(false, |p| p.len() > 1) {
-                new_choices.remove(provided_slot);
-            }
-        }
-    }
-
-    // 2. For each slot the new candidate provides: if another order currently
-    //    claims that slot, evict it (remove all of its claimed slots) first,
-    //    then claim the slot for new_choice.
-    //    This correctly handles bundles that provide multiple slots.
-    for provided_slot in &deps.order_deps[new_choice].provides {
-        if deps.slot_providers.get(provided_slot).map_or(false, |p| p.len() > 1) {
-            if let Some(&existing) = new_choices.get(provided_slot) {
-                if existing != new_choice {
-                    // Evict the conflicting order's entire claim set.
-                    let existing_provides = deps.order_deps[existing].provides.clone();
-                    for ep in &existing_provides {
-                        if deps.slot_providers.get(ep).map_or(false, |p| p.len() > 1) {
-                            new_choices.remove(ep);
-                        }
-                    }
-                }
-            }
-            new_choices.insert(provided_slot.clone(), new_choice);
-        }
-    }
-
-    // Rebuild active set and repair the sequence to match the new DAG.
-    ind.choices = new_choices;
-    ind.active = active_set_from_choices(deps, &ind.choices);
-    let dag = deps.build_dag(&ind.active);
-    ind.seq = repair_topo_sort(&ind.seq, &dag);
-}
-
-
-/// Swap two adjacent orders that have no dependency between them.
+/// Swap two adjacent orders that have no dependency between them
 fn mut_adjacent_swap(seq: &mut [usize], dag: &DependencyDag, rng: &mut SmallRng) -> bool {
     if seq.len() < 2 {
         return false;
@@ -750,7 +245,7 @@ fn mut_adjacent_swap(seq: &mut [usize], dag: &DependencyDag, rng: &mut SmallRng)
     true
 }
 
-/// Bubble an element left or right by repeated adjacent swaps.
+/// Bubble an element left or right by repeated adjacent swaps
 fn mut_bubble_move(
     seq: &mut [usize],
     dag: &DependencyDag,
@@ -767,19 +262,13 @@ fn mut_bubble_move(
 
     for _ in 0..steps {
         if go_left {
-            if pos == 0 {
-                break;
-            }
-            if !can_swap_adjacent(seq, pos - 1, dag) {
+            if pos == 0 || !can_swap_adjacent(seq, pos - 1, dag) {
                 break;
             }
             seq.swap(pos - 1, pos);
             pos -= 1;
         } else {
-            if pos + 1 >= seq.len() {
-                break;
-            }
-            if !can_swap_adjacent(seq, pos, dag) {
+            if pos + 1 >= seq.len() || !can_swap_adjacent(seq, pos, dag) {
                 break;
             }
             seq.swap(pos, pos + 1);
@@ -804,8 +293,6 @@ fn can_swap_adjacent(seq: &[usize], i: usize, dag: &DependencyDag) -> bool {
     !dag.successors[ni_a].contains(&ni_b)
 }
 
-// ─── Competition ────────────────────────────────────────────────────────
-
 pub fn compete(parent: &Individual, child: &Individual, rng: &mut SmallRng) -> Individual {
     if dominates(child, parent) {
         child.clone()
@@ -818,39 +305,25 @@ pub fn compete(parent: &Individual, child: &Individual, rng: &mut SmallRng) -> I
     }
 }
 
-// ─── Distance metrics ───────────────────────────────────────────────────
-
-/// Normalized Kendall-tau distance for sequences that may have different elements.
-/// Only counts inversions among shared elements.
-fn kendall_tau_normalized(a: &[usize], b: &[usize]) -> f64 {
-    // Find shared elements.
-    let a_set: AHashSet<usize> = a.iter().copied().collect();
-    let b_set: AHashSet<usize> = b.iter().copied().collect();
-    let shared: Vec<usize> = a.iter().copied().filter(|x| b_set.contains(x)).collect();
-
-    let n = shared.len();
+/// Normalized Kendall-tau distance between two sequences.
+/// Since all individuals share the same active set, sequences contain the
+/// same elements and we count inversions directly.
+pub fn kendall_tau_distance(a: &[usize], b: &[usize]) -> f64 {
+    let n = a.len();
     if n <= 1 {
         return 0.0;
     }
 
-    // Build position map for b (among shared elements only).
-    let shared_set: AHashSet<usize> = shared.iter().copied().collect();
-    let mut pos_in_b = HashMap::default();
-    let mut rank = 0usize;
-    for &oi in b {
-        if shared_set.contains(&oi) {
-            pos_in_b.insert(oi, rank);
-            rank += 1;
-        }
+    // Build position map for b.
+    let mut pos_in_b: HashMap<usize, usize> = HashMap::default();
+    for (i, &oi) in b.iter().enumerate() {
+        pos_in_b.insert(oi, i);
     }
 
-    // Map a's shared elements to their position in b.
-    let mut mapped: Vec<usize> = Vec::with_capacity(n);
-    for &oi in a {
-        if let Some(&pos) = pos_in_b.get(&oi) {
-            mapped.push(pos);
-        }
-    }
+    // Map a's elements to their position in b.
+    let mut mapped: Vec<usize> = a.iter()
+        .map(|&oi| pos_in_b.get(&oi).copied().unwrap_or(0))
+        .collect();
 
     let mut buf = vec![0usize; n];
     let inv = count_inversions(&mut mapped, &mut buf) as f64;
@@ -903,50 +376,13 @@ fn count_inversions(arr: &mut [usize], buf: &mut [usize]) -> u64 {
     inv
 }
 
-/// Fraction of conflicting slots where a and b chose different candidates.
-fn candidate_mismatch_rate(a: &Individual, b: &Individual, deps: &GroupDeps) -> f64 {
-    if !deps.has_conflicts() {
-        return 0.0;
-    }
-
-    let mut mismatches = 0usize;
-    let mut total = 0usize;
-
-    for (slot, providers) in &deps.slot_providers {
-        if providers.len() <= 1 {
-            continue;
-        }
-        total += 1;
-        let pick_a = a.choices.get(slot);
-        let pick_b = b.choices.get(slot);
-        if pick_a != pick_b {
-            mismatches += 1;
-        }
-    }
-
-    if total == 0 { 0.0 } else { mismatches as f64 / total as f64 }
-}
-
-/// Combined distance for deterministic crowding.
-pub fn dc_distance(a: &Individual, b: &Individual, deps: &GroupDeps) -> f64 {
-    if a.seq.is_empty() || b.seq.is_empty() {
-        return 1.0;
-    }
-    let w_order = 0.7;
-    let w_choice = 0.3;
-    let tau = kendall_tau_normalized(&a.seq, &b.seq);
-    let idm = candidate_mismatch_rate(a, b, deps);
-    w_order * tau + w_choice * idm
-}
-
-// ─── Deterministic Crowding generation step ─────────────────────────────
-
+// Deterministic Crowding (DC) for maintaining diversity in each island
 /// An unevaluated child with metadata for DC competition.
 pub struct PendingChild {
     pub island_idx: usize,
     pub pair_idx: usize,
     pub child_slot: usize,
-    pub ind: Individual,  // has seq but profit/gas not yet filled
+    pub ind: Individual,
 }
 
 /// Metadata about a parent pair for DC competition.
@@ -960,7 +396,7 @@ pub fn generate_dc_children(
     island: &mut Island,
     island_idx: usize,
     params: &GAParams,
-    deps: &GroupDeps,
+    dag: &DependencyDag,
 ) -> (Vec<PendingChild>, Vec<ParentPairInfo>) {
     let population = &island.population;
     let rng = &mut island.rng;
@@ -983,30 +419,39 @@ pub fn generate_dc_children(
 
         let (mut c1, mut c2) = if rng.gen::<f64>() < params.crossover_rate {
             (
-                crossover_simple_ox(p1, p2, deps, rng),
-                crossover_simple_ox(p2, p1, deps, rng),
+                crossover(p1, p2, dag, rng),
+                crossover(p2, p1, dag, rng),
             )
         } else {
             (p1.clone(), p2.clone())
         };
 
-        mutate_simple_swap(&mut c1, deps, rng, params.mutation_rate);
-        mutate_simple_swap(&mut c2, deps, rng, params.mutation_rate);
+        mutate(&mut c1, dag, rng, params.mutation_rate);
+        mutate(&mut c2, dag, rng, params.mutation_rate);
 
-        children.push(PendingChild { island_idx, pair_idx, child_slot: 0, ind: c1 });
-        children.push(PendingChild { island_idx, pair_idx, child_slot: 1, ind: c2 });
+        children.push(PendingChild {
+            island_idx,
+            pair_idx,
+            child_slot: 0,
+            ind: c1,
+        });
+        children.push(PendingChild {
+            island_idx,
+            pair_idx,
+            child_slot: 1,
+            ind: c2,
+        });
         pair_infos.push(ParentPairInfo { p1_idx, p2_idx });
     }
 
     (children, pair_infos)
 }
 
-/// Apply DC competition using evaluated children.
+/// Apply DC competition using evaluated children
 pub fn apply_dc_competition(
     island: &mut Island,
     pair_infos: &[ParentPairInfo],
     evaluated_children: &mut Vec<Option<Individual>>,
-    deps: &GroupDeps,
 ) {
     let population = &island.population;
     let rng = &mut island.rng;
@@ -1028,10 +473,11 @@ pub fn apply_dc_competition(
         let p1 = &population[info.p1_idx];
         let p2 = &population[info.p2_idx];
 
-        let dist_p1c1 = dc_distance(p1, &c1, deps);
-        let dist_p2c2 = dc_distance(p2, &c2, deps);
-        let dist_p1c2 = dc_distance(p1, &c2, deps);
-        let dist_p2c1 = dc_distance(p2, &c1, deps);
+        // Match children to most similar parents
+        let dist_p1c1 = kendall_tau_distance(&p1.seq, &c1.seq);
+        let dist_p2c2 = kendall_tau_distance(&p2.seq, &c2.seq);
+        let dist_p1c2 = kendall_tau_distance(&p1.seq, &c2.seq);
+        let dist_p2c1 = kendall_tau_distance(&p2.seq, &c1.seq);
 
         let (winner1, winner2) = if dist_p1c1 + dist_p2c2 <= dist_p1c2 + dist_p2c1 {
             (compete(p1, &c1, rng), compete(p2, &c2, rng))
@@ -1050,413 +496,734 @@ pub fn apply_dc_competition(
     island.population = next_population;
 }
 
-// #[cfg(test)]
-// mod tests {
-//     use super::*;
-//     use std::sync::Arc;
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
 
-//     use ahash::HashSet;
-//     use alloy_consensus::TxLegacy;
-//     use alloy_primitives::{address, Address, Signature, TxHash, B256, U256};
-//     use rand::SeedableRng;
-//     use reth::primitives::TransactionSigned;
-//     use reth_primitives::{Recovered, Transaction};
-//     use uuid::Uuid;
+    use super::*;
+    use ahash::HashSet as AHashSet;
+    use alloy_consensus::TxLegacy;
+    use alloy_primitives::{address, Address, Signature, TxHash, B256, U256};
+    use rand::SeedableRng;
+    use reth::primitives::TransactionSigned;
+    use reth_primitives::{Recovered, Transaction};
+    use uuid::Uuid;
 
-//     // Adjust these imports to match your actual crate structure:
-//     use crate::building::builders::parallel_builder::ConflictGroup;
-//     use rbuilder_primitives::{
-//         Bundle, MempoolTx, Metadata, Order, SimValue, SimulatedOrder,
-//         TransactionSignedEcRecoveredWithBlobs, LAST_BUNDLE_VERSION,
-//     };
-//     use crate::building::sim::NonceKey;
+    use crate::building::builders::parallel_builder::ConflictGroup;
+    use crate::building::builders::parallel_builder::nonce_handling::GroupDeps;
+    use rbuilder_primitives::{
+        Bundle, MempoolTx, Metadata, Order, SimValue, SimulatedOrder,
+        TransactionSignedEcRecoveredWithBlobs, LAST_BUNDLE_VERSION,
+    };
 
-//     const SENDER_A: Address = address!("0x000000000000000000000000000000000000000a");
-//     const SENDER_B: Address = address!("0x000000000000000000000000000000000000000b");
-//     const SENDER_C: Address = address!("0x000000000000000000000000000000000000000c");
+    const SENDER_A: Address = address!("0x000000000000000000000000000000000000000a");
+    const SENDER_B: Address = address!("0x000000000000000000000000000000000000000b");
+    const SENDER_C: Address = address!("0x000000000000000000000000000000000000000c");
 
-//     struct IdGen(u64);
-//     impl IdGen {
-//         fn new() -> Self { Self(0) }
-//         fn next_hash(&mut self) -> TxHash {
-//             self.0 += 1;
-//             TxHash::from(U256::from(self.0))
-//         }
-//     }
+    struct IdGen(u64);
+    impl IdGen {
+        fn new() -> Self { Self(0) }
+        fn next_hash(&mut self) -> TxHash {
+            self.0 += 1;
+            TxHash::from(U256::from(self.0))
+        }
+    }
 
-//     fn mk_tx(sender: Address, nonce: u64, gen: &mut IdGen) -> Recovered<TransactionSigned> {
-//         let tx_legacy = TxLegacy { nonce, ..Default::default() };
-//         Recovered::new_unchecked(
-//             TransactionSigned::new(
-//                 Transaction::Legacy(tx_legacy),
-//                 Signature::test_signature(),
-//                 gen.next_hash(),
-//             ),
-//             sender,
-//         )
-//     }
+    fn mk_tx(sender: Address, nonce: u64, gen: &mut IdGen) -> Recovered<TransactionSigned> {
+        let tx_legacy = TxLegacy { nonce, ..Default::default() };
+        Recovered::new_unchecked(
+            TransactionSigned::new(
+                Transaction::Legacy(tx_legacy),
+                Signature::test_signature(),
+                gen.next_hash(),
+            ),
+            sender,
+        )
+    }
 
-//     fn mk_single_tx_order(
-//         sender: Address,
-//         nonce: u64,
-//         profit: u64,
-//         gen: &mut IdGen,
-//     ) -> Arc<SimulatedOrder> {
-//         let rec = mk_tx(sender, nonce, gen);
-//         let with_blobs = TransactionSignedEcRecoveredWithBlobs::new_no_blobs(rec).unwrap();
-//         Arc::new(SimulatedOrder {
-//             order: Arc::new(Order::Tx(MempoolTx { tx_with_blobs: with_blobs })),
-//             used_state_trace: None,
-//             sim_value: SimValue::new_test(U256::from(profit), U256::from(profit), 0),
-//         })
-//     }
+    fn mk_single_tx_order(
+        sender: Address,
+        nonce: u64,
+        profit: u64,
+        gen: &mut IdGen,
+    ) -> Arc<SimulatedOrder> {
+        let rec = mk_tx(sender, nonce, gen);
+        let with_blobs = TransactionSignedEcRecoveredWithBlobs::new_no_blobs(rec).unwrap();
+        Arc::new(SimulatedOrder {
+            order: Arc::new(Order::Tx(MempoolTx { tx_with_blobs: with_blobs })),
+            used_state_trace: None,
+            sim_value: SimValue::new_test(U256::from(profit), U256::from(profit), 0),
+        })
+    }
 
-//     fn mk_bundle_order(
-//         tx_specs: &[(Address, u64)],
-//         profit: u64,
-//         gen: &mut IdGen,
-//     ) -> Arc<SimulatedOrder> {
-//         let txs: Vec<_> = tx_specs.iter()
-//             .map(|&(sender, nonce)| {
-//                 TransactionSignedEcRecoveredWithBlobs::new_no_blobs(mk_tx(sender, nonce, gen)).unwrap()
-//             })
-//             .collect();
-//         let bundle = Bundle {
-//             version: LAST_BUNDLE_VERSION,
-//             block: Some(0),
-//             min_timestamp: None,
-//             max_timestamp: None,
-//             txs,
-//             reverting_tx_hashes: Vec::new(),
-//             dropping_tx_hashes: Vec::new(),
-//             hash: B256::ZERO,
-//             uuid: Uuid::new_v4(),
-//             replacement_data: None,
-//             signer: None,
-//             refund_identity: None,
-//             metadata: Metadata::default(),
-//             refund: None,
-//             external_hash: None,
-//         };
-//         Arc::new(SimulatedOrder {
-//             order: Arc::new(Order::Bundle(bundle)),
-//             used_state_trace: None,
-//             sim_value: SimValue::new_test(U256::from(profit), U256::from(profit), 0),
-//         })
-//     }
+    fn mk_bundle_order(
+        tx_specs: &[(Address, u64)],
+        profit: u64,
+        gen: &mut IdGen,
+    ) -> Arc<SimulatedOrder> {
+        let txs: Vec<_> = tx_specs.iter()
+            .map(|&(sender, nonce)| {
+                TransactionSignedEcRecoveredWithBlobs::new_no_blobs(mk_tx(sender, nonce, gen)).unwrap()
+            })
+            .collect();
+        let bundle = Bundle {
+            version: LAST_BUNDLE_VERSION,
+            block: Some(0),
+            min_timestamp: None,
+            max_timestamp: None,
+            txs,
+            reverting_tx_hashes: Vec::new(),
+            dropping_tx_hashes: Vec::new(),
+            hash: B256::ZERO,
+            uuid: Uuid::new_v4(),
+            replacement_data: None,
+            signer: None,
+            refund_identity: None,
+            metadata: Metadata::default(),
+            refund: None,
+            external_hash: None,
+        };
+        Arc::new(SimulatedOrder {
+            order: Arc::new(Order::Bundle(bundle)),
+            used_state_trace: None,
+            sim_value: SimValue::new_test(U256::from(profit), U256::from(profit), 0),
+        })
+    }
 
-//     fn mk_group(orders: Vec<Arc<SimulatedOrder>>) -> ConflictGroup {
-//         ConflictGroup {
-//             id: 0,
-//             orders: Arc::new(orders),
-//             conflicting_group_ids: Arc::new(HashSet::default()),
-//         }
-//     }
+    fn mk_group(orders: Vec<Arc<SimulatedOrder>>) -> ConflictGroup {
+        ConflictGroup {
+            id: 0,
+            orders: Arc::new(orders),
+            conflicting_group_ids: Arc::new(AHashSet::default()),
+        }
+    }
 
-//     fn assert_valid_individual(ind: &Individual, deps: &GroupDeps) {
-//         // 1. Seq contains exactly the active set.
-//         let seq_set: AHashSet<usize> = ind.seq.iter().copied().collect();
-//         assert_eq!(seq_set, ind.active,
-//             "Seq elements {:?} don't match active set {:?}", seq_set, ind.active);
-//         assert_eq!(ind.seq.len(), ind.active.len(),
-//             "Seq has duplicates: {:?}", ind.seq);
+    /// Build a DAG with greedy dedup (matching the simplified GA approach).
+    fn build_deduped_dag(group: &ConflictGroup) -> (GroupDeps, DependencyDag) {
+        use crate::building::builders::parallel_builder::nonce_handling::GreedyKey;
+        let deps = GroupDeps::from_group(group).unwrap();
+        let dag = if deps.has_conflicts() {
+            let active = deps.dedup_best(group, GreedyKey::Profit, false);
+            deps.build_dag(&active)
+        } else {
+            deps.build_dag_all()
+        };
+        (deps, dag)
+    }
 
-//         // 2. No two orders in seq compete for the same slot.
-//         for (slot, providers) in &deps.slot_providers {
-//             if providers.len() <= 1 { continue; }
-//             let count = providers.iter().filter(|idx| seq_set.contains(idx)).count();
-//             assert!(count <= 1,
-//                 "Slot {:?} has {} providers in seq: {:?}", slot, count, ind.seq);
-//         }
+    /// Assert the sequence is a valid topo sort of the given DAG.
+    fn assert_valid_topo_sort(seq: &[usize], dag: &DependencyDag) {
+        let seq_set: AHashSet<usize> = seq.iter().copied().collect();
+        let dag_set: AHashSet<usize> = dag.nodes.iter().copied().collect();
+        assert_eq!(seq_set, dag_set,
+            "Seq elements {:?} don't match DAG nodes {:?}", seq_set, dag_set);
+        assert_eq!(seq.len(), dag.nodes.len(),
+            "Seq has duplicates: {:?}", seq);
 
-//         // 3. Valid topo sort.
-//         let dag = deps.build_dag(&ind.active);
-//         let pos: HashMap<usize, usize> = ind.seq.iter().enumerate()
-//             .map(|(p, &oi)| (oi, p)).collect();
-//         for (ni, succs) in dag.successors.iter().enumerate() {
-//             let from = dag.nodes[ni];
-//             for &si in succs {
-//                 let to = dag.nodes[si];
-//                 assert!(pos[&from] < pos[&to],
-//                     "{} must come before {} in {:?}", from, to, ind.seq);
-//             }
-//         }
-//     }
+        let pos: HashMap<usize, usize> = seq.iter().enumerate()
+            .map(|(p, &oi)| (oi, p)).collect();
+        for (ni, succs) in dag.successors.iter().enumerate() {
+            let from = dag.nodes[ni];
+            for &si in succs {
+                let to = dag.nodes[si];
+                assert!(pos[&from] < pos[&to],
+                    "{} must come before {} in {:?}", from, to, seq);
+            }
+        }
+    }
 
-//     // ═══════════════════════════════════════════════════════════════
-//     // Basic: no conflicts
-//     // ═══════════════════════════════════════════════════════════════
+    // individual_from_seq
 
-//     #[test]
-//     fn crossover_no_conflicts_preserves_validity() {
-//         let mut gen = IdGen::new();
-//         let group = mk_group(vec![
-//             mk_single_tx_order(SENDER_A, 0, 100, &mut gen),
-//             mk_single_tx_order(SENDER_A, 1, 200, &mut gen),
-//             mk_single_tx_order(SENDER_B, 0, 150, &mut gen),
-//             mk_single_tx_order(SENDER_B, 1, 250, &mut gen),
-//         ]);
-//         let deps = GroupDeps::from_group(&group).unwrap();
-//         let mut rng = SmallRng::seed_from_u64(42);
+    #[test]
+    fn individual_from_seq_creates_valid_individual() {
+        let ind = individual_from_seq(vec![3, 1, 0, 2]);
+        assert_eq!(ind.seq, vec![3, 1, 0, 2]);
+        assert_eq!(ind.profit, U256::ZERO);
+        assert_eq!(ind.gas, 0);
+    }
 
-//         let pa = individual_from_seq(vec![0, 2, 1, 3], &deps);
-//         let pb = individual_from_seq(vec![2, 0, 3, 1], &deps);
+    #[test]
+    fn individual_from_seq_empty() {
+        let ind = individual_from_seq(vec![]);
+        assert!(ind.seq.is_empty());
+    }
 
-//         for _ in 0..100 {
-//             let child = crossover(&pa, &pb, &deps, &mut rng);
-//             assert_valid_individual(&child, &deps);
-//         }
-//     }
+    // dominates
+    #[test]
+    fn dominates_higher_profit() {
+        let a = Individual { seq: vec![], profit: U256::from(100), gas: 50 };
+        let b = Individual { seq: vec![], profit: U256::from(50), gas: 50 };
+        assert!(dominates(&a, &b));
+        assert!(!dominates(&b, &a));
+    }
 
-//     // ═══════════════════════════════════════════════════════════════
-//     // With conflicts: different candidates in parents
-//     // ═══════════════════════════════════════════════════════════════
+    #[test]
+    fn dominates_same_profit_lower_gas() {
+        let a = Individual { seq: vec![], profit: U256::from(100), gas: 30 };
+        let b = Individual { seq: vec![], profit: U256::from(100), gas: 50 };
+        assert!(dominates(&a, &b));
+        assert!(!dominates(&b, &a));
+    }
 
-//     #[test]
-//     fn crossover_with_conflicts_always_valid() {
-//         let mut gen = IdGen::new();
-//         // Two candidates for A@0, plus A@1 and B@0.
-//         let group = mk_group(vec![
-//             mk_single_tx_order(SENDER_A, 0, 100, &mut gen), // idx 0
-//             mk_single_tx_order(SENDER_A, 0, 200, &mut gen), // idx 1 (conflicts with 0)
-//             mk_single_tx_order(SENDER_A, 1, 300, &mut gen), // idx 2
-//             mk_single_tx_order(SENDER_B, 0, 150, &mut gen), // idx 3
-//         ]);
-//         let deps = GroupDeps::from_group(&group).unwrap();
-//         let mut rng = SmallRng::seed_from_u64(42);
+    #[test]
+    fn dominates_neither() {
+        let a = Individual { seq: vec![], profit: U256::from(100), gas: 50 };
+        let b = Individual { seq: vec![], profit: U256::from(100), gas: 50 };
+        assert!(!dominates(&a, &b));
+        assert!(!dominates(&b, &a));
+    }
 
-//         // Parent A chose idx 0 for A@0.
-//         let pa = individual_from_seq(vec![0, 3, 2], &deps);
-//         // Parent B chose idx 1 for A@0.
-//         let pb = individual_from_seq(vec![3, 1, 2], &deps);
+    // compete
+    #[test]
+    fn compete_picks_dominant() {
+        let mut rng = SmallRng::seed_from_u64(1);
+        let better = Individual { seq: vec![0, 1], profit: U256::from(100), gas: 50 };
+        let worse = Individual { seq: vec![1, 0], profit: U256::from(50), gas: 100 };
+        for _ in 0..20 {
+            let winner = compete(&worse, &better, &mut rng);
+            assert_eq!(winner.profit, U256::from(100));
+        }
+    }
 
-//         assert_eq!(pa.seq.len(), 3);
-//         assert_eq!(pb.seq.len(), 3);
+    #[test]
+    fn compete_equal_is_random() {
+        let mut rng = SmallRng::seed_from_u64(42);
+        let a = Individual { seq: vec![0, 1], profit: U256::from(100), gas: 50 };
+        let b = Individual { seq: vec![1, 0], profit: U256::from(100), gas: 50 };
+        let mut a_wins = 0;
+        let mut b_wins = 0;
+        for _ in 0..200 {
+            let winner = compete(&a, &b, &mut rng);
+            if winner.seq == a.seq { a_wins += 1; } else { b_wins += 1; }
+        }
+        // Both should win a reasonable number of times.
+        assert!(a_wins > 50 && b_wins > 50,
+            "Expected roughly even split, got a={} b={}", a_wins, b_wins);
+    }
 
-//         for _ in 0..200 {
-//             let child = crossover(&pa, &pb, &deps, &mut rng);
-//             assert_valid_individual(&child, &deps);
-//             // Child must have exactly one of {0, 1}.
-//             let has_0 = child.seq.contains(&0);
-//             let has_1 = child.seq.contains(&1);
-//             assert!(has_0 ^ has_1, "Child must have exactly one A@0 candidate: {:?}", child.seq);
-//             // Must always have 2 and 3.
-//             assert!(child.seq.contains(&2));
-//             assert!(child.seq.contains(&3));
-//         }
-//     }
+    // Crossover: no dependencies (independent orders)
+    #[test]
+    fn crossover_independent_orders_preserves_elements() {
+        let mut gen = IdGen::new();
+        let group = mk_group(vec![
+            mk_single_tx_order(SENDER_A, 0, 100, &mut gen),
+            mk_single_tx_order(SENDER_B, 0, 200, &mut gen),
+            mk_single_tx_order(SENDER_C, 0, 150, &mut gen),
+        ]);
+        let (_, dag) = build_deduped_dag(&group);
+        let mut rng = SmallRng::seed_from_u64(42);
 
-//     #[test]
-//     fn crossover_with_bundle_conflicts() {
-//         let mut gen = IdGen::new();
-//         // idx0: A@0 (profit 400)
-//         // idx1: B@0 (profit 300)
-//         // idx2: Bundle[A@0, B@0] (profit 200) — conflicts with both idx0 and idx1
-//         // idx3: A@1
-//         let group = mk_group(vec![
-//             mk_single_tx_order(SENDER_A, 0, 400, &mut gen),
-//             mk_single_tx_order(SENDER_B, 0, 300, &mut gen),
-//             mk_bundle_order(&[(SENDER_A, 0), (SENDER_B, 0)], 200, &mut gen),
-//             mk_single_tx_order(SENDER_A, 1, 100, &mut gen),
-//         ]);
-//         let deps = GroupDeps::from_group(&group).unwrap();
-//         let mut rng = SmallRng::seed_from_u64(99);
+        let pa = individual_from_seq(vec![0, 1, 2]);
+        let pb = individual_from_seq(vec![2, 0, 1]);
 
-//         // Parent A: chose individual txs (idx0 + idx1).
-//         let pa = individual_from_seq(vec![0, 1, 3], &deps);
-//         // Parent B: chose the bundle (idx2).
-//         let pb = individual_from_seq(vec![2, 3], &deps);
+        for _ in 0..100 {
+            let child = crossover(&pa, &pb, &dag, &mut rng);
+            assert_valid_topo_sort(&child.seq, &dag);
+            assert_eq!(child.profit, U256::ZERO);
+            assert_eq!(child.gas, 0);
+        }
+    }
 
-//         for _ in 0..200 {
-//             let child = crossover(&pa, &pb, &deps, &mut rng);
-//             assert_valid_individual(&child, &deps);
+    // Crossover: with nonce chain dependencies
+    #[test]
+    fn crossover_nonce_chain_preserves_topo_order() {
+        let mut gen = IdGen::new();
+        // A: nonce 0 -> 1 -> 2, B: nonce 0 -> 1
+        let group = mk_group(vec![
+            mk_single_tx_order(SENDER_A, 0, 100, &mut gen), // 0
+            mk_single_tx_order(SENDER_A, 1, 200, &mut gen), // 1
+            mk_single_tx_order(SENDER_A, 2, 300, &mut gen), // 2
+            mk_single_tx_order(SENDER_B, 0, 150, &mut gen), // 3
+            mk_single_tx_order(SENDER_B, 1, 250, &mut gen), // 4
+        ]);
+        let (_, dag) = build_deduped_dag(&group);
+        let mut rng = SmallRng::seed_from_u64(42);
 
-//             // If bundle (2) is chosen, neither 0 nor 1 should be present.
-//             if child.seq.contains(&2) {
-//                 assert!(!child.seq.contains(&0), "Bundle chosen but idx0 present: {:?}", child.seq);
-//                 assert!(!child.seq.contains(&1), "Bundle chosen but idx1 present: {:?}", child.seq);
-//             }
-//         }
-//     }
+        let pa = individual_from_seq(vec![0, 3, 1, 4, 2]);
+        let pb = individual_from_seq(vec![3, 0, 4, 1, 2]);
 
-//     // ═══════════════════════════════════════════════════════════════
-//     // Mutation preserves validity
-//     // ═══════════════════════════════════════════════════════════════
+        for _ in 0..200 {
+            let child = crossover(&pa, &pb, &dag, &mut rng);
+            assert_valid_topo_sort(&child.seq, &dag);
+        }
+    }
 
-//     #[test]
-//     fn mutation_preserves_validity_no_conflicts() {
-//         let mut gen = IdGen::new();
-//         let group = mk_group(vec![
-//             mk_single_tx_order(SENDER_A, 0, 100, &mut gen),
-//             mk_single_tx_order(SENDER_A, 1, 200, &mut gen),
-//             mk_single_tx_order(SENDER_B, 0, 150, &mut gen),
-//             mk_single_tx_order(SENDER_B, 1, 250, &mut gen),
-//         ]);
-//         let deps = GroupDeps::from_group(&group).unwrap();
-//         let mut rng = SmallRng::seed_from_u64(123);
+    #[test]
+    fn crossover_single_element() {
+        let mut gen = IdGen::new();
+        let group = mk_group(vec![
+            mk_single_tx_order(SENDER_A, 0, 100, &mut gen),
+        ]);
+        let (_, dag) = build_deduped_dag(&group);
+        let mut rng = SmallRng::seed_from_u64(42);
 
-//         let mut ind = individual_from_seq(vec![0, 2, 1, 3], &deps);
-//         for _ in 0..200 {
-//             mutate(&mut ind, &deps, &mut rng, 0.3);
-//             assert_valid_individual(&ind, &deps);
-//         }
-//     }
+        let pa = individual_from_seq(vec![0]);
+        let pb = individual_from_seq(vec![0]);
+        let child = crossover(&pa, &pb, &dag, &mut rng);
+        assert_eq!(child.seq, vec![0]);
+    }
 
-//     #[test]
-//     fn mutation_with_candidate_flip_preserves_validity() {
-//         let mut gen = IdGen::new();
-//         let group = mk_group(vec![
-//             mk_single_tx_order(SENDER_A, 0, 100, &mut gen), // idx 0
-//             mk_single_tx_order(SENDER_A, 0, 200, &mut gen), // idx 1
-//             mk_single_tx_order(SENDER_A, 1, 300, &mut gen), // idx 2
-//             mk_single_tx_order(SENDER_B, 0, 150, &mut gen), // idx 3
-//         ]);
-//         let deps = GroupDeps::from_group(&group).unwrap();
-//         let mut rng = SmallRng::seed_from_u64(456);
+    #[test]
+    fn crossover_with_bundles_preserves_dag() {
+        let mut gen = IdGen::new();
+        // idx0: A@0, idx1: bundle(A@1, B@0), idx2: A@2, idx3: B@1
+        // DAG: 0 -> 1 -> 2, 1 -> 3
+        let group = mk_group(vec![
+            mk_single_tx_order(SENDER_A, 0, 100, &mut gen),                  // 0
+            mk_bundle_order(&[(SENDER_A, 1), (SENDER_B, 0)], 200, &mut gen), // 1
+            mk_single_tx_order(SENDER_A, 2, 300, &mut gen),                  // 2
+            mk_single_tx_order(SENDER_B, 1, 150, &mut gen),                  // 3
+        ]);
+        let (_, dag) = build_deduped_dag(&group);
+        let mut rng = SmallRng::seed_from_u64(42);
 
-//         let mut ind = individual_from_seq(vec![0, 3, 2], &deps);
-//         for _ in 0..200 {
-//             mutate(&mut ind, &deps, &mut rng, 0.5); // high rate to trigger flips
-//             assert_valid_individual(&ind, &deps);
-//         }
-//     }
+        let pa = individual_from_seq(vec![0, 1, 2, 3]);
+        let pb = individual_from_seq(vec![0, 1, 3, 2]);
 
-//     // ═══════════════════════════════════════════════════════════════
-//     // Diamond DAG with bundles
-//     // ═══════════════════════════════════════════════════════════════
+        for _ in 0..200 {
+            let child = crossover(&pa, &pb, &dag, &mut rng);
+            assert_valid_topo_sort(&child.seq, &dag);
+        }
+    }
 
-//     #[test]
-//     fn operators_valid_on_diamond_dag() {
-//         let mut gen = IdGen::new();
-//         let group = mk_group(vec![
-//             mk_single_tx_order(SENDER_A, 0, 100, &mut gen),                  // 0
-//             mk_bundle_order(&[(SENDER_A, 1), (SENDER_B, 0)], 200, &mut gen), // 1
-//             mk_bundle_order(&[(SENDER_A, 2), (SENDER_C, 0)], 300, &mut gen), // 2
-//             mk_single_tx_order(SENDER_B, 1, 150, &mut gen),                  // 3
-//             mk_bundle_order(&[(SENDER_B, 2), (SENDER_C, 1)], 250, &mut gen), // 4
-//         ]);
-//         let deps = GroupDeps::from_group(&group).unwrap();
-//         let mut rng = SmallRng::seed_from_u64(12345);
+    // Crossover: produces variation
+    #[test]
+    fn crossover_produces_diverse_children() {
+        let mut gen = IdGen::new();
+        let group = mk_group(vec![
+            mk_single_tx_order(SENDER_A, 0, 100, &mut gen),
+            mk_single_tx_order(SENDER_B, 0, 200, &mut gen),
+            mk_single_tx_order(SENDER_C, 0, 150, &mut gen),
+        ]);
+        let (_, dag) = build_deduped_dag(&group);
+        let mut rng = SmallRng::seed_from_u64(42);
 
-//         let pa = individual_from_seq(vec![0, 1, 2, 3, 4], &deps);
-//         let pb = individual_from_seq(vec![0, 1, 3, 2, 4], &deps);
+        let pa = individual_from_seq(vec![0, 1, 2]);
+        let pb = individual_from_seq(vec![2, 1, 0]);
 
-//         for _ in 0..100 {
-//             let child = crossover(&pa, &pb, &deps, &mut rng);
-//             assert_valid_individual(&child, &deps);
+        let mut unique_seqs: AHashSet<Vec<usize>> = AHashSet::default();
+        for _ in 0..100 {
+            let child = crossover(&pa, &pb, &dag, &mut rng);
+            unique_seqs.insert(child.seq);
+        }
+        assert!(unique_seqs.len() > 1,
+            "Crossover should produce diverse children, got {} unique", unique_seqs.len());
+    }
 
-//             let mut ind = pa.clone();
-//             mutate(&mut ind, &deps, &mut rng, 0.3);
-//             assert_valid_individual(&ind, &deps);
-//         }
-//     }
+    // Mutation: preserves topo sort
+    #[test]
+    fn mutation_preserves_topo_order_no_deps() {
+        let mut gen = IdGen::new();
+        let group = mk_group(vec![
+            mk_single_tx_order(SENDER_A, 0, 100, &mut gen),
+            mk_single_tx_order(SENDER_B, 0, 200, &mut gen),
+            mk_single_tx_order(SENDER_C, 0, 150, &mut gen),
+        ]);
+        let (_, dag) = build_deduped_dag(&group);
+        let mut rng = SmallRng::seed_from_u64(123);
 
-//     // ═══════════════════════════════════════════════════════════════
-//     // DC distance
-//     // ═══════════════════════════════════════════════════════════════
+        let mut ind = individual_from_seq(vec![0, 1, 2]);
+        for _ in 0..200 {
+            mutate(&mut ind, &dag, &mut rng, 0.3);
+            assert_valid_topo_sort(&ind.seq, &dag);
+        }
+    }
 
-//     #[test]
-//     fn dc_distance_same_individual_is_zero() {
-//         let mut gen = IdGen::new();
-//         let group = mk_group(vec![
-//             mk_single_tx_order(SENDER_A, 0, 100, &mut gen),
-//             mk_single_tx_order(SENDER_B, 0, 200, &mut gen),
-//         ]);
-//         let deps = GroupDeps::from_group(&group).unwrap();
-//         let ind = individual_from_seq(vec![0, 1], &deps);
-//         assert!((dc_distance(&ind, &ind, &deps)).abs() < 1e-12);
-//     }
+    #[test]
+    fn mutation_preserves_topo_order_with_chain() {
+        let mut gen = IdGen::new();
+        // Strict chain: A@0 -> A@1 -> A@2
+        let group = mk_group(vec![
+            mk_single_tx_order(SENDER_A, 0, 100, &mut gen),
+            mk_single_tx_order(SENDER_A, 1, 200, &mut gen),
+            mk_single_tx_order(SENDER_A, 2, 300, &mut gen),
+            mk_single_tx_order(SENDER_B, 0, 150, &mut gen),
+        ]);
+        let (_, dag) = build_deduped_dag(&group);
+        let mut rng = SmallRng::seed_from_u64(456);
 
-//     #[test]
-//     fn dc_distance_different_candidates_nonzero() {
-//         let mut gen = IdGen::new();
-//         let group = mk_group(vec![
-//             mk_single_tx_order(SENDER_A, 0, 100, &mut gen), // 0
-//             mk_single_tx_order(SENDER_A, 0, 200, &mut gen), // 1
-//         ]);
-//         let deps = GroupDeps::from_group(&group).unwrap();
-//         let a = individual_from_seq(vec![0], &deps);
-//         let b = individual_from_seq(vec![1], &deps);
-//         let dist = dc_distance(&a, &b, &deps);
-//         assert!(dist > 0.0, "Different candidates should have nonzero distance");
-//     }
+        let mut ind = individual_from_seq(vec![0, 1, 3, 2]);
+        for _ in 0..200 {
+            mutate(&mut ind, &dag, &mut rng, 0.5);
+            assert_valid_topo_sort(&ind.seq, &dag);
+            // A@0 must always precede A@1 must always precede A@2
+            let pos: HashMap<usize, usize> = ind.seq.iter().enumerate()
+                .map(|(p, &oi)| (oi, p)).collect();
+            assert!(pos[&0] < pos[&1], "A@0 must come before A@1");
+            assert!(pos[&1] < pos[&2], "A@1 must come before A@2");
+        }
+    }
 
-//     // ═══════════════════════════════════════════════════════════════
-//     // Compete
-//     // ═══════════════════════════════════════════════════════════════
+    #[test]
+    fn mutation_produces_changes() {
+        let mut gen = IdGen::new();
+        let group = mk_group(vec![
+            mk_single_tx_order(SENDER_A, 0, 100, &mut gen),
+            mk_single_tx_order(SENDER_B, 0, 200, &mut gen),
+            mk_single_tx_order(SENDER_C, 0, 150, &mut gen),
+        ]);
+        let (_, dag) = build_deduped_dag(&group);
+        let mut rng = SmallRng::seed_from_u64(789);
 
-//     #[test]
-//     fn compete_picks_dominant() {
-//         let mut rng = SmallRng::seed_from_u64(1);
-//         let deps = GroupDeps { order_deps: vec![], slot_providers: HashMap::default(), n: 0 };
+        let original = vec![0, 1, 2];
+        let mut changed = false;
+        for _ in 0..50 {
+            let mut ind = individual_from_seq(original.clone());
+            mutate(&mut ind, &dag, &mut rng, 0.5);
+            if ind.seq != original {
+                changed = true;
+                break;
+            }
+        }
+        assert!(changed, "Mutation should eventually change the sequence");
+    }
 
-//         let better = Individual {
-//             choices: CandidateChoices::default(),
-//             active: AHashSet::default(),
-//             seq: vec![0, 1],
-//             profit: U256::from(100),
-//             gas: 50,
-//         };
-//         let worse = Individual {
-//             choices: CandidateChoices::default(),
-//             active: AHashSet::default(),
-//             seq: vec![1, 0],
-//             profit: U256::from(50),
-//             gas: 100,
-//         };
-//         for _ in 0..20 {
-//             assert_eq!(compete(&worse, &better, &mut rng).profit, U256::from(100));
-//         }
-//     }
+    #[test]
+    fn mutation_no_change_on_fully_constrained_chain() {
+        let mut gen = IdGen::new();
+        // Fully constrained: A@0 -> A@1 -> A@2, no independent orders.
+        // No valid adjacent swaps exist.
+        let group = mk_group(vec![
+            mk_single_tx_order(SENDER_A, 0, 100, &mut gen),
+            mk_single_tx_order(SENDER_A, 1, 200, &mut gen),
+            mk_single_tx_order(SENDER_A, 2, 300, &mut gen),
+        ]);
+        let (_, dag) = build_deduped_dag(&group);
+        let mut rng = SmallRng::seed_from_u64(42);
 
-//     // ═══════════════════════════════════════════════════════════════
-//     // individual_from_seq correctly extracts choices
-//     // ═══════════════════════════════════════════════════════════════
+        let original = vec![0, 1, 2];
+        let mut ind = individual_from_seq(original.clone());
+        for _ in 0..50 {
+            mutate(&mut ind, &dag, &mut rng, 1.0);
+        }
+        // Only valid ordering is [0, 1, 2], mutation can't change it.
+        assert_eq!(ind.seq, original);
+    }
 
-//     #[test]
-//     fn individual_from_seq_extracts_choices() {
-//         let mut gen = IdGen::new();
-//         let group = mk_group(vec![
-//             mk_single_tx_order(SENDER_A, 0, 100, &mut gen), // 0
-//             mk_single_tx_order(SENDER_A, 0, 200, &mut gen), // 1
-//             mk_single_tx_order(SENDER_A, 1, 300, &mut gen), // 2
-//         ]);
-//         let deps = GroupDeps::from_group(&group).unwrap();
+    // Mutation: diamond DAG with bundles
+    #[test]
+    fn mutation_diamond_dag_preserves_validity() {
+        let mut gen = IdGen::new();
+        // 0: A@0
+        // 1: bundle(A@1, B@0) — depends on 0
+        // 2: bundle(A@2, C@0) — depends on 1
+        // 3: B@1 — depends on 1
+        // 4: bundle(B@2, C@1) — depends on 2 and 3
+        let group = mk_group(vec![
+            mk_single_tx_order(SENDER_A, 0, 100, &mut gen),                  // 0
+            mk_bundle_order(&[(SENDER_A, 1), (SENDER_B, 0)], 200, &mut gen), // 1
+            mk_bundle_order(&[(SENDER_A, 2), (SENDER_C, 0)], 300, &mut gen), // 2
+            mk_single_tx_order(SENDER_B, 1, 150, &mut gen),                  // 3
+            mk_bundle_order(&[(SENDER_B, 2), (SENDER_C, 1)], 250, &mut gen), // 4
+        ]);
+        let (_, dag) = build_deduped_dag(&group);
+        let mut rng = SmallRng::seed_from_u64(12345);
 
-//         let ind = individual_from_seq(vec![0, 2], &deps);
-//         let slot = NonceKey { address: SENDER_A, nonce: 0 };
-//         assert_eq!(ind.choices.get(&slot), Some(&0));
-//         assert!(ind.active.contains(&0));
-//         assert!(!ind.active.contains(&1)); // excluded
-//         assert!(ind.active.contains(&2));
-//     }
+        let mut ind = individual_from_seq(vec![0, 1, 2, 3, 4]);
+        for _ in 0..200 {
+            mutate(&mut ind, &dag, &mut rng, 0.3);
+            assert_valid_topo_sort(&ind.seq, &dag);
+        }
+    }
 
-//     // ═══════════════════════════════════════════════════════════════
-//     // Multiple conflict slots
-//     // ═══════════════════════════════════════════════════════════════
+    // Kendall-tau distance
+    #[test]
+    fn kendall_tau_identical_is_zero() {
+        let a = vec![0, 1, 2, 3];
+        assert!((kendall_tau_distance(&a, &a)).abs() < 1e-12);
+    }
 
-//     #[test]
-//     fn crossover_multiple_conflict_slots() {
-//         let mut gen = IdGen::new();
-//         // A@0: two candidates, B@0: two candidates
-//         let group = mk_group(vec![
-//             mk_single_tx_order(SENDER_A, 0, 100, &mut gen), // 0
-//             mk_single_tx_order(SENDER_A, 0, 200, &mut gen), // 1
-//             mk_single_tx_order(SENDER_B, 0, 150, &mut gen), // 2
-//             mk_single_tx_order(SENDER_B, 0, 250, &mut gen), // 3
-//         ]);
-//         let deps = GroupDeps::from_group(&group).unwrap();
-//         let mut rng = SmallRng::seed_from_u64(77);
+    #[test]
+    fn kendall_tau_reversed_is_one() {
+        let a = vec![0, 1, 2, 3];
+        let b = vec![3, 2, 1, 0];
+        let d = kendall_tau_distance(&a, &b);
+        assert!((d - 1.0).abs() < 1e-12, "Reversed should be 1.0, got {}", d);
+    }
 
-//         // Parent A: chose 0 for A@0, 2 for B@0
-//         let pa = individual_from_seq(vec![0, 2], &deps);
-//         // Parent B: chose 1 for A@0, 3 for B@0
-//         let pb = individual_from_seq(vec![1, 3], &deps);
+    #[test]
+    fn kendall_tau_single_swap() {
+        let a = vec![0, 1, 2, 3];
+        let b = vec![0, 2, 1, 3]; // one adjacent swap
+        let d = kendall_tau_distance(&a, &b);
+        // max inversions = 4*3/2 = 6, one inversion => 1/6
+        let expected = 1.0 / 6.0;
+        assert!((d - expected).abs() < 1e-12, "Expected {}, got {}", expected, d);
+    }
 
-//         for _ in 0..200 {
-//             let child = crossover(&pa, &pb, &deps, &mut rng);
-//             assert_valid_individual(&child, &deps);
-//             assert_eq!(child.seq.len(), 2);
-//         }
-//     }
-// }
+    #[test]
+    fn kendall_tau_single_element() {
+        assert!((kendall_tau_distance(&[0], &[0])).abs() < 1e-12);
+    }
+
+    #[test]
+    fn kendall_tau_empty() {
+        let empty: Vec<usize> = vec![];
+        assert!((kendall_tau_distance(&empty, &empty)).abs() < 1e-12);
+    }
+
+    #[test]
+    fn kendall_tau_symmetric() {
+        let a = vec![0, 2, 1, 3, 4];
+        let b = vec![4, 0, 3, 1, 2];
+        let d1 = kendall_tau_distance(&a, &b);
+        let d2 = kendall_tau_distance(&b, &a);
+        assert!((d1 - d2).abs() < 1e-12, "Should be symmetric: {} vs {}", d1, d2);
+    }
+
+    // validate_individual (debug only)
+    #[test]
+    #[cfg(debug_assertions)]
+    fn validate_individual_valid() {
+        let mut gen = IdGen::new();
+        let group = mk_group(vec![
+            mk_single_tx_order(SENDER_A, 0, 100, &mut gen),
+            mk_single_tx_order(SENDER_A, 1, 200, &mut gen),
+            mk_single_tx_order(SENDER_B, 0, 150, &mut gen),
+        ]);
+        let (_, dag) = build_deduped_dag(&group);
+        let ind = individual_from_seq(vec![0, 2, 1]);
+        assert!(validate_individual(&ind, &dag));
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    fn validate_individual_wrong_order_invalid() {
+        let mut gen = IdGen::new();
+        let group = mk_group(vec![
+            mk_single_tx_order(SENDER_A, 0, 100, &mut gen),
+            mk_single_tx_order(SENDER_A, 1, 200, &mut gen),
+        ]);
+        let (_, dag) = build_deduped_dag(&group);
+        // A@1 before A@0 violates the dependency.
+        let ind = individual_from_seq(vec![1, 0]);
+        assert!(!validate_individual(&ind, &dag));
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    fn validate_individual_missing_element_invalid() {
+        let mut gen = IdGen::new();
+        let group = mk_group(vec![
+            mk_single_tx_order(SENDER_A, 0, 100, &mut gen),
+            mk_single_tx_order(SENDER_B, 0, 200, &mut gen),
+        ]);
+        let (_, dag) = build_deduped_dag(&group);
+        // Missing order 1.
+        let ind = individual_from_seq(vec![0]);
+        assert!(!validate_individual(&ind, &dag));
+    }
+
+    // DC children generation
+    #[test]
+    fn generate_dc_children_produces_correct_count() {
+        let mut gen = IdGen::new();
+        let group = mk_group(vec![
+            mk_single_tx_order(SENDER_A, 0, 100, &mut gen),
+            mk_single_tx_order(SENDER_B, 0, 200, &mut gen),
+            mk_single_tx_order(SENDER_C, 0, 150, &mut gen),
+        ]);
+        let (_, dag) = build_deduped_dag(&group);
+
+        let params = GAParams {
+            population: 10,
+            crossover_rate: 0.8,
+            mutation_rate: 0.1,
+            max_generations: 10,
+            time_ms: 1000,
+            seed: 42,
+            num_islands: 1,
+            migration_interval: 5,
+        };
+
+        let pop: Vec<Individual> = (0..10).map(|_| {
+            individual_from_seq(vec![0, 1, 2])
+        }).collect();
+
+        let mut island = Island {
+            population: pop,
+            rng: SmallRng::seed_from_u64(42),
+        };
+
+        let (children, pair_infos) = generate_dc_children(&mut island, 0, &params, &dag);
+
+        // 10 individuals => 5 pairs => 10 children
+        assert_eq!(children.len(), 10);
+        assert_eq!(pair_infos.len(), 5);
+
+        // All children should be valid topo sorts.
+        for child in &children {
+            assert_valid_topo_sort(&child.ind.seq, &dag);
+        }
+    }
+
+    #[test]
+    fn generate_dc_children_odd_population() {
+        let mut gen = IdGen::new();
+        let group = mk_group(vec![
+            mk_single_tx_order(SENDER_A, 0, 100, &mut gen),
+            mk_single_tx_order(SENDER_B, 0, 200, &mut gen),
+        ]);
+        let (_, dag) = build_deduped_dag(&group);
+
+        let params = GAParams {
+            population: 7,
+            crossover_rate: 0.8,
+            mutation_rate: 0.1,
+            max_generations: 10,
+            time_ms: 1000,
+            seed: 42,
+            num_islands: 1,
+            migration_interval: 5,
+        };
+
+        let pop: Vec<Individual> = (0..7).map(|_| {
+            individual_from_seq(vec![0, 1])
+        }).collect();
+
+        let mut island = Island {
+            population: pop,
+            rng: SmallRng::seed_from_u64(42),
+        };
+
+        let (children, pair_infos) = generate_dc_children(&mut island, 0, &params, &dag);
+
+        // 7 individuals => 3 pairs => 6 children (last one unpaired)
+        assert_eq!(children.len(), 6);
+        assert_eq!(pair_infos.len(), 3);
+    }
+
+    // DC competition
+    #[test]
+    fn dc_competition_replaces_with_better_child() {
+        let p1 = Individual { seq: vec![0, 1], profit: U256::from(50), gas: 100 };
+        let p2 = Individual { seq: vec![1, 0], profit: U256::from(60), gas: 90 };
+
+        // Child that dominates p1 (higher profit, same seq for distance matching).
+        let c1 = Individual { seq: vec![0, 1], profit: U256::from(200), gas: 50 };
+        let c2 = Individual { seq: vec![1, 0], profit: U256::from(10), gas: 200 };
+
+        let mut island = Island {
+            population: vec![p1, p2],
+            rng: SmallRng::seed_from_u64(42),
+        };
+
+        let pair_infos = vec![ParentPairInfo { p1_idx: 0, p2_idx: 1 }];
+        let mut evaluated = vec![Some(c1), Some(c2)];
+
+        apply_dc_competition(&mut island, &pair_infos, &mut evaluated);
+
+        assert_eq!(island.population.len(), 2);
+        // c1 dominates p1 so should replace it.
+        assert_eq!(island.population[0].profit, U256::from(200));
+        // p2 dominates c2 so p2 should be kept.
+        assert_eq!(island.population[1].profit, U256::from(60));
+    }
+
+    #[test]
+    fn dc_competition_handles_failed_eval() {
+        let p1 = Individual { seq: vec![0, 1], profit: U256::from(50), gas: 100 };
+        let p2 = Individual { seq: vec![1, 0], profit: U256::from(60), gas: 90 };
+
+        let mut island = Island {
+            population: vec![p1, p2],
+            rng: SmallRng::seed_from_u64(42),
+        };
+
+        let pair_infos = vec![ParentPairInfo { p1_idx: 0, p2_idx: 1 }];
+        // Both children failed evaluation.
+        let mut evaluated: Vec<Option<Individual>> = vec![None, None];
+
+        apply_dc_competition(&mut island, &pair_infos, &mut evaluated);
+
+        // Parents should be preserved.
+        assert_eq!(island.population.len(), 2);
+        assert_eq!(island.population[0].profit, U256::from(50));
+        assert_eq!(island.population[1].profit, U256::from(60));
+    }
+
+    // can_swap_adjacent
+    #[test]
+    fn can_swap_independent_orders() {
+        let mut gen = IdGen::new();
+        let group = mk_group(vec![
+            mk_single_tx_order(SENDER_A, 0, 100, &mut gen),
+            mk_single_tx_order(SENDER_B, 0, 200, &mut gen),
+        ]);
+        let (_, dag) = build_deduped_dag(&group);
+
+        let seq = vec![0, 1];
+        assert!(can_swap_adjacent(&seq, 0, &dag));
+    }
+
+    #[test]
+    fn cannot_swap_dependent_orders() {
+        let mut gen = IdGen::new();
+        let group = mk_group(vec![
+            mk_single_tx_order(SENDER_A, 0, 100, &mut gen),
+            mk_single_tx_order(SENDER_A, 1, 200, &mut gen),
+        ]);
+        let (_, dag) = build_deduped_dag(&group);
+
+        let seq = vec![0, 1];
+        assert!(!can_swap_adjacent(&seq, 0, &dag));
+    }
+
+    // Crossover + mutation combined stress test
+    #[test]
+    fn stress_crossover_mutation_interleaved_chains() {
+        let mut gen = IdGen::new();
+        // Two interleaved chains with bundles:
+        // A@0, A@1, A@2, B@0, B@1, bundle(A@3, B@2)
+        let group = mk_group(vec![
+            mk_single_tx_order(SENDER_A, 0, 100, &mut gen),                  // 0
+            mk_single_tx_order(SENDER_A, 1, 200, &mut gen),                  // 1
+            mk_single_tx_order(SENDER_A, 2, 300, &mut gen),                  // 2
+            mk_single_tx_order(SENDER_B, 0, 150, &mut gen),                  // 3
+            mk_single_tx_order(SENDER_B, 1, 250, &mut gen),                  // 4
+            mk_bundle_order(&[(SENDER_A, 3), (SENDER_B, 2)], 500, &mut gen), // 5
+        ]);
+        let (_, dag) = build_deduped_dag(&group);
+        let mut rng = SmallRng::seed_from_u64(54321);
+
+        let pa = individual_from_seq(vec![0, 3, 1, 4, 2, 5]);
+        let pb = individual_from_seq(vec![3, 0, 4, 1, 2, 5]);
+
+        for _ in 0..500 {
+            let mut child = crossover(&pa, &pb, &dag, &mut rng);
+            assert_valid_topo_sort(&child.seq, &dag);
+
+            mutate(&mut child, &dag, &mut rng, 0.3);
+            assert_valid_topo_sort(&child.seq, &dag);
+
+            // Also cross the child back with a parent.
+            let grandchild = crossover(&child, &pa, &dag, &mut rng);
+            assert_valid_topo_sort(&grandchild.seq, &dag);
+        }
+    }
+
+    #[test]
+    fn stress_many_independent_orders() {
+        let mut gen = IdGen::new();
+        // 20 independent orders (different senders, nonce 0).
+        let orders: Vec<_> = (0..20).map(|i| {
+            let sender = Address::from_word(U256::from(i + 100).into());
+            mk_single_tx_order(sender, 0, (i + 1) as u64 * 10, &mut gen)
+        }).collect();
+        let group = mk_group(orders);
+        let (_, dag) = build_deduped_dag(&group);
+        let mut rng = SmallRng::seed_from_u64(99999);
+
+        let seq_a: Vec<usize> = (0..20).collect();
+        let seq_b: Vec<usize> = (0..20).rev().collect();
+        let pa = individual_from_seq(seq_a);
+        let pb = individual_from_seq(seq_b);
+
+        for _ in 0..200 {
+            let mut child = crossover(&pa, &pb, &dag, &mut rng);
+            assert_valid_topo_sort(&child.seq, &dag);
+            mutate(&mut child, &dag, &mut rng, 0.15);
+            assert_valid_topo_sort(&child.seq, &dag);
+        }
+    }
+}

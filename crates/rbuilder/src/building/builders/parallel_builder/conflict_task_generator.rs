@@ -377,26 +377,9 @@ pub fn get_tasks_for_group(
             group: group.clone(),
             created_at,
         });
-        tasks.push(ConflictTask {
-            group_idx: group.id,
-            algorithm: Algorithm::GreedyHeap,
-            priority,
-            group: group.clone(),
-            created_at,
-        });
-
         // Check if we can enumerate all orderings within the cap
-        println!(
-            "Group {}... Checking if it has orderings <= cap of {}.",
-            group.id,
-            MULTINOMIAL_ALL_PERMS_THRESHOLD
-         );
         if let Some(small) = orderings_leq_cap(group, MULTINOMIAL_ALL_PERMS_THRESHOLD) {
             if small {
-                println!(
-                    "Group {} has less than 120 orderings. Adding AllPermutations task.",
-                    group.id
-                );
                 tasks.push(ConflictTask {
                     group_idx: group.id,
                     algorithm: Algorithm::AllPermutations,
@@ -405,62 +388,72 @@ pub fn get_tasks_for_group(
                     created_at,
                 });
             } else {
-                println!(
-                    "Group {} has more than 120 orderings. Adding Greedy, Random and Length tasks.",
-                    group.id
-                );
-                // tasks.push(ConflictTask {
-                //     group_idx: group.id,
-                //     algorithm: Algorithm::Genetic {
-                //         population: 50,
-                //         crossover_rate: 0.8,
-                //         mutation_rate: 0.2,
-                //         tourn_k: 5,
-                //         max_generations: 50,
-                //         time_ms: 20000,
-                //         seed: group.id as u64,
-                //     },
-                //     priority: TaskPriority::Medium,
-                //     group: group.clone(),
-                //     created_at,
-                // });
+                tasks.push(ConflictTask {
+                    group_idx: group.id,
+                    algorithm: Algorithm::GreedyFast,
+                    priority,
+                    group: group.clone(),
+                    created_at,
+                });
+                tasks.push(ConflictTask {
+                    group_idx: group.id,
+                    algorithm: Algorithm::Genetic {
+                        population: 100,
+                        crossover_rate: 0.8,
+                        mutation_rate: 0.15,
+                        max_generations: 100,
+                        time_ms: 300000,
+                        seed: group.id as u64,
+                        num_islands: 4,
+                        migration_interval: 5,
+                    },
+                    priority: TaskPriority::Medium,
+                    group: group.clone(),
+                    created_at,
+                });
+                tasks.push(ConflictTask {
+                    group_idx: group.id,
+                    algorithm: Algorithm::GreedyHeap,
+                    priority,
+                    group: group.clone(),
+                    created_at,
+                });
+                tasks.push(ConflictTask {
+                    group_idx: group.id,
+                    algorithm: Algorithm::Random {
+                        seed: group.id as u64,
+                        count: 50,
+                    },
+                    priority: TaskPriority::Low,
+                    group: group.clone(),
+                    created_at,
+                });
 
-                // tasks.push(ConflictTask {
-                //     group_idx: group.id,
-                //     algorithm: Algorithm::Random {
-                //         seed: group.id as u64,
-                //         count: NUMBER_OF_RANDOM_TASKS,
-                //     },
-                //     priority: TaskPriority::Low,
-                //     group: group.clone(),
-                //     created_at,
-                // });
+                tasks.push(ConflictTask {
+                    group_idx: group.id,
+                    algorithm: Algorithm::RandomImproved {
+                        seed: group.id as u64,
+                        count: 50,
+                    },
+                    priority: TaskPriority::Low,
+                    group: group.clone(),
+                    created_at,
+                });
 
-                // tasks.push(ConflictTask {
-                //     group_idx: group.id,
-                //     algorithm: Algorithm::RandomImproved {
-                //         seed: group.id as u64,
-                //         count: NUMBER_OF_RANDOM_TASKS,
-                //     },
-                //     priority: TaskPriority::Low,
-                //     group: group.clone(),
-                //     created_at,
-                // });
-
-                // tasks.push(ConflictTask {
-                //     group_idx: group.id,
-                //     algorithm: Algorithm::Length,
-                //     priority: TaskPriority::Low,
-                //     group: group.clone(),
-                //     created_at,
-                // });
-                // tasks.push(ConflictTask {
-                //     group_idx: group.id,
-                //     algorithm: Algorithm::ReverseGreedy,
-                //     priority: TaskPriority::Low,
-                //     group: group.clone(),
-                //     created_at,
-                // });
+                tasks.push(ConflictTask {
+                    group_idx: group.id,
+                    algorithm: Algorithm::Length,
+                    priority: TaskPriority::Low,
+                    group: group.clone(),
+                    created_at,
+                });
+                tasks.push(ConflictTask {
+                    group_idx: group.id,
+                    algorithm: Algorithm::ReverseGreedy,
+                    priority: TaskPriority::Low,
+                    group: group.clone(),
+                    created_at,
+                });
             }
             return tasks;
         }

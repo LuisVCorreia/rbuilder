@@ -405,7 +405,7 @@ where
 
     let cancel_token = CancellationToken::new();
     let outstanding = Arc::new(AtomicUsize::new(0));
-    let conflict_resolving_pool = ConflictResolvingPool::new(
+    let mut conflict_resolving_pool = ConflictResolvingPool::new(
         config.num_threads,
         task_queue_receiver.clone(),
         config.safe_sorting_only,
@@ -424,76 +424,59 @@ where
         .into();
 
     // Group processing
-    println!("Processing {} orders in conflict finder", sorted_orders.len());
     conflict_finder.add_orders(sorted_orders);
-    let mut groups = conflict_finder.get_order_groups();
-    println!("Conflict finder produced {} groups", groups.len());
-
-    // // find which group bundle 4e83890d-cddc-54aa-8b26-12067c445393 belongs to for testing
-    // use uuid::Uuid;
-    // use rbuilder_primitives::OrderId;
-
-    // let target_uuid = Uuid::parse_str("4e83890d-cddc-54aa-8b26-12067c445393").unwrap();
-    // let mut target_group_id = None;
-    // for group in groups.iter() {
-    //     for sim_order in group.orders.iter() {
-    //         if sim_order.order.id() == OrderId::Bundle(target_uuid) {
-    //             target_group_id = Some(group.id);
-    //             println!("Found target bundle in group {}", group.id);
-    //         }
-    //     }
-    // }
-
-    // // remove all groups except target
-    // match target_group_id {
-    //     Some(id) => groups.retain(|group| group.id == id),
-    //     None => groups.clear(),
-    // }
+    let groups = conflict_finder.get_order_groups();
 
     // Keep orders only from the largest group
-    if let Some(largest_group) = groups.clone().into_iter().max_by_key(|group| group.orders.len()) {
-        groups.retain(|group| group.orders.len() == largest_group.orders.len());
-    }
-    println!("After keeping only largest group(s), {} groups remain with {} orders", groups.len(), groups.iter().map(|g| g.orders.len()).sum::<usize>());
+    // if let Some(largest_group) = groups.clone().into_iter().max_by_key(|group| group.orders.len()) {
+    //     groups.retain(|group| group.orders.len() == largest_group.orders.len());
+    // }
+    // println!("After keeping only largest group(s), {} groups remain with {} orders", groups.len(), groups.iter().map(|g| g.orders.len()).sum::<usize>());
 
     // Generate tasks using the same logic as live builder
     let mut task_generator = ConflictTaskGenerator::new(config.safe_sorting_only, task_queue_sender.clone(), group_result_sender_for_task_generator);
-    let processing_start = Instant::now();
-    println!("Processing groups in conflict task generator");
+    // let processing_start = Instant::now();
     task_generator.process_groups(groups.clone());
-    println!("Conflict task generator produced {} tasks", task_queue_receiver.len());
 
-    // Initialise outstanding from the actual number of enqueued tasks
-    let planned = task_queue_receiver.len();
-    outstanding.store(planned, Ordering::Release);
+    // // Initialise outstanding from the actual number of enqueued tasks
+    // let planned = task_queue_receiver.len();
+    // outstanding.store(planned, Ordering::Release);
 
-    // Start worker threads (after tasks are enqueued)
-    if let Err(err) = conflict_resolving_pool.start() {
-        return Err(err);
-    }
+    // // Start worker threads (after tasks are enqueued)
+    // if let Err(err) = conflict_resolving_pool.start() {
+    //     return Err(err);
+    // }
     
-    let mut results: Vec<(GroupId, (ResolutionResult, ConflictGroup))> = Vec::new();
-    let mut last_progress = Instant::now();
-    loop {
-        match group_result_receiver.recv_timeout(Duration::from_millis(250)) {
-            Ok(res) => {
-                results.push(res);
-                last_progress = Instant::now();
-            }
-            Err(RecvTimeoutError::Timeout) => {
-                if outstanding.load(Ordering::Acquire) == 0 {
-                    break;
-                }
-            }
-            Err(RecvTimeoutError::Disconnected) => break,
-        }
-    }
+    // let mut results: Vec<(GroupId, (ResolutionResult, ConflictGroup))> = Vec::new();
+    // let mut last_progress = Instant::now();
+    // loop {
+    //     match group_result_receiver.recv_timeout(Duration::from_millis(250)) {
+    //         Ok(res) => {
+    //             results.push(res);
+    //             last_progress = Instant::now();
+    //         }
+    //         Err(RecvTimeoutError::Timeout) => {
+    //             if outstanding.load(Ordering::Acquire) == 0 {
+    //                 break;
+    //             }
+    //         }
+    //         Err(RecvTimeoutError::Disconnected) => break,
+    //     }
+    // }
 
-    // Stop workers
-    cancel_token.cancel();
+    // // Stop workers
+    // cancel_token.cancel();
 
-    let processing_end = last_progress; // updated on every Ok(res)
-    let processing_duration = processing_end.duration_since(processing_start);
+    // let processing_end = last_progress; // updated on every Ok(res)
+    // let processing_duration = processing_end.duration_since(processing_start);
+
+    let results = conflict_resolving_pool.process_groups_backtest(
+        groups,
+        &input.ctx,
+        block_state.clone(),
+        Arc::clone(&simulation_cache),
+    );
+
 
     // Block building result assembler creation
     let assembler_start = Instant::now();
@@ -528,11 +511,6 @@ where
 
     let mut best_results: HashMap<GroupId, (ResolutionResult, ConflictGroup)> = HashMap::default();
 
-    for (gid, (res, grp)) in results.iter() {
-        println!("Received result for group {}: profit {}", gid, res.total_profit);
-    }
-    println!("Total results received: {}", results.len());
-
     for (gid, (res, grp)) in results.into_iter() {
         match best_results.get_mut(&gid) {
             None => { best_results.insert(gid, (res, grp)); }
@@ -544,17 +522,6 @@ where
             }
         }
     }
-
-
-    // let mut total = 0;
-    // for (gid, (res, grp)) in best_results.iter() {
-    //     total += res.sequence_of_orders.len();
-    //     println!("Group {}: profit {}, gas {}, number of orders {}", gid, res.total_profit, res.gas_used, res.sequence_of_orders.len());
-    //     for (order_idx, profit, gas_used) in res.sequence_of_orders.iter() {
-    //         println!("  Order idx {}: id {}, profit {}, gas {}", order_idx, grp.orders[*order_idx].order.id(), profit, gas_used);
-    //     }
-    // }
-    // println!("Total orders in best results: {}", total);
 
     let collection_duration = collection_start.elapsed();
 
@@ -592,7 +559,7 @@ where
 
     trace!("Initialization time: {:?}", init_duration);
     trace!("Setup time: {:?}", setup_duration);
-    trace!("Group processing time: {:?}", processing_duration);
+    // trace!("Group processing time: {:?}", processing_duration);
     trace!("Assembler creation time: {:?}", assembler_duration);
     trace!("Best results collection time: {:?}", collection_duration);
     trace!("Block building time: {:?}", building_duration);

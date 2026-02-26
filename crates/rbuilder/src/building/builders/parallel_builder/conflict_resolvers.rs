@@ -18,7 +18,7 @@ use rayon::prelude::*;
 use super::{
     simulation_cache::{CachedSimulationState, SharedSimulationCache},
     Algorithm, ConflictTask, ResolutionResult,
-    nonce_handling::{GroupDeps, DependencyDag, GreedyKey, allowed_indices_after_nonce_dedup, enumerate_all_with_choices, random_ordering_with_random_choices, ALL_PERMS_CAP},
+    nonce_handling::{GroupDeps, DependencyDag, GreedyKey, allowed_indices_after_nonce_dedup, enumerate_all_with_choices, ALL_PERMS_CAP},
     genetic_algo::*,
 };
 
@@ -94,7 +94,6 @@ impl ResolverContext {
                 population,
                 crossover_rate,
                 mutation_rate,
-                tourn_k,
                 max_generations,
                 time_ms,
                 seed,
@@ -105,7 +104,6 @@ impl ResolverContext {
                     population,
                     crossover_rate,
                     mutation_rate,
-                    tourn_k,
                     max_generations,
                     time_ms,
                     seed,
@@ -141,11 +139,6 @@ impl ResolverContext {
             _ => {
                 let sequences = generate_sequences_of_orders_to_try(&task);
 
-                // Print up to 5 sequences for debugging
-                for (i, seq) in sequences.iter().take(5).enumerate() {
-                    println!("Sequence {}: {:?}", i, seq);
-                }
-                
                 let results: Vec<ResolutionResult> = sequences
                     .into_par_iter()
                     .map_init(
@@ -570,8 +563,20 @@ impl ResolverContext {
         let Some(deps) = build_group_deps(task) else {
             return Ok(ResolutionResult::default());
         };
+        // Build a single DAG shared by all individuals.
+        // Nonce conflicts are resolved greedily upfront.
+        let dag = if deps.has_conflicts() {
+            let active = deps.dedup_best(&task.group, GreedyKey::Profit, false);
+            deps.build_dag(&active)
+        } else {
+            deps.build_dag_all()
+        };
 
-        // ─── Problem structure summary ───
+        if dag.is_empty() {
+            return Ok(ResolutionResult::default());
+        }
+
+        // Problem structure summary
         {
             let n_orders = deps.n;
             let n_slots = deps.slot_providers.len();
@@ -587,9 +592,8 @@ impl ResolverContext {
                 n_orders, n_slots, n_conflicting_slots, max_candidates_per_slot, total_candidates);
             println!("  has_nonce_deps={}, orders_with_deps={}, orders_with_multi_provides (bundles)={}",
                 has_deps, orders_with_deps, orders_with_multi_provides);
-            println!("  params: pop={}, crossover={}, mutation={}, tourn_k={}, max_gens={}, time_ms={}, islands={}, migration_interval={}",
-                params.population, params.crossover_rate, params.mutation_rate, params.tourn_k,
-                params.max_generations, params.time_ms, params.num_islands, params.migration_interval);
+            println!("  params: pop={}, crossover={}, mutation={}, max_gens={}, time_ms={}, islands={}, migration_interval={}",
+                params.population, params.crossover_rate, params.mutation_rate, params.max_generations, params.time_ms, params.num_islands, params.migration_interval);
         }
 
         let start = Instant::now();
@@ -600,16 +604,12 @@ impl ResolverContext {
         let population_per_island = (params.population / num_islands).max(4);
         let total_pop = num_islands * population_per_island;
 
-        println!("About to begin...");
-        // --- Seeding: raw permutations (length = all orders), decode each into a valid Individual.
-        let all_seed_raw = seed_initial_population(task, params.seed, total_pop);
-        let all_seed_inds: Vec<Individual> = all_seed_raw
-            .into_iter()
-            .map(|raw| individual_from_raw_seq(raw, &deps))
+        // Seed population with weighted topo sorts of the shared DAG
+        let all_seed_seqs = generate_seed_sequences(&dag, task, params.seed, total_pop);
+        let all_seed_inds: Vec<Individual> = all_seed_seqs.into_iter()
+            .map(|seq| individual_from_seq(seq))
             .collect();
-        println!("Generated {} seed individuals, starting evaluation...", all_seed_inds.len());
 
-        // --- Evaluate seeds in parallel (eval_individual must use ind.seq (decoded) as before).
         let all_evaluated: Vec<(Individual, ResolutionResult)> = all_seed_inds
             .into_par_iter()
             .map_init(
@@ -663,13 +663,15 @@ impl ResolverContext {
 
             let profit_before = best_result.total_profit;
 
-            // Phase 1: Generate all children (now uses simplified operators on raw_seq).
+            // Phase 1: Generate all children
             let t_phase1 = Instant::now();
             let mut all_children: Vec<PendingChild> = Vec::new();
             let mut all_pair_infos: Vec<(usize, Vec<ParentPairInfo>)> = Vec::new();
 
             for (island_idx, island) in islands.iter_mut().enumerate() {
-                let (children, pair_infos) = generate_dc_children(island, island_idx, &params, &deps);
+                let (children, pair_infos) = generate_dc_children(
+                    island, island_idx, &params, &dag,
+                );
                 all_children.extend(children);
                 all_pair_infos.push((island_idx, pair_infos));
             }
@@ -700,7 +702,7 @@ impl ResolverContext {
                 .map(|(_, infos)| vec![None; infos.len() * 2])
                 .collect();
 
-            // ─── Child evaluation diagnostics ───
+            // Child evaluation diagnostics
             let mut child_profits: Vec<U256> = Vec::new();
             let mut child_better_count = 0usize;
             let mut child_worse_count = 0usize;
@@ -766,25 +768,24 @@ impl ResolverContext {
                 );
             }
 
-            // ─── Snapshot parent profits before DC to measure competition outcomes ───
+            // Snapshot parent profits before DC to measure competition outcomes
             let pre_dc_profits: Vec<Vec<U256>> = islands
                 .iter()
                 .map(|isl| isl.population.iter().map(|ind| ind.profit).collect())
                 .collect();
 
-            // Phase 3: DC competition per island (distance uses decoded seq + choices)
+            // Phase 3: DC competition per island
             let t_phase3 = Instant::now();
             for (island_pos, (island_idx, pair_infos)) in all_pair_infos.iter().enumerate() {
                 apply_dc_competition(
                     &mut islands[*island_idx],
                     pair_infos,
                     &mut island_children[island_pos],
-                    &deps,
                 );
             }
             let phase3_dur = t_phase3.elapsed();
 
-            // ─── DC competition outcome diagnostics ───
+            // DC competition outcome diagnostics
             {
                 let mut dc_replacements = 0usize;
                 let mut dc_kept = 0usize;
@@ -880,11 +881,63 @@ impl ResolverContext {
     }
 }
 
+/// Generate seed sequences as weighted topo sorts of the shared DAG.
+/// Uses profit-biased sampling with increasing temperature for diversity.
+fn generate_seed_sequences(
+    dag: &DependencyDag,
+    task: &ConflictTask,
+    seed: u64,
+    count: usize,
+) -> Vec<Vec<usize>> {
+    let mut rng = SmallRng::seed_from_u64(seed);
+    let order_values = profit_values_f64(&task.group.orders);
+
+    temperature_schedule(count).into_iter()
+        .map(|t| dag.sample_weighted_topo_sort(&order_values, t, &mut rng))
+        .collect()
+}
+
+/// Convert order profits to f64 for weighted sampling.
+fn profit_values_f64(orders: &[Arc<SimulatedOrder>]) -> Vec<f64> {
+    orders.iter()
+        .map(|o| {
+            let profit = o.sim_value.full_profit_info().coinbase_profit();
+            let lo = profit.as_limbs()[0] as f64;
+            let hi = profit.as_limbs()[1] as f64;
+            hi * (u64::MAX as f64 + 1.0) + lo
+        })
+        .collect()
+}
+
+/// Generate a temperature schedule: 2 greedy, ~60% tight (0.5–2.0), ~30% broad (3.0–8.0).
+fn temperature_schedule(count: usize) -> Vec<f64> {
+    let mut temps = Vec::with_capacity(count);
+
+    // First 2: pure greedy
+    for _ in 0..2.min(count) {
+        temps.push(0.0);
+    }
+
+    // Next ~60%: tight exploration
+    let tight_count = ((count as f64 * 0.6) as usize).min(count.saturating_sub(temps.len()));
+    for i in 0..tight_count {
+        temps.push(0.5 + 1.5 * (i as f64) / (tight_count.max(1) as f64));
+    }
+
+    // Remaining: broader exploration
+    while temps.len() < count {
+        let i = temps.len();
+        temps.push(3.0 + 5.0 * (i as f64) / (count.max(1) as f64));
+    }
+
+    temps
+}
+
 /// Print diversity and fitness statistics for a population across all islands.
 fn print_population_stats(
     label: &str,
     islands: &[Island],
-    deps: &GroupDeps,
+    _deps: &GroupDeps,
 ) {
     let all_inds: Vec<&Individual> = islands.iter().flat_map(|isl| isl.population.iter()).collect();
     let n = all_inds.len();
@@ -917,19 +970,15 @@ fn print_population_stats(
     let avg_seq = seq_lens.iter().sum::<usize>() as f64 / n as f64;
 
     // Active set size stats
-    let mut active_sizes: Vec<usize> = all_inds.iter().map(|ind| ind.active.len()).collect();
+    let mut active_sizes: Vec<usize> = all_inds.iter().map(|ind| ind.seq.len()).collect();
     active_sizes.sort();
     let min_active = active_sizes[0];
     let max_active = active_sizes[n - 1];
 
-    // Choice diversity: how many unique choice sets
+    // Sequence diversity: how many unique orderings
     let unique_choices = all_inds
         .iter()
-        .map(|ind| {
-            let mut pairs: Vec<_> = ind.choices.iter().map(|(k, v)| (k.clone(), *v)).collect();
-            pairs.sort_by(|a, b| a.0.address.cmp(&b.0.address).then(a.0.nonce.cmp(&b.0.nonce)));
-            pairs
-        })
+        .map(|ind| ind.seq.clone())
         .collect::<ahash::HashSet<_>>()
         .len();
 
@@ -945,7 +994,7 @@ fn print_population_stats(
         'outer: for i in 0..n {
             for j in (i + 1)..n {
                 if pair_idx % step.max(1) == 0 {
-                    let d = dc_distance(all_inds[i], all_inds[j], deps);
+                    let d = kendall_tau_distance(&all_inds[i].seq, &all_inds[j].seq);
                     dist_sum += d;
                     dist_count += 1;
                     if d < dist_min { dist_min = d; }
@@ -958,10 +1007,10 @@ fn print_population_stats(
     }
     let avg_dist = if dist_count > 0 { dist_sum / dist_count as f64 } else { 0.0 };
 
-    // Unique raw_seq (full genome identity)
+    // Unique genomes (full genome identity)
     let unique_genomes = all_inds
         .iter()
-        .map(|ind| ind.raw_seq.clone())
+        .map(|ind| ind.seq.clone())
         .collect::<ahash::HashSet<_>>()
         .len();
 
@@ -1010,6 +1059,7 @@ fn print_population_stats(
 pub fn generate_sequences_of_orders_to_try(task: &ConflictTask) -> Vec<Vec<usize>> {
     match task.algorithm {
         Algorithm::Greedy => generate_greedy_sequence(task, false),
+        Algorithm::GreedyFast => generate_greedy_sequence_with_nonce(task, false),
         Algorithm::GreedyHeap => vec![],
         Algorithm::ReverseGreedy => generate_greedy_sequence(task, true),
         Algorithm::Length => generate_length_based_sequence(task),
@@ -1031,65 +1081,6 @@ fn generate_random_permutations(task: &ConflictTask, seed: u64, count: usize) ->
     out
 }
 
-// pub fn generate_random_permutations(
-//     task: &ConflictTask,
-//     seed: u64,
-//     count: usize,
-// ) -> Vec<Vec<usize>> {
-//     let Some(deps) = build_group_deps(task) else {
-//         return generate_random_permutations(task, seed, count);
-//     };
-
-//     let mut rng = SmallRng::seed_from_u64(seed);
-//     (0..count)
-//         .map(|_| random_ordering_with_random_choices(&deps, &mut rng))
-//         .collect()
-// }
-
-// pub fn generate_random_permutations_with_nonce(task: &ConflictTask, seed: u64, count: usize) -> Vec<Vec<usize>> {
-//     if let Some(deps) = build_group_deps(task) {
-//         let mut rng = SmallRng::seed_from_u64(seed);
-//         let order_values: Vec<f64> = task.group.orders.iter()
-//             .map(|o| {
-//                 let profit = o.sim_value.full_profit_info().coinbase_profit();
-//                 let lo = profit.as_limbs()[0] as f64;
-//                 let hi = profit.as_limbs()[1] as f64;
-//                 hi * (u64::MAX as f64 + 1.0) + lo
-//             })
-//             .collect();
-
-//         let active = deps.dedup_best(&task.group, GreedyKey::Profit, false);
-//         let dag = deps.build_dag(&active);
-//         let mut out = Vec::with_capacity(count);
-
-//         // First 2: pure greedy
-//         for _ in 0..2.min(count) {
-//             out.push(dag.sample_weighted_topo_sort(&order_values, 0.0, &mut rng));
-//         }
-
-//         // Next 60%: tight exploration (temp 0.5 to 2.0)
-//         // At temp=1 with 2 ready nodes, top node is picked ~73% of the time
-//         // With 5 ready nodes, top node ~55%, top-2 ~90%
-//         // This finds orderings differing from greedy by a few swaps
-//         let tight_count = ((count as f64 * 0.6) as usize).min(count.saturating_sub(out.len()));
-//         for i in 0..tight_count {
-//             let t = 0.5 + 1.5 * (i as f64) / (tight_count.max(1) as f64);
-//             out.push(dag.sample_weighted_topo_sort(&order_values, t, &mut rng));
-//         }
-
-//         // Remaining ~30%: broader exploration
-//         while out.len() < count {
-//             let remaining = count - out.len();
-//             let i = count - remaining;
-//             let t = 3.0 + 5.0 * (i as f64) / (count.max(1) as f64);
-//             out.push(dag.sample_weighted_topo_sort(&order_values, t, &mut rng));
-//         }
-
-//         return out;
-//     }
-//     generate_random_permutations(task, seed, count)
-// }
-
 pub fn generate_random_permutations_with_nonce(
     task: &ConflictTask,
     seed: u64,
@@ -1100,58 +1091,13 @@ pub fn generate_random_permutations_with_nonce(
     };
 
     let mut rng = SmallRng::seed_from_u64(seed);
+    let order_values = profit_values_f64(&task.group.orders);
 
-    // Profit -> f64 (same as you had)
-    let order_values: Vec<f64> = task.group.orders.iter()
-        .map(|o| {
-            let profit = o.sim_value.full_profit_info().coinbase_profit();
-            let lo = profit.as_limbs()[0] as f64;
-            let hi = profit.as_limbs()[1] as f64;
-            hi * (u64::MAX as f64 + 1.0) + lo
-        })
-        .collect();
-
-    let mut out = Vec::with_capacity(count);
-
-    // First 2: greedy (good starting points).
-    for _ in 0..2.min(count) {
-        out.push(ordering_with_biased_choices_and_weighted_topo(
-            &deps,
-            &order_values,
-            /*choice_temperature=*/0.0,
-            /*topo_temperature=*/0.0,
-            &mut rng,
-        ));
-    }
-
-    // Next ~60%: tighter exploration
-    let tight_count = ((count as f64 * 0.6) as usize).min(count.saturating_sub(out.len()));
-    for i in 0..tight_count {
-        let t = 0.5 + 1.5 * (i as f64) / (tight_count.max(1) as f64);
-        out.push(ordering_with_biased_choices_and_weighted_topo(
-            &deps,
-            &order_values,
-            /*choice_temperature=*/t,
-            /*topo_temperature=*/t,
-            &mut rng,
-        ));
-    }
-
-    // Remaining: broader exploration
-    while out.len() < count {
-        let remaining = count - out.len();
-        let i = count - remaining;
-        let t = 3.0 + 5.0 * (i as f64) / (count.max(1) as f64);
-        out.push(ordering_with_biased_choices_and_weighted_topo(
-            &deps,
-            &order_values,
-            /*choice_temperature=*/t,
-            /*topo_temperature=*/t,
-            &mut rng,
-        ));
-    }
-
-    out
+    temperature_schedule(count).into_iter()
+        .map(|t| ordering_with_biased_choices_and_weighted_topo(
+            &deps, &order_values, t, t, &mut rng,
+        ))
+        .collect()
 }
 
 
@@ -1186,7 +1132,7 @@ fn generate_all_permutations(task: &ConflictTask) -> Vec<Vec<usize>> {
 /// # Returns
 ///
 /// A vector of static sequences of order indices, sorted by coinbase profit and mev_gas_price.
-fn generate_greedy_sequence(task: &ConflictTask, reverse: bool) -> Vec<Vec<usize>> {
+fn generate_greedy_sequence_with_nonce(task: &ConflictTask, reverse: bool) -> Vec<Vec<usize>> {
     let g = &task.group;
 
     let allowed_profit =
@@ -1194,7 +1140,7 @@ fn generate_greedy_sequence(task: &ConflictTask, reverse: bool) -> Vec<Vec<usize
     let allowed_mgp =
         allowed_indices_after_nonce_dedup(g, GreedyKey::MevGasPrice, reverse);
 
-    let build = |allowed: &Option<AHashSet<usize>>,
+    let build = |allowed: &Option<HashSet<usize>>,
                  value_extractor: fn(&SimulatedOrder) -> U256| -> Vec<usize> {
         let mut v: Vec<_> = g.orders.iter().enumerate()
             .filter(|(idx, _)| allowed.as_ref().map_or(true, |s| s.contains(idx)))
@@ -1210,49 +1156,33 @@ fn generate_greedy_sequence(task: &ConflictTask, reverse: bool) -> Vec<Vec<usize
         build(&allowed_mgp, |o| o.sim_value.full_profit_info().mev_gas_price()),
     ]
 }
-// fn generate_greedy_sequence(task: &ConflictTask, reverse: bool) -> Vec<Vec<usize>> {
-//     let order_group = &task.group;
 
-//     let create_sequence = |value_extractor: fn(&SimulatedOrder) -> U256| {
-//         let mut ids_and_value: Vec<_> = order_group
-//             .orders
-//             .iter()
-//             .enumerate()
-//             .map(|(idx, order)| (idx, value_extractor(order)))
-//             .collect();
+fn generate_greedy_sequence(task: &ConflictTask, reverse: bool) -> Vec<Vec<usize>> {
+    let order_group = &task.group;
 
-//         ids_and_value.sort_by(|a, b| {
-//             if reverse {
-//                 a.1.cmp(&b.1)
-//             } else {
-//                 b.1.cmp(&a.1)
-//             }
-//         });
-//         ids_and_value.into_iter().map(|(idx, _)| idx).collect()
-//     };
+    let create_sequence = |value_extractor: fn(&SimulatedOrder) -> U256| {
+        let mut ids_and_value: Vec<_> = order_group
+            .orders
+            .iter()
+            .enumerate()
+            .map(|(idx, order)| (idx, value_extractor(order)))
+            .collect();
 
-//     vec![
-//         create_sequence(|sim_order| sim_order.sim_value.full_profit_info().coinbase_profit()),
-//         create_sequence(|sim_order| sim_order.sim_value.full_profit_info().mev_gas_price()),
-//     ]
-// }
+        ids_and_value.sort_by(|a, b| {
+            if reverse {
+                a.1.cmp(&b.1)
+            } else {
+                b.1.cmp(&a.1)
+            }
+        });
+        ids_and_value.into_iter().map(|(idx, _)| idx).collect()
+    };
 
-// fn generate_length_based_sequence(task: &ConflictTask) -> Vec<Vec<usize>> {
-//     let order_group = &task.group;
-//     let allowed = allowed_indices_after_nonce_dedup(order_group, GreedyKey::Profit, false);
-
-//     let mut order_data: Vec<(usize, usize, U256)> = order_group
-//         .orders
-//         .iter()
-//         .enumerate()
-//         .filter(|(idx, _)| allowed.as_ref().map_or(true, |set| set.contains(idx)))
-//         .map(|(idx, order)| (idx, order.order.list_txs().len(), order.sim_value.full_profit_info().coinbase_profit()))
-//         .collect();
-
-//     order_data.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| b.2.cmp(&a.2)));
-//     let seq: Vec<usize> = order_data.into_iter().map(|(idx, _, _)| idx).collect();
-//     vec![seq]
-// }
+    vec![
+        create_sequence(|sim_order| sim_order.sim_value.full_profit_info().coinbase_profit()),
+        create_sequence(|sim_order| sim_order.sim_value.full_profit_info().mev_gas_price()),
+    ]
+}
 
 fn generate_length_based_sequence(task: &ConflictTask) -> Vec<Vec<usize>> {
     let mut sequences_of_orders = vec![];
@@ -1279,12 +1209,6 @@ fn generate_length_based_sequence(task: &ConflictTask) -> Vec<Vec<usize>> {
 
     sequences_of_orders.push(length_based_sequence);
     sequences_of_orders
-}
-
-fn seed_initial_population(task: &ConflictTask, seed: u64, total_pop: usize) -> Vec<Vec<usize>> {
-    let mut seeds = generate_greedy_sequence(task, false);
-    seeds.extend(generate_random_permutations(task, seed, total_pop - seeds.len()));
-    seeds
 }
 
 #[cfg(test)]

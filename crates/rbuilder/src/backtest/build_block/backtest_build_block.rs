@@ -130,8 +130,8 @@ where
     }
 
     let processing_start = Instant::now();
-    let blob_cap = ctx.max_blob_gas_per_block();
-    let sim_orders = select_orders_under_blob_cap(&sim_orders, blob_cap);
+    // let blob_cap = ctx.max_blob_gas_per_block();
+    // let sim_orders = select_orders_under_blob_cap(&sim_orders, blob_cap);
     let processing_duration = processing_start.elapsed();
     ctx.blob_tx_selection_duration = Some(processing_duration);
 

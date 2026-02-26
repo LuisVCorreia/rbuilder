@@ -991,7 +991,7 @@ mod tests {
     use reth_primitives::{Recovered, Transaction};
     use uuid::Uuid;
 
-    use crate::primitives::{
+    use rbuilder_primitives::{
         Bundle, MempoolTx, Metadata, Order, SimValue, SimulatedOrder,
         TransactionSignedEcRecoveredWithBlobs, LAST_BUNDLE_VERSION,
     };
@@ -1047,10 +1047,7 @@ mod tests {
                 tx_with_blobs: with_blobs,
             }).into(),
             used_state_trace: None,
-            sim_value: SimValue {
-                coinbase_profit: U256::from(profit),
-                ..Default::default()
-            },
+            sim_value: SimValue::new_test_no_gas(U256::from(profit), U256::ZERO),
         })
     }
 
@@ -1082,16 +1079,15 @@ mod tests {
             metadata: Metadata::default(),
             dropping_tx_hashes: Vec::new(),
             refund: None,
+            refund_identity: None,
+            external_hash: None,
             version: LAST_BUNDLE_VERSION,
         };
 
         Arc::new(SimulatedOrder {
-            order: Order::Bundle(bundle),
+            order: Order::Bundle(bundle).into(),
             used_state_trace: None,
-            sim_value: SimValue {
-                coinbase_profit: U256::from(profit),
-                ..Default::default()
-            },
+            sim_value: SimValue::new_test_no_gas(U256::from(profit), U256::ZERO),
         })
     }
 

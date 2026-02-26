@@ -61,6 +61,8 @@ impl Ord for ConflictTask {
 pub enum Algorithm {
     /// `Greedy` checks the following ordrerings: max profit, mev gas price
     Greedy,
+    /// `GreedyFast` is a faster version of `Greedy` that handles nonces during sequence generation
+    GreedyFast,
     /// `HeapGreedy` checks the following ordrerings: max profit, mev gas price using a heap like the ordering builder
     GreedyHeap,
     /// `ReverseGreedy` checks the reverse greedy orderings: e.g. min profit, min mev gas price first
@@ -72,8 +74,8 @@ pub enum Algorithm {
     /// `Random` checks random permutations of the group.
     Random { seed: u64, count: usize },
     /// `Genetic` uses a genetic algorithm to find near-optimal orderings.
-    Genetic { population: usize, crossover_rate: f64, mutation_rate: f64, tourn_k: usize, max_generations: usize, time_ms: u64, seed: u64, num_islands: usize, migration_interval: usize },
-    /// `RandomImproved` checks valid random permutations of the group only.
+    Genetic { population: usize, crossover_rate: f64, mutation_rate: f64, max_generations: usize, time_ms: u64, seed: u64, num_islands: usize, migration_interval: usize },
+    /// `RandomImproved` checks nonce-valid random permutations of the group only.
     RandomImproved { seed: u64, count: usize },
 }
 
@@ -81,6 +83,7 @@ impl Algorithm {
     pub fn display(&self) -> &str {
         match self {
             Algorithm::Greedy => "Greedy",
+            Algorithm::GreedyFast => "GreedyFast",
             Algorithm::GreedyHeap => "HeapGreedy",
             Algorithm::ReverseGreedy => "ReverseGreedy",
             Algorithm::Length => "Length",
