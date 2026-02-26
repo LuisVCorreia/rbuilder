@@ -45,6 +45,7 @@ use crate::{
     provider::StateProviderFactory,
     utils::elapsed_ms,
 };
+use conflict_resolvers::{AlgoRecord, GAGenRecord};
 
 use self::{
     block_building_result_assembler::BlockBuildingResultAssembler,
@@ -470,7 +471,7 @@ where
     // let processing_end = last_progress; // updated on every Ok(res)
     // let processing_duration = processing_end.duration_since(processing_start);
 
-    let results = conflict_resolving_pool.process_groups_backtest(
+    let (results, algo_records, ga_records) = conflict_resolving_pool.process_groups_backtest(
         groups,
         &input.ctx,
         block_state.clone(),
@@ -559,11 +560,59 @@ where
 
     trace!("Initialization time: {:?}", init_duration);
     trace!("Setup time: {:?}", setup_duration);
-    // trace!("Group processing time: {:?}", processing_duration);
     trace!("Assembler creation time: {:?}", assembler_duration);
     trace!("Best results collection time: {:?}", collection_duration);
     trace!("Block building time: {:?}", building_duration);
     trace!("Total time taken: {:?}", total_duration);
+
+    // Write parallel builder analytics
+    {
+        let analytics_dir = {
+            let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+            let workspace_root = manifest_dir
+                .ancestors()
+                .find(|p| p.join("Cargo.lock").exists())
+                .unwrap_or(manifest_dir.as_path())
+                .to_path_buf();
+            workspace_root
+                .parent()
+                .unwrap_or(workspace_root.as_path())
+                .join("parallel_builder_analytics")
+        };
+        if let Err(e) = std::fs::create_dir_all(&analytics_dir) {
+            error!(%e, "Failed to create parallel_builder_analytics directory");
+        } else {
+            let block = input.ctx.block();
+            // File 1: algo results + block profit
+            #[derive(serde::Serialize)]
+            struct AlgoResultsFile<'a> {
+                block_number: u64,
+                block_profit_wei: String,
+                algo_results: &'a [AlgoRecord],
+            }
+            let algo_file = analytics_dir.join(format!("algo_results_{}.json", block));
+            let payload = AlgoResultsFile {
+                block_number: block,
+                block_profit_wei: payout_tx_value.to_string(),
+                algo_results: &algo_records,
+            };
+            if let Ok(json) = serde_json::to_string_pretty(&payload) {
+                if let Err(e) = std::fs::write(&algo_file, json) {
+                    error!(%e, "Failed to write algo_results analytics");
+                }
+            }
+
+            // File 2: GA per-generation records
+            if !ga_records.is_empty() {
+                let ga_file = analytics_dir.join(format!("ga_analytics_{}.json", block));
+                if let Ok(json) = serde_json::to_string_pretty(&ga_records) {
+                    if let Err(e) = std::fs::write(&ga_file, json) {
+                        error!(%e, "Failed to write ga_analytics");
+                    }
+                }
+            }
+        }
+    }
 
     Ok(finalize_block_result.block)
 }

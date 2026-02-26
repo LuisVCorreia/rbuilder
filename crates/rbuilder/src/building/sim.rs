@@ -25,7 +25,100 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
-use tracing::{error, trace};
+use tracing::{error, trace, info};
+
+// Simulation analytics types
+
+/// Record emitted for every successful simulation.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SimulationRecord {
+    /// Unique id of the simulation task
+    pub sim_id: SimulationId,
+    /// Human-readable order id
+    pub order_id: String,
+    /// "bundle" or "mempool_tx" (or "unknown" if we can't tell)
+    pub order_kind: String,
+    /// Whether any transaction in the order carries blob (EIP-4844) sidecar data
+    pub has_blob_txs: bool,
+    /// Wall-clock time the simulation took (including parent simulations), in microseconds
+    pub simulation_time_us: u64,
+    /// Gas consumed by the simulation (includes reverted txs)
+    pub gas_used: u64,
+    /// Number of transactions in the order
+    pub num_txs: usize,
+    /// Number of parent orders that had to be simulated first
+    pub num_parents: usize,
+    /// Coinbase profit of the simulated order (wei, stored as string to avoid f64 precision loss)
+    pub coinbase_profit_wei: String,
+}
+
+/// Accumulates [`SimulationRecord`]s and can flush them to a JSON file.
+#[derive(Debug, Default)]
+pub struct SimulationAnalytics {
+    records: Vec<SimulationRecord>,
+}
+
+impl SimulationAnalytics {
+    pub fn new() -> Self {
+        Self {
+            records: Vec::new(),
+        }
+    }
+
+    pub fn push(&mut self, record: SimulationRecord) {
+        self.records.push(record);
+    }
+
+    pub fn records(&self) -> &[SimulationRecord] {
+        &self.records
+    }
+
+    /// Write all collected records to `path` as a JSON array.
+    /// Appends to existing data if the file already exists.
+    pub fn flush_to_file(&self, path: &std::path::Path) -> std::io::Result<()> {
+        use std::io::Write;
+
+        let mut all_records: Vec<SimulationRecord> = Vec::new();
+
+        // If the file already exists, load previous records so we append
+        if path.exists() {
+            if let Ok(contents) = std::fs::read_to_string(path) {
+                if let Ok(mut existing) =
+                    serde_json::from_str::<Vec<SimulationRecord>>(&contents)
+                {
+                    all_records.append(&mut existing);
+                }
+            }
+        }
+
+        all_records.extend(self.records.iter().cloned());
+
+        let json = serde_json::to_string_pretty(&all_records)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+
+        let mut file = std::fs::File::create(path)?;
+        file.write_all(json.as_bytes())?;
+
+        info!(
+            path = %path.display(),
+            new_records = self.records.len(),
+            total_records = all_records.len(),
+            "Flushed simulation analytics"
+        );
+
+        Ok(())
+    }
+}
+
+// Helpers to classify orders
+
+/// Returns `"bundle"` or `"mempool_tx"` (or `"unknown"`).
+fn classify_order_kind(order: &Order) -> &'static str {
+    match order {
+        Order::Bundle(_) => "bundle",
+        Order::Tx(_) => "mempool_tx",
+    }
+}
 
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)]
@@ -328,6 +421,23 @@ where
     };
     let mut sim_tree = SimTree::new(nonces);
 
+    let analytics_dir = {
+        let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let workspace_root = manifest_dir
+            .ancestors()
+            .find(|p| p.join("Cargo.lock").exists())
+            .unwrap_or(manifest_dir.as_path())
+            .to_path_buf();
+        workspace_root
+            .parent()
+            .unwrap_or(workspace_root.as_path())
+            .join("simulation_analytics")
+    };
+    std::fs::create_dir_all(&analytics_dir).unwrap_or_else(|e| {
+        error!(%e, "Failed to create analytics directory");
+    });
+    let analytics_path = analytics_dir.join(format!("sim_analytics_{}.json", ctx.block()));
+
     let mut orders = orders.to_vec();
     let random_insert_size = max(orders.len() / 20, 1);
     if randomize_insertion {
@@ -339,6 +449,7 @@ where
     }
 
     let mut sim_errors = Vec::new();
+    let mut analytics = SimulationAnalytics::new();
     let mut state_for_sim =
         Arc::<dyn StateProvider>::from(provider.history_by_block_hash(ctx.attributes.parent)?);
     let mut local_ctx = ThreadBlockBuildingContext::default();
@@ -382,23 +493,49 @@ where
                     sim_errors.push(err);
                     continue;
                 }
-                OrderSimResult::Success(sim_order, nonces) => {
+                OrderSimResult::Success(ref sim_order, ref nonces) => {
+                    let elapsed = start_time.elapsed();
+
+                    // Record analytics for successful simulation
+                    let record = SimulationRecord {
+                        sim_id: sim_task.id,
+                        order_id: sim_task.order.id().to_string(),
+                        order_kind: classify_order_kind(&sim_task.order).to_string(),
+                        has_blob_txs: sim_task.order.has_blobs(),
+                        simulation_time_us: elapsed.as_micros() as u64,
+                        gas_used: sim_result.gas_used,
+                        num_txs: sim_task.order.list_txs_len(),
+                        num_parents: sim_task.parents.len(),
+                        coinbase_profit_wei: sim_order
+                            .sim_value
+                            .full_profit_info()
+                            .coinbase_profit()
+                            .to_string(),
+                    };
+                    analytics.push(record);
+
                     let result = SimulatedResult {
                         id: sim_task.id,
-                        simulated_order: sim_order,
+                        simulated_order: sim_order.clone(),
                         previous_orders: sim_task.parents,
                         nonces_after: nonces
-                            .into_iter()
-                            .map(|(address, nonce)| NonceKey { address, nonce })
+                            .iter()
+                            .map(|(address, nonce)| NonceKey {
+                                address: *address,
+                                nonce: *nonce,
+                            })
                             .collect(),
-
-                        simulation_time: start_time.elapsed(),
+                        simulation_time: elapsed,
                     };
                     sim_results.push(result);
                 }
             }
         }
         sim_tree.submit_simulation_tasks_results(sim_results)?;
+    }
+
+    if let Err(e) = analytics.flush_to_file(analytics_path.as_path()) {
+        error!(%e, "Failed to write simulation analytics");
     }
 
     Ok((

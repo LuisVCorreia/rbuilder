@@ -11,7 +11,8 @@ use tracing::{trace, warn};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::{
-    conflict_resolvers::ResolverContext, conflict_task_generator::{get_tasks_for_group},
+    conflict_resolvers::{AlgoRecord, GAGenRecord, ResolverContext},
+    conflict_task_generator::get_tasks_for_group,
     simulation_cache::SharedSimulationCache, ConflictGroup, ConflictResolutionResultPerGroup,
     ConflictTask, GroupId, ResolutionResult, TaskPriority,
 };
@@ -82,7 +83,6 @@ where
                 loop {
                     match task_queue.recv_timeout(std::time::Duration::from_millis(100)) {
                         Ok(task) => {
-                            println!("Popped task for group_idx {}, task algo {:?}", task.group_idx, task.algorithm);
                             if cancellation_token.is_cancelled() {
                                 if let Some(ref o) = outstanding { o.fetch_sub(1, Ordering::AcqRel); }
                                 return;
@@ -97,7 +97,7 @@ where
                                 Arc::clone(&simulation_cache),
                             );
                             if let Some(ref o) = outstanding { o.fetch_sub(1, Ordering::AcqRel); }
-                            if let Ok((task_id, result)) = processed {
+                            if let Ok((task_id, result, _algo_record, _ga_records)) = processed {
                                 match group_result_sender.send((task_id, result)) {
                                     Ok(_) => {
                                         trace!(
@@ -136,7 +136,7 @@ where
         state: Arc<dyn StateProvider>,
         cancellation_token: CancellationToken,
         simulation_cache: Arc<SharedSimulationCache>,
-    ) -> Result<(GroupId, (ResolutionResult, ConflictGroup))> {
+    ) -> Result<(GroupId, (ResolutionResult, ConflictGroup), AlgoRecord, Vec<GAGenRecord>)> {
         let mut merging_context = ResolverContext::new(
             state,
             ctx.clone(),
@@ -148,7 +148,7 @@ where
         let task_algo = task.algorithm;
 
         match merging_context.run_conflict_task(task, local_ctx) {
-            Ok(sequence_of_orders) => {
+            Ok((sequence_of_orders, algo_record, ga_records)) => {
                 trace!(
                     task_type = ?task_algo,
                     group_id = task_id,
@@ -156,7 +156,7 @@ where
                     order_count = sequence_of_orders.sequence_of_orders.len(),
                     "Successfully ran conflict task"
                 );
-                Ok((task_id, (sequence_of_orders, task_group)))
+                Ok((task_id, (sequence_of_orders, task_group), algo_record, ga_records))
             }
             Err(err) => {
                 // Fast patch/heuristic to fix excessive tracing.
@@ -179,8 +179,10 @@ where
         ctx: &BlockBuildingContext,
         state: Arc<dyn StateProvider>,
         simulation_cache: Arc<SharedSimulationCache>,
-    ) -> Vec<(GroupId, (ResolutionResult, ConflictGroup))> {
+    ) -> (Vec<(GroupId, (ResolutionResult, ConflictGroup))>, Vec<AlgoRecord>, Vec<GAGenRecord>) {
         let mut results = Vec::new();
+        let mut algo_records: Vec<AlgoRecord> = Vec::new();
+        let mut ga_records: Vec<GAGenRecord> = Vec::new();
         let mut local_ctx = ThreadBlockBuildingContext::default();
         for new_group in new_groups {
             let tasks = get_tasks_for_group(&new_group, TaskPriority::High, self.safe_sorting_only);
@@ -194,11 +196,13 @@ where
                     CancellationToken::new(),
                     simulation_cache,
                 );
-                if let Ok(result) = result {
-                    results.push(result);
+                if let Ok((gid, res_grp, algo_rec, ga_recs)) = result {
+                    results.push((gid, res_grp));
+                    algo_records.push(algo_rec);
+                    ga_records.extend(ga_recs);
                 }
             }
         }
-        results
+        (results, algo_records, ga_records)
     }
 }
