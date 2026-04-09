@@ -74,7 +74,7 @@ pub enum Algorithm {
     /// `Random` checks random permutations of the group.
     Random { seed: u64, count: usize },
     /// `Genetic` uses a genetic algorithm to find near-optimal orderings.
-    Genetic { population: usize, crossover_rate: f64, mutation_rate: f64, max_generations: usize, time_ms: u64, seed: u64, num_islands: usize, migration_interval: usize },
+    Genetic { population: usize, crossover_rate: f64, mutation_rate: f64, max_generations: usize, time_ms: u64, seed: u64, num_islands: usize, migration_interval: usize, w_choice: f64, early_stopping_generations: usize, temp_tight_low: f64, temp_tight_high: f64, temp_broad_low: f64, temp_broad_high: f64, tight_fraction: f64 },
     /// `RandomImproved` checks nonce-valid random permutations of the group only.
     RandomImproved { seed: u64, count: usize },
 }

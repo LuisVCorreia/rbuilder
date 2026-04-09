@@ -32,7 +32,7 @@ use rbuilder_primitives::SimulatedOrder;
 
 pub const ALL_PERMS_CAP: usize = 120;
 
-// ─── Greedy metric helpers ──────────────────────────────────────────────
+// Greedy metric helpers
 
 #[derive(Clone, Copy, Debug)]
 pub enum GreedyKey {
@@ -70,7 +70,7 @@ fn is_better(a: usize, b: usize, group: &ConflictGroup, key: GreedyKey, reverse:
     a < b
 }
 
-// ─── Per-order dependency info ──────────────────────────────────────────
+// Order dependency info
 
 /// Nonce-level dependency information for a single order.
 #[derive(Debug, Clone)]
@@ -86,7 +86,7 @@ pub struct OrderDeps {
     pub requires: Vec<NonceKey>,
 }
 
-// ─── Group-level dependency info ────────────────────────────────────────
+// Group-level dependency info
 
 /// Aggregate dependency information for every order in a [`ConflictGroup`].
 ///
@@ -276,7 +276,7 @@ impl GroupDeps {
     }
 }
 
-// ─── Dependency DAG ─────────────────────────────────────────────────────
+// Dependency DAG
 
 /// A concrete dependency DAG over a selected subset of orders.
 ///
@@ -284,13 +284,13 @@ impl GroupDeps {
 /// order indices via [`DependencyDag::nodes`].
 #[derive(Debug, Clone)]
 pub struct DependencyDag {
-    /// DAG node `i` corresponds to `group.orders[nodes[i]]`.
+    /// DAG node `i` corresponds to `group.orders[nodes[i]]`
     pub nodes: Vec<usize>,
-    /// Reverse lookup: original order index → DAG node index.
+    /// Reverse lookup: original order index --> DAG node index
     pub node_of: HashMap<usize, usize>,
-    /// Adjacency list: `successors[i]` = nodes that depend on node `i`.
+    /// Adjacency list: `successors[i]` = nodes that depend on node `i`
     pub successors: Vec<Vec<usize>>,
-    /// Number of predecessors for each node (used as starting state for algorithms).
+    /// Number of predecessors for each node (used as starting state for algorithms)
     pub in_degree: Vec<usize>,
 }
 
@@ -576,10 +576,10 @@ impl DependencyDag {
     }
 }
 
-// ─── Enumeration with duplicate-nonce branching ─────────────────────────
+// Enumeration with duplicate-nonce branching
 
-/// Enumerate all valid orderings, branching over **both** slot-conflict
-/// choices (which candidate fills each duplicate-nonce slot) **and**
+/// Enumerate all valid orderings, branching over both slot-conflict
+/// choices (which candidate fills each duplicate-nonce slot) and
 /// topological sort orderings.  Capped at `cap` total results.
 ///
 /// Also respects a work budget so it won't hang on large inputs.
@@ -864,7 +864,7 @@ fn pick_weighted_by_value<R: Rng + ?Sized>(
     ranked.last().unwrap().0
 }
 
-// ─── Convenience wrappers (backward-compatible signatures) ──────────────
+// Convenience wrappers
 
 /// Set of order indices surviving the best-per-slot dedup.
 pub fn allowed_indices_after_nonce_dedup(
@@ -925,7 +925,7 @@ pub fn orderings_leq_cap(group: &ConflictGroup, cap: usize) -> Option<bool> {
     }
 }
 
-// ─── Logging / stats helpers ────────────────────────────────────────────
+// Logging / stats helpers
 
 /// ln(n!) computed via sum of logs (exact enough for moderate n).
 pub fn ln_fact(n: usize) -> f64 {
@@ -996,13 +996,13 @@ mod tests {
         TransactionSignedEcRecoveredWithBlobs, LAST_BUNDLE_VERSION,
     };
 
-    // ─── Test addresses ─────────────────────────────────────────────
+    // Test addresses
 
     const SENDER_A: Address = address!("0x000000000000000000000000000000000000000a");
     const SENDER_B: Address = address!("0x000000000000000000000000000000000000000b");
     const SENDER_C: Address = address!("0x000000000000000000000000000000000000000c");
 
-    // ─── Helpers ────────────────────────────────────────────────────
+    // Helpers
 
     struct IdGen(u64);
 

@@ -18,7 +18,7 @@ use rayon::prelude::*;
 use super::{
     simulation_cache::{CachedSimulationState, SharedSimulationCache},
     Algorithm, ConflictTask, ResolutionResult,
-    nonce_handling::{GroupDeps, DependencyDag, GreedyKey, allowed_indices_after_nonce_dedup, enumerate_all_with_choices, ALL_PERMS_CAP},
+    nonce_handling::{GroupDeps, GreedyKey, allowed_indices_after_nonce_dedup, enumerate_all_with_choices, ALL_PERMS_CAP},
     genetic_algo::*,
 };
 
@@ -148,6 +148,13 @@ impl ResolverContext {
                 seed,
                 num_islands,
                 migration_interval,
+                w_choice,
+                early_stopping_generations,
+                temp_tight_low,
+                temp_tight_high,
+                temp_broad_low,
+                temp_broad_high,
+                tight_fraction,
             } => {
                 let params = GAParams {
                     population,
@@ -158,6 +165,13 @@ impl ResolverContext {
                     seed,
                     num_islands,
                     migration_interval,
+                    w_choice,
+                    early_stopping_generations,
+                    temp_tight_low,
+                    temp_tight_high,
+                    temp_broad_low,
+                    temp_broad_high,
+                    tight_fraction,
                 };
                 let (res, ga_records) = self.run_genetic(&task, params, local_ctx)?;
                 trace!(
@@ -479,7 +493,7 @@ impl ResolverContext {
         task: &ConflictTask,
         local_ctx: &mut ThreadBlockBuildingContext,
     ) -> eyre::Result<(Individual, ResolutionResult)> {
-        let res = self.evaluate_fitness(&ind.seq, task, local_ctx)?;
+        let res = self.evaluate_fitness(&ind.nonce_seq, task, local_ctx)?;
         ind.profit = res.total_profit;
         ind.gas = res.gas_used;
         Ok((ind, res))
@@ -604,16 +618,8 @@ impl ResolverContext {
         let Some(deps) = build_group_deps(task) else {
             return Ok((ResolutionResult::default(), vec![]));
         };
-        // Build a single DAG shared by all individuals.
-        // Nonce conflicts are resolved greedily upfront.
-        let dag = if deps.has_conflicts() {
-            let active = deps.dedup_best(&task.group, GreedyKey::Profit, false);
-            deps.build_dag(&active)
-        } else {
-            deps.build_dag_all()
-        };
 
-        if dag.is_empty() {
+        if task.group.orders.is_empty() {
             return Ok((ResolutionResult::default(), vec![]));
         }
 
@@ -625,10 +631,9 @@ impl ResolverContext {
         let population_per_island = (params.population / num_islands).max(4);
         let total_pop = num_islands * population_per_island;
 
-        // Seed population with weighted topo sorts of the shared DAG
-        let all_seed_seqs = generate_seed_sequences(&dag, task, params.seed, total_pop);
+        let all_seed_seqs = generate_seed_sequences(task, params.seed, total_pop, &params);
         let all_seed_inds: Vec<Individual> = all_seed_seqs.into_iter()
-            .map(|seq| individual_from_seq(seq))
+            .map(|seq| individual_from_seq(seq, &deps))
             .collect();
 
         let all_evaluated: Vec<(Individual, ResolutionResult)> = all_seed_inds
@@ -690,7 +695,6 @@ impl ResolverContext {
 
         let mut generation = 0usize;
         let mut gens_without_improvement = 0usize;
-        const EARLY_STOPPING_LIMIT: usize = 10;
 
         loop {
             if generation >= params.max_generations || Instant::now() >= deadline {
@@ -709,7 +713,7 @@ impl ResolverContext {
 
             for (island_idx, island) in islands.iter_mut().enumerate() {
                 let (children, pair_infos) = generate_dc_children(
-                    island, island_idx, &params, &dag,
+                    island, island_idx, &params, &deps,
                 );
                 all_children.extend(children);
                 all_pair_infos.push((island_idx, pair_infos));
@@ -805,6 +809,8 @@ impl ResolverContext {
                     &mut islands[*island_idx],
                     pair_infos,
                     &mut island_children[island_pos],
+                    &deps,
+                    params.w_choice,
                 );
             }
             let phase3_dur = t_phase3.elapsed();
@@ -822,13 +828,9 @@ impl ResolverContext {
             let t_migration = Instant::now();
             if generation > 0 && generation % migration_interval == 0 {
                 let migrants: Vec<Individual> = islands
-                    .iter_mut()
+                    .iter()
                     .map(|island| {
-                        let mut sorted_indices: Vec<usize> = (0..island.population.len()).collect();
-                        sorted_indices.sort_by(|&a, &b| island.population[b].profit.cmp(&island.population[a].profit));
-                        let top_k = sorted_indices.len().min(3);
-                        let pick = island.rng.gen_range(0..top_k);
-                        island.population[sorted_indices[pick]].clone()
+                        island.population.iter().max_by_key(|ind| ind.profit).unwrap().clone()
                     })
                     .collect();
 
@@ -889,7 +891,7 @@ impl ResolverContext {
                 gens_without_improvement += 1;
             }
 
-            if gens_without_improvement >= EARLY_STOPPING_LIMIT {
+            if gens_without_improvement >= params.early_stopping_generations {
                 break;
             }
 
@@ -900,20 +902,62 @@ impl ResolverContext {
     }
 }
 
-/// Generate seed sequences as weighted topo sorts of the shared DAG.
-/// Uses profit-biased sampling with increasing temperature for diversity.
+/// Generate seed sequences as biased raw permutations of all N orders.
+/// Uses profit-weighted sampling with increasing temperature for diversity.
 fn generate_seed_sequences(
-    dag: &DependencyDag,
     task: &ConflictTask,
     seed: u64,
     count: usize,
+    params: &GAParams,
 ) -> Vec<Vec<usize>> {
     let mut rng = SmallRng::seed_from_u64(seed);
     let order_values = profit_values_f64(&task.group.orders);
+    let n = task.group.orders.len();
 
-    temperature_schedule(count).into_iter()
-        .map(|t| dag.sample_weighted_topo_sort(&order_values, t, &mut rng))
+    temperature_schedule(count, params).into_iter()
+        .map(|t| sample_weighted_raw_permutation(&order_values, t, &mut rng, n))
         .collect()
+}
+
+/// Sample a biased permutation of all N order indices using profit weights.
+/// At t=0: deterministic descending-profit sort. At t>0: weighted shuffle.
+fn sample_weighted_raw_permutation(
+    values: &[f64],
+    temperature: f64,
+    rng: &mut SmallRng,
+    n: usize,
+) -> Vec<usize> {
+    if temperature == 0.0 {
+        let mut indices: Vec<usize> = (0..n).collect();
+        indices.sort_by(|&a, &b| values[b].partial_cmp(&values[a]).unwrap_or(std::cmp::Ordering::Equal));
+        return indices;
+    }
+
+    let mut remaining: Vec<usize> = (0..n).collect();
+    let mut weights: Vec<f64> = remaining.iter().map(|&i| (values[i] / temperature).exp()).collect();
+    let mut result = Vec::with_capacity(n);
+
+    while !remaining.is_empty() {
+        let total: f64 = weights.iter().sum();
+        if total <= 0.0 || !total.is_finite() {
+            result.extend(remaining.iter());
+            break;
+        }
+        let r = rng.gen::<f64>() * total;
+        let mut cumsum = 0.0;
+        let mut chosen = remaining.len() - 1;
+        for i in 0..remaining.len() {
+            cumsum += weights[i];
+            if r <= cumsum {
+                chosen = i;
+                break;
+            }
+        }
+        result.push(remaining[chosen]);
+        remaining.swap_remove(chosen);
+        weights.swap_remove(chosen);
+    }
+    result
 }
 
 /// Convert order profits to f64 for weighted sampling.
@@ -921,29 +965,50 @@ fn profit_values_f64(orders: &[Arc<SimulatedOrder>]) -> Vec<f64> {
     orders.iter()
         .map(|o| {
             let profit = o.sim_value.full_profit_info().coinbase_profit();
-            let lo = profit.as_limbs()[0] as f64;
-            let hi = profit.as_limbs()[1] as f64;
-            hi * (u64::MAX as f64 + 1.0) + lo
+            let limbs = profit.as_limbs();
+            let scale = u64::MAX as f64 + 1.0;
+            limbs[0] as f64
+                + limbs[1] as f64 * scale
+                + limbs[2] as f64 * scale * scale
+                + limbs[3] as f64 * scale * scale * scale
         })
         .collect()
 }
 
-/// Generate a temperature schedule: 2 greedy, ~60% tight (0.5–2.0), ~30% broad (3.0–8.0).
-fn temperature_schedule(count: usize) -> Vec<f64> {
+/// Generate a temperature schedule parameterized by GAParams.
+fn temperature_schedule(count: usize, params: &GAParams) -> Vec<f64> {
     let mut temps = Vec::with_capacity(count);
 
-    // First 2: pure greedy
     for _ in 0..2.min(count) {
         temps.push(0.0);
     }
 
-    // Next ~60%: tight exploration
+    let tight_count = ((count as f64 * params.tight_fraction) as usize).min(count.saturating_sub(temps.len()));
+    for i in 0..tight_count {
+        temps.push(params.temp_tight_low + (params.temp_tight_high - params.temp_tight_low) * (i as f64) / (tight_count.max(1) as f64));
+    }
+
+    while temps.len() < count {
+        let i = temps.len();
+        temps.push(params.temp_broad_low + (params.temp_broad_high - params.temp_broad_low) * (i as f64) / (count.max(1) as f64));
+    }
+
+    temps
+}
+
+/// Temperature schedule with default values for non-GA callers.
+fn temperature_schedule_defaults(count: usize) -> Vec<f64> {
+    let mut temps = Vec::with_capacity(count);
+
+    for _ in 0..2.min(count) {
+        temps.push(0.0);
+    }
+
     let tight_count = ((count as f64 * 0.6) as usize).min(count.saturating_sub(temps.len()));
     for i in 0..tight_count {
         temps.push(0.5 + 1.5 * (i as f64) / (tight_count.max(1) as f64));
     }
 
-    // Remaining: broader exploration
     while temps.len() < count {
         let i = temps.len();
         temps.push(3.0 + 5.0 * (i as f64) / (count.max(1) as f64));
@@ -967,7 +1032,7 @@ fn collect_pop_stats(islands: &[Island]) -> (usize, usize, usize, usize, U256, U
     let zero_profit_count = profits.iter().filter(|&&p| p == U256::ZERO).count();
     let unique_genomes = all_inds
         .iter()
-        .map(|ind| ind.seq.clone())
+        .map(|ind| ind.nonce_seq.clone())
         .collect::<ahash::HashSet<_>>()
         .len();
     (n, unique_genomes, unique_profits, zero_profit_count, profits[0], profits[n / 2], profits[n - 1])
@@ -1019,7 +1084,7 @@ pub fn generate_random_permutations_with_nonce(
     let mut rng = SmallRng::seed_from_u64(seed);
     let order_values = profit_values_f64(&task.group.orders);
 
-    temperature_schedule(count).into_iter()
+    temperature_schedule_defaults(count).into_iter()
         .map(|t| ordering_with_biased_choices_and_weighted_topo(
             &deps, &order_values, t, t, &mut rng,
         ))
