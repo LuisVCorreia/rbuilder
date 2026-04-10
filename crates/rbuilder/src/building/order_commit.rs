@@ -352,8 +352,6 @@ pub enum OrderErr {
     NoExclusiveProfit,
     #[error("Negative profit: {0}")]
     NegativeProfit(U256),
-    #[error("Order changed pool prices in actual execution and was rolled back")]
-    NotPriceNeutral,
 }
 
 /// Sometimes we want to reject orders that pass simulation but we think are not going to be good for the block.

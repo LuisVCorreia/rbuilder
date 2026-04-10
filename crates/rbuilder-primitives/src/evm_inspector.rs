@@ -115,31 +115,29 @@ impl UsedStateTrace {
         self.touched_pools.clear();
     }
 
-    /// Returns true if for every pool touched by this order the price after all txs is exactly
-    /// equal to the price before any tx touched the pool.
+    /// Returns the relative price displacement for each pool touched by this order.
     ///
-    /// Uses `read_slot_values` (first-read-wins across the bundle = pre-bundle price) and
-    /// `written_slot_values` (last-write-wins across the bundle = post-bundle price).
-    /// This is correct even when the same pool is touched by multiple txs in the bundle.
+    /// For V3: |sqrtPriceX96_after - sqrtPriceX96_before| / sqrtPriceX96_before.
+    /// For V2: |price_after - price_before| / price_before, where price = reserve1 / reserve0.
     ///
-    /// Orders with no touched pools are considered price-neutral (vacuously true).
-    pub fn is_price_neutral(&self) -> bool {
+    /// Returns 0.0 for a pool when there is no write (price unchanged) or no read.
+    /// Orders with no touched pools return an empty map.
+    pub fn price_displacement(&self) -> HashMap<Address, f64> {
+        let mut result = HashMap::default();
         let mask112: U256 = (U256::from(1u64) << 112) - U256::from(1u64);
 
         for (pool, kind) in &self.touched_pools {
-            match kind {
+            let displacement = match kind {
                 PoolKind::UniV3 => {
                     let key = SlotKey { address: *pool, key: B256::ZERO };
+                    let mask = sqrt_price_mask(); // lower 160 bits
                     let before = self.read_slot_values.get(&key)
-                        .map(|v| U256::from_be_bytes(v.0) & sqrt_price_mask());
+                        .map(|v| u256_to_f64(U256::from_be_bytes(v.0) & mask));
                     let after = self.written_slot_values.get(&key)
-                        .map(|v| U256::from_be_bytes(v.0) & sqrt_price_mask());
-                    // No write entry means the SSTORE hook saw no net change — treat as neutral.
-                    // TODO: maybe we should not treat these as neutral, can get top of block
-                    if let (Some(b), Some(a)) = (before, after) {
-                        if b != a {
-                            return false;
-                        }
+                        .map(|v| u256_to_f64(U256::from_be_bytes(v.0) & mask));
+                    match (before, after) {
+                        (Some(b), Some(a)) if b > 0.0 => (a - b).abs() / b,
+                        _ => 0.0,
                     }
                 }
                 PoolKind::UniV2 => {
@@ -147,22 +145,28 @@ impl UsedStateTrace {
                         address: *pool,
                         key: B256::from(U256::from(8u64).to_be_bytes::<32>()),
                     };
-                    let extract = |v: &B256| -> (U256, U256) {
+                    let extract = |v: &B256| -> (f64, f64) {
                         let s = U256::from_be_bytes(v.0);
-                        (s & mask112, (s >> 112) & mask112) // (reserve0, reserve1)
+                        // reserves packed as (reserve1 << 112 | reserve0), each 112 bits
+                        let r0 = u256_to_f64(s & mask112);
+                        let r1 = u256_to_f64((s >> 112) & mask112);
+                        (r0, r1)
                     };
                     let before = self.read_slot_values.get(&key).map(extract);
                     let after = self.written_slot_values.get(&key).map(extract);
-                    if let (Some((r0b, r1b)), Some((r0a, r1a))) = (before, after) {
-                        // Cross-multiply to avoid lossy division: same price iff r1b*r0a == r1a*r0b
-                        if r1b * r0a != r1a * r0b {
-                            return false;
+                    match (before, after) {
+                        (Some((r0b, r1b)), Some((r0a, r1a))) if r0b > 0.0 && r0a > 0.0 => {
+                            let price_before = r1b / r0b;
+                            let price_after = r1a / r0a;
+                            (price_after - price_before).abs() / price_before
                         }
+                        _ => 0.0,
                     }
                 }
-            }
+            };
+            result.insert(*pool, displacement);
         }
-        true // TODO: Might change this to false, we're only interested in bundles that touch pools, everything else is ordered greedily as per usual
+        result
     }
 }
 
@@ -392,115 +396,22 @@ fn sqrt_price_mask() -> U256 {
     (U256::from(1u64) << 160) - U256::from(1u64)
 }
 
+/// Convert a U256 to f64 via its little-endian u64 limbs.
+/// Precision is limited to ~15 significant digits, which is acceptable for displacement ratios.
+/// Safe for the full uint160 range (sqrtPriceX96 max ~1.46e48) unlike u128 which overflows at ~3.4e38.
+#[inline]
+fn u256_to_f64(v: U256) -> f64 {
+    const TWO64: f64 = 1.844_674_407_370_955_2e19; // 2^64
+    let limbs = v.as_limbs(); // [lo0, lo1, lo2, lo3] little-endian u64s
+    limbs[0] as f64
+        + limbs[1] as f64 * TWO64
+        + limbs[2] as f64 * (TWO64 * TWO64)
+        + limbs[3] as f64 * (TWO64 * TWO64 * TWO64)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn b256(v: U256) -> B256 {
-        B256::from(v.to_be_bytes::<32>())
-    }
-
-    fn slot0_key(pool: Address) -> SlotKey {
-        SlotKey { address: pool, key: B256::ZERO }
-    }
-
-    fn slot8_key(pool: Address) -> SlotKey {
-        SlotKey { address: pool, key: b256(U256::from(8u64)) }
-    }
-
-    fn pack_reserves(reserve0: U256, reserve1: U256) -> B256 {
-        let mask112: U256 = (U256::from(1u64) << 112) - U256::from(1u64);
-        b256((reserve1 & mask112) << 112 | (reserve0 & mask112))
-    }
-
-    // ── is_price_neutral ─────────────────────────────────────────────────────
-
-    #[test]
-    fn test_v3_neutral_no_write() {
-        // Pool touched but no slot written → price unchanged → neutral
-        let pool = Address::repeat_byte(0x01);
-        let mut trace = UsedStateTrace::default();
-        trace.touched_pools.insert(pool, PoolKind::UniV3);
-        trace.read_slot_values.insert(slot0_key(pool), b256(U256::from(1_000_000u64)));
-        // No write → is_price_neutral returns true
-        assert!(trace.is_price_neutral());
-    }
-
-    #[test]
-    fn test_v3_neutral_same_sqrt_price() {
-        // Both read and written slot have the same sqrtPriceX96 → neutral
-        let pool = Address::repeat_byte(0x02);
-        let p = U256::from(1_000_000u64);
-        let mut trace = UsedStateTrace::default();
-        trace.touched_pools.insert(pool, PoolKind::UniV3);
-        trace.read_slot_values.insert(slot0_key(pool), b256(p));
-        trace.written_slot_values.insert(slot0_key(pool), b256(p));
-        assert!(trace.is_price_neutral());
-    }
-
-    #[test]
-    fn test_v3_impacting_different_sqrt_price() {
-        let pool = Address::repeat_byte(0x03);
-        let mut trace = UsedStateTrace::default();
-        trace.touched_pools.insert(pool, PoolKind::UniV3);
-        trace.read_slot_values.insert(slot0_key(pool), b256(U256::from(1_000_000u64)));
-        trace.written_slot_values.insert(slot0_key(pool), b256(U256::from(1_010_000u64)));
-        assert!(!trace.is_price_neutral());
-    }
-
-    #[test]
-    fn test_v3_neutral_backrun_restores_price() {
-        // Simulate append_trace result for a user tx + backrun on V3:
-        //   read_slot_values[slot0] = P0  (first read, from user tx)
-        //   written_slot_values[slot0] = P0  (last write, from backrun restoring the price)
-        let pool = Address::repeat_byte(0x04);
-        let p0 = U256::from(1_000_000u64);
-        let mut trace = UsedStateTrace::default();
-        trace.touched_pools.insert(pool, PoolKind::UniV3);
-        trace.read_slot_values.insert(slot0_key(pool), b256(p0));
-        trace.written_slot_values.insert(slot0_key(pool), b256(p0));
-        assert!(trace.is_price_neutral());
-    }
-
-    #[test]
-    fn test_v2_neutral_same_reserves() {
-        let pool = Address::repeat_byte(0x05);
-        let (r0, r1) = (U256::from(100_000u64), U256::from(200_000u64));
-        let mut trace = UsedStateTrace::default();
-        trace.touched_pools.insert(pool, PoolKind::UniV2);
-        trace.read_slot_values.insert(slot8_key(pool), pack_reserves(r0, r1));
-        trace.written_slot_values.insert(slot8_key(pool), pack_reserves(r0, r1));
-        assert!(trace.is_price_neutral());
-    }
-
-    #[test]
-    fn test_v2_impacting_changed_reserves() {
-        let pool = Address::repeat_byte(0x06);
-        let mut trace = UsedStateTrace::default();
-        trace.touched_pools.insert(pool, PoolKind::UniV2);
-        trace.read_slot_values.insert(slot8_key(pool), pack_reserves(U256::from(100u64), U256::from(200u64)));
-        trace.written_slot_values.insert(slot8_key(pool), pack_reserves(U256::from(110u64), U256::from(181u64)));
-        assert!(!trace.is_price_neutral());
-    }
-
-    #[test]
-    fn test_v2_neutral_cross_multiply_exact_cancel() {
-        // Backrun exactly restores reserves to original values.
-        // After append_trace: read=original, write=original → neutral.
-        let pool = Address::repeat_byte(0x07);
-        let (r0, r1) = (U256::from(100u64), U256::from(200u64));
-        let mut trace = UsedStateTrace::default();
-        trace.touched_pools.insert(pool, PoolKind::UniV2);
-        trace.read_slot_values.insert(slot8_key(pool), pack_reserves(r0, r1));
-        trace.written_slot_values.insert(slot8_key(pool), pack_reserves(r0, r1));
-        assert!(trace.is_price_neutral());
-    }
-
-    #[test]
-    fn test_no_touched_pools_is_neutral() {
-        // Empty trace → vacuously neutral
-        assert!(UsedStateTrace::default().is_price_neutral());
-    }
 
     // ── append_trace ─────────────────────────────────────────────────────────
 

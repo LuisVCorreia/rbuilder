@@ -1,6 +1,5 @@
-use ahash::{HashMap, HashSet};
+use ahash::HashMap;
 use alloy_primitives::{Address, U256};
-use rbuilder_primitives::evm_inspector::{SlotKey, UsedStateTrace};
 use derivative::Derivative;
 use eyre::Result;
 use itertools::Itertools;
@@ -16,7 +15,7 @@ use super::{
 };
 
 use crate::building::{
-    BlockBuildingContext, BlockState, ExecutionError, ExecutionResult, OrderErr, PartialBlock,
+    BlockBuildingContext, BlockState, ExecutionError, ExecutionResult, PartialBlock,
     ThreadBlockBuildingContext,
 };
 use rbuilder_primitives::{OrderId, SimulatedOrder};
@@ -92,30 +91,6 @@ impl ResolverContext {
             best_resolution_result.total_profit,
             task.algorithm
         );
-
-        if task.group.orders.len() > 1700 && task.algorithm == Algorithm::DexDirectionBalanced {
-            let mut greedy_best = ResolutionResult {
-                total_profit: U256::ZERO,
-                sequence_of_orders: vec![],
-            };
-            for seq in generate_greedy_sequence(&task, false) {
-                let (result, _) =
-                    self.process_sequence_of_orders(seq, &task, self.state.clone())?;
-                self.update_best_result(result, &mut greedy_best);
-            }
-            let dex_profit = best_resolution_result.total_profit;
-            let greedy_profit = greedy_best.total_profit;
-            let (diff_sign, diff) = if dex_profit >= greedy_profit {
-                ("+", dex_profit - greedy_profit)
-            } else {
-                ("-", greedy_profit - dex_profit)
-            };
-            let dex_len = best_resolution_result.sequence_of_orders.len();
-            let greedy_len = greedy_best.sequence_of_orders.len();
-            eprintln!(
-                "[DBG grp=326] COMPARE: DexBalanced profit={dex_profit} txs={dex_len} vs Greedy profit={greedy_profit} txs={greedy_len} (dex{diff_sign}{diff})",
-            );
-        }
 
         Ok(best_resolution_result)
     }
@@ -196,71 +171,26 @@ impl ResolverContext {
 
             let sim_order = &task.group.orders[order_idx];
 
-            // For DexDirectionBalanced: orders that the static analysis classified as
-            // price-neutral must also prove to be price-neutral in the actual execution
-            // context (the block state may differ from top-of-block simulation).
-            // If the actual trace shows a price change, roll back the order and skip it.
-            let is_predicted_neutral = task.algorithm == Algorithm::DexDirectionBalanced
-                && sim_order
-                    .used_state_trace
-                    .as_ref()
-                    .map(|t| t.is_price_neutral())
-                    .unwrap_or(false);
-
-            let result = if is_predicted_neutral {
-                partial_block.commit_order(
-                    sim_order,
-                    &self.ctx,
-                    &mut local_ctx,
-                    &mut state,
-                    &|_, actual_trace: Option<&UsedStateTrace>| {
-                        if actual_trace.map(|t| t.is_price_neutral()).unwrap_or(true) {
-                            Ok(())
-                        } else {
-                            Err(ExecutionError::OrderError(OrderErr::NotPriceNeutral))
-                        }
-                    },
-                )?
-            } else {
-                partial_block.commit_order(
-                    sim_order,
-                    &self.ctx,
-                    &mut local_ctx,
-                    &mut state,
-                    &|_, _| Ok(()),
-                )?
-            };
+            let result = partial_block.commit_order(
+                sim_order,
+                &self.ctx,
+                &mut local_ctx,
+                &mut state,
+                &|_, _| Ok(()),
+            )?;
 
             match result {
-                Ok(res) => {
-                    if is_predicted_neutral {
-                        let expected =
-                            sim_order.sim_value.full_profit_info().coinbase_profit();
-                        let actual = res.coinbase_profit;
-                        eprintln!(
-                            "[DBG neutral-profit] order={:?} expected={expected} actual={actual} match={}",
-                            sim_order.order.id(),
-                            expected == actual
-                        );
-                    }
-                    self.handle_successful_commit(
-                        res,
-                        sim_order,
-                        order_idx,
-                        &mut pending_orders,
-                        &mut remaining_orders,
-                        &mut sequenced_order_result,
-                        &mut total_profit,
-                        &mut per_order_profits,
-                    )
-                }
+                Ok(res) => self.handle_successful_commit(
+                    res,
+                    sim_order,
+                    order_idx,
+                    &mut pending_orders,
+                    &mut remaining_orders,
+                    &mut sequenced_order_result,
+                    &mut total_profit,
+                    &mut per_order_profits,
+                ),
                 Err(err) => {
-                    if matches!(err, ExecutionError::OrderError(OrderErr::NotPriceNeutral)) {
-                        eprintln!(
-                            "[DBG neutral-discarded] order {:?} discarded: changed pool prices in actual execution",
-                            sim_order.order.id()
-                        );
-                    }
                     self.handle_err(&err, sim_order, &mut pending_orders, order_idx)
                 }
             }
@@ -519,77 +449,72 @@ fn generate_length_based_sequence(task: &ConflictTask) -> Vec<Vec<usize>> {
     sequences_of_orders
 }
 
-#[inline]
-fn coinbase_profit(task: &ConflictTask, idx: usize) -> U256 {
-    task.group.orders[idx]
-        .sim_value
-        .full_profit_info()
-        .coinbase_profit()
-}
-
-/// Place price-neutral bundles first (sorted by profit), then impacting orders (sorted by profit).
+/// Score-based DEX ordering: sort orders by (profit_eth - λ * impact), where
+/// impact is the sum of pool price displacements weighted by pool popularity.
 ///
-/// An order is "price-neutral" if for every pool it touches, the pool price after all its
-/// transactions exactly equals the price before any of them (e.g. user tx + MEV backrun that
-/// fully restores the price). These bundles can be included at the top of the block without
-/// perturbing pool prices seen by later orders.
+/// Pools touched by many orders in the conflict group get a higher weight, because
+/// a displacement there cascades across more downstream orders.
 ///
-/// Before placing a candidate-neutral order in the neutral bucket we also verify that it does
-/// not write to any storage slot that an impacting order reads.  This catches the common case
-/// where a neutral bundle consumes a nonce (or other state) that a high-profit impacting bundle
-/// depends on, which would cause the impacting bundle to revert if the neutral runs first.
-///
-/// Orders without a state trace are treated as impacting (placed after neutrals).
+/// Orders without a state trace get impact = 0 and are sorted purely by profit.
 fn generate_dex_marginal_centered_sequence(task: &ConflictTask) -> Vec<Vec<usize>> {
+    const ALPHA: f64 = 1.0; // pool-popularity weight: w(pool) = 1 + α * ln(1 + touch_count)
+    const LAMBDA: f64 = 0.5; // profit/impact trade-off
+    const WEI_TO_ETH: f64 = 1e-18;
+
     let n = task.group.orders.len();
+    let orders = &task.group.orders;
 
-    // Initial split by price-neutrality.
-    let (candidate_neutral, mut impacting): (Vec<usize>, Vec<usize>) =
-        (0..n).partition(|&i| {
-            task.group.orders[i]
-                .used_state_trace
-                .as_ref()
-                .map(|t| t.is_price_neutral())
-                .unwrap_or(false)
-        });
-
-    // Collect every storage slot READ by any impacting order (those that have a trace).
-    let impacting_reads: HashSet<&SlotKey> = impacting
-        .iter()
-        .filter_map(|&i| task.group.orders[i].used_state_trace.as_ref())
-        .flat_map(|t| t.read_slot_values.keys())
-        .collect();
-
-    // Keep a candidate neutral only if none of its WRITES overlap with the impacting reads.
-    // Neutrals that do write to such slots (e.g. consuming a nonce that an impacting bundle
-    // also needs) are demoted to impacting so the profit-based sort handles them correctly.
-    let mut neutral: Vec<usize> = Vec::new();
-    for i in candidate_neutral {
-        let demote = task.group.orders[i]
-            .used_state_trace
-            .as_ref()
-            .map(|t| {
-                t.written_slot_values
-                    .keys()
-                    .any(|k| impacting_reads.contains(k))
-            })
-            .unwrap_or(false);
-        if demote {
-            eprintln!(
-                "[DBG neutral-demote] order {:?} demoted to impacting: writes slots read by impacting orders (likely shared nonce/state)",
-                task.group.orders[i].order.id()
-            );
-            impacting.push(i);
-        } else {
-            neutral.push(i);
+    // Step 1: count how many orders touch each pool.
+    let mut touch_count: HashMap<Address, usize> = HashMap::default();
+    for order in orders.iter() {
+        if let Some(trace) = &order.used_state_trace {
+            for pool in trace.touched_pools.keys() {
+                *touch_count.entry(*pool).or_default() += 1;
+            }
         }
     }
 
-    neutral.sort_by(|&a, &b| coinbase_profit(task, b).cmp(&coinbase_profit(task, a)));
-    impacting.sort_by(|&a, &b| coinbase_profit(task, b).cmp(&coinbase_profit(task, a)));
+    // Step 2: compute a continuous score for each order.
+    let mut scored: Vec<(usize, f64)> = (0..n)
+        .map(|i| {
+            let order = &orders[i];
+            let profit_eth =
+                order.sim_value.full_profit_info().coinbase_profit().to::<u128>() as f64
+                    * WEI_TO_ETH;
 
-    neutral.extend(impacting);
-    vec![neutral]
+            let (impact, pool_dbg) = if let Some(trace) = &order.used_state_trace {
+                let displacements = trace.price_displacement();
+                let mut impact = 0.0f64;
+                let mut pool_dbg: Vec<String> = Vec::new();
+                for (pool, disp) in &displacements {
+                    let tc = *touch_count.get(pool).unwrap_or(&1);
+                    let w = 1.0 + ALPHA * (1.0 + tc as f64).ln();
+                    impact += w * disp;
+                    pool_dbg.push(format!("{pool:?}:disp={disp:.4},w={w:.2},tc={tc}"));
+                }
+                (impact, pool_dbg)
+            } else {
+                (0.0, vec![])
+            };
+
+            let score = profit_eth - LAMBDA * impact;
+
+            // eprintln!(
+            //     "[DBG dex-score] order={:?} profit_eth={profit_eth:.6} impact={impact:.6} \
+            //      lambda_impact={:.6} score={score:.6} pools={pool_dbg:?}",
+            //     order.order.id(),
+            //     LAMBDA * impact,
+            // );
+
+            (i, score)
+        })
+        .collect();
+
+    // Step 3: sort by score descending.
+    scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    let score_sequence: Vec<usize> = scored.into_iter().map(|(i, _)| i).collect();
+
+    vec![score_sequence]
 }
 
 #[cfg(test)]
