@@ -39,8 +39,9 @@ use evm::EthCachedEvmFactory;
 use jsonrpsee::core::Serialize;
 use parking_lot::Mutex;
 use rbuilder_primitives::{
-    mev_boost::BidAdjustmentData, BlockSpace, Order, OrderId, SimValue, SimulatedOrder,
-    TransactionSignedEcRecoveredWithBlobs,
+    evm_inspector::UsedStateTrace,
+    mev_boost::BidAdjustmentData,
+    BlockSpace, Order, OrderId, SimValue, SimulatedOrder, TransactionSignedEcRecoveredWithBlobs,
 };
 use reth::{
     payload::PayloadId,
@@ -721,13 +722,19 @@ impl<Tracer: SimulationTracer, PartialBlockExecutionTracerType: PartialBlockExec
         self.space_state.free_reserved_block_space();
     }
 
+    /// `result_filter` receives the sim value and the actual used-state trace from execution.
+    /// Returning `Err` rolls back the state and causes `commit_order` to return `Ok(Err(...))`.
+    /// Pass `&|_, _| Ok(())` to accept all orders unconditionally.
     pub fn commit_order(
         &mut self,
         order: &SimulatedOrder,
         ctx: &BlockBuildingContext,
         local_ctx: &mut ThreadBlockBuildingContext,
         state: &mut BlockState,
-        result_filter: &dyn Fn(&SimValue) -> Result<(), ExecutionError>,
+        result_filter: &dyn Fn(
+            &SimValue,
+            Option<&UsedStateTrace>,
+        ) -> Result<(), ExecutionError>,
     ) -> Result<Result<ExecutionResult, ExecutionError>, CriticalCommitOrderError> {
         self.partial_block_execution_tracer
             .update_commit_order_about_to_execute(order);
@@ -746,7 +753,10 @@ impl<Tracer: SimulationTracer, PartialBlockExecutionTracerType: PartialBlockExec
         ctx: &BlockBuildingContext,
         local_ctx: &mut ThreadBlockBuildingContext,
         state: &mut BlockState,
-        result_filter: &dyn Fn(&SimValue) -> Result<(), ExecutionError>,
+        result_filter: &dyn Fn(
+            &SimValue,
+            Option<&UsedStateTrace>,
+        ) -> Result<(), ExecutionError>,
     ) -> Result<Result<ExecutionResult, ExecutionError>, CriticalCommitOrderError> {
         let mut fork = PartialBlockFork::new_with_execution_tracer(
             state,
@@ -773,7 +783,7 @@ impl<Tracer: SimulationTracer, PartialBlockExecutionTracerType: PartialBlockExec
         let inplace_sim_result =
             create_sim_value(&order.order, &ok_result, &ctx.mempool_tx_detector);
 
-        match result_filter(&inplace_sim_result) {
+        match result_filter(&inplace_sim_result, ok_result.used_state_trace.as_ref()) {
             Ok(()) => {}
             Err(err) => {
                 fork.rollback(rollback);

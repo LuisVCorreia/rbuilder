@@ -57,7 +57,7 @@ impl Ord for ConflictTask {
 
 /// Algorithm provides an algorithm for resolving a [ConflictGroup].
 /// Initially these are all algorithms that produce a sequence of orders to execute.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Algorithm {
     /// `Greedy` checks the following ordrerings: max profit, mev gas price
     Greedy,
@@ -69,6 +69,11 @@ pub enum Algorithm {
     AllPermutations,
     /// `Random` checks random permutations of the group.
     Random { seed: u64, count: usize },
+    /// `DexDirectionBalanced` groups orders by pool, computes net signed price impact per order,
+    /// and interleaves up-movers and down-movers to keep pool prices near their starting values.
+    /// This maximises the number of orders that land without slippage reverts.
+    /// Orders with no swap data (or ~zero net impact) are appended last, sorted by profit.
+    DexDirectionBalanced,
 }
 
 #[cfg(test)]

@@ -251,7 +251,7 @@ impl TestSetup {
                 self.test_chain.block_building_context(),
                 &mut local_ctx,
                 &mut block_state,
-                &|_| Ok(()),
+                &|_, _| Ok(()),
             )?;
             results.push(result);
             let (bundle_state, _) = block_state.into_parts();

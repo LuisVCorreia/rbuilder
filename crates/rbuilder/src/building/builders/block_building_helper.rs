@@ -547,12 +547,15 @@ impl<
     ) -> Result<Result<&ExecutionResult, ExecutionError>, CriticalCommitOrderError> {
         self.built_block_trace.add_considered_order(order);
         let start = Instant::now();
+        // PartialBlock::commit_order also receives the actual UsedStateTrace; the trait-level
+        // filter only knows about SimValue, so we adapt by ignoring the trace parameter.
+        let adapted_filter = |v: &SimValue, _: Option<&rbuilder_primitives::evm_inspector::UsedStateTrace>| result_filter(v);
         let result = self.partial_block.commit_order(
             order,
             &self.building_ctx,
             local_ctx,
             &mut self.block_state,
-            result_filter,
+            &adapted_filter,
         );
         let sim_time = start.elapsed();
         if self

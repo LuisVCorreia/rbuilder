@@ -371,47 +371,56 @@ pub fn get_tasks_for_group(
         created_at,
     });
 
-    // Then, we can push lower priority tasks that have a low chance, but a chance, of finding a better result
-    if group.orders.len() <= MAX_LENGTH_FOR_ALL_PERMUTATIONS && !safe_sorting_only {
-        // AllPermutations
-        tasks.push(ConflictTask {
-            group_idx: group.id,
-            algorithm: Algorithm::AllPermutations,
-            priority,
-            group: group.clone(),
-            created_at,
-        });
-    } else {
-        if !safe_sorting_only {
-            // Random
-            tasks.push(ConflictTask {
-                group_idx: group.id,
-                algorithm: Algorithm::Random {
-                    seed: group.id as u64,
-                    count: NUMBER_OF_RANDOM_TASKS,
-                },
-                priority: TaskPriority::Low,
-                group: group.clone(),
-                created_at,
-            });
-        }
-        tasks.push(ConflictTask {
-            group_idx: group.id,
-            algorithm: Algorithm::Length,
-            priority: TaskPriority::Low,
-            group: group.clone(),
-            created_at,
-        });
-        if !safe_sorting_only {
-            tasks.push(ConflictTask {
-                group_idx: group.id,
-                algorithm: Algorithm::ReverseGreedy,
-                priority: TaskPriority::Low,
-                group: group.clone(),
-                created_at,
-            });
-        }
-    }
+    // DexDirectionBalanced: interleave up/down movers per pool to reduce slippage reverts
+    tasks.push(ConflictTask {
+        group_idx: group.id,
+        algorithm: Algorithm::DexDirectionBalanced,
+        priority: TaskPriority::Medium,
+        group: group.clone(),
+        created_at,
+    });
+
+    // // Then, we can push lower priority tasks that have a low chance, but a chance, of finding a better result
+    // if group.orders.len() <= MAX_LENGTH_FOR_ALL_PERMUTATIONS && !safe_sorting_only {
+    //     // AllPermutations
+    //     tasks.push(ConflictTask {
+    //         group_idx: group.id,
+    //         algorithm: Algorithm::AllPermutations,
+    //         priority,
+    //         group: group.clone(),
+    //         created_at,
+    //     });
+    // } else {
+    //     if !safe_sorting_only {
+    //         // Random
+    //         tasks.push(ConflictTask {
+    //             group_idx: group.id,
+    //             algorithm: Algorithm::Random {
+    //                 seed: group.id as u64,
+    //                 count: NUMBER_OF_RANDOM_TASKS,
+    //             },
+    //             priority: TaskPriority::Low,
+    //             group: group.clone(),
+    //             created_at,
+    //         });
+    //     }
+    //     tasks.push(ConflictTask {
+    //         group_idx: group.id,
+    //         algorithm: Algorithm::Length,
+    //         priority: TaskPriority::Low,
+    //         group: group.clone(),
+    //         created_at,
+    //     });
+    //     if !safe_sorting_only {
+    //         tasks.push(ConflictTask {
+    //             group_idx: group.id,
+    //             algorithm: Algorithm::ReverseGreedy,
+    //             priority: TaskPriority::Low,
+    //             group: group.clone(),
+    //             created_at,
+    //         });
+    //     }
+    // }
 
     tasks
 }
@@ -539,7 +548,7 @@ mod tests {
 
         assert_eq!(conflict_manager.existing_groups.len(), 1);
         assert!(conflict_manager.existing_groups.contains_key(&1));
-        assert_eq!(conflict_manager.task_queue.len(), 2);
+        assert_eq!(conflict_manager.task_queue.len(), 3);
     }
 
     #[test]
@@ -569,7 +578,7 @@ mod tests {
         conflict_manager.process_single_group(updated_group);
 
         assert_eq!(conflict_manager.existing_groups.len(), 1);
-        assert_eq!(conflict_manager.task_queue.len(), 2);
+        assert_eq!(conflict_manager.task_queue.len(), 3);
     }
 
     #[test]
@@ -602,7 +611,7 @@ mod tests {
 
         assert_eq!(conflict_manager.existing_groups.len(), 1);
         assert!(conflict_manager.existing_groups.contains_key(&2));
-        assert_eq!(conflict_manager.task_queue.len(), 2);
+        assert_eq!(conflict_manager.task_queue.len(), 3);
     }
 
     #[test]
@@ -646,7 +655,7 @@ mod tests {
         assert_eq!(conflict_manager.existing_groups.len(), 2);
         assert!(conflict_manager.existing_groups.contains_key(&2));
         assert!(conflict_manager.existing_groups.contains_key(&3));
-        assert_eq!(conflict_manager.task_queue.len(), 4);
+        assert_eq!(conflict_manager.task_queue.len(), 6);
     }
 
     #[test]

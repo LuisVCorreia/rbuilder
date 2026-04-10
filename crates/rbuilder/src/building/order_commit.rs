@@ -352,6 +352,8 @@ pub enum OrderErr {
     NoExclusiveProfit,
     #[error("Negative profit: {0}")]
     NegativeProfit(U256),
+    #[error("Order changed pool prices in actual execution and was rolled back")]
+    NotPriceNeutral,
 }
 
 /// Sometimes we want to reject orders that pass simulation but we think are not going to be good for the block.
@@ -1434,6 +1436,7 @@ where
         },
     };
     drop(evm);
+    rbuilder_inspector.process_execution_logs(res.result.logs());
     let access_list = rbuilder_inspector.into_access_list();
     if access_list.flatten().any(|(a, _)| blocklist.contains(&a)) {
         return Ok(Err(TransactionErr::Blocklist));
