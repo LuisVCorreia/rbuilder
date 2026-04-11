@@ -1177,6 +1177,7 @@ where
         },
     };
     drop(evm);
+    rbuilder_inspector.process_execution_logs(res.result.logs());
     let access_list = rbuilder_inspector.into_access_list();
     if access_list.flatten().any(|(a, _)| blocklist.contains(&a)) {
         return Ok(Err(TransactionErr::Blocklist));

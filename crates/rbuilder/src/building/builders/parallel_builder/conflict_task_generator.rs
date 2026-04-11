@@ -19,12 +19,20 @@ const THRESHOLD_FOR_SIGNIFICANT_CHANGE: u64 = 20;
 const NUMBER_OF_TOP_ORDERS_TO_CONSIDER_FOR_SIGNIFICANT_CHANGE: usize = 10;
 const NUMBER_OF_RANDOM_TASKS: usize = 50;
 
+/// Hyperparameter grid for the DEX direction backtest sweep.
+pub const DEX_ALPHA_VALUES: &[f64] = &[0.5, 1.0, 2.0];
+pub const DEX_LAMBDA_VALUES: &[f64] = &[0.01, 0.05, 0.1, 0.5, 1.0];
+
 /// Manages conflicts and updates for conflict groups, coordinating with a worker pool to process tasks.
 pub struct ConflictTaskGenerator {
     existing_groups: HashMap<GroupId, ConflictGroup>,
     task_queue: TaskQueueSender,
     group_result_sender: std_mpsc::Sender<ConflictResolutionResultPerGroup>,
     safe_sorting_only: bool,
+    /// When `true`, emits the full alpha×lambda hyperparameter grid of `DexDirectionBalanced` tasks
+    /// for every group with >120 valid orderings (backtest mode).
+    /// When `false`, emits a single `DexDirectionBalanced` task with default parameters (live mode).
+    hyperparam_sweep: bool,
 }
 
 impl ConflictTaskGenerator {
@@ -32,15 +40,21 @@ impl ConflictTaskGenerator {
     ///
     /// # Arguments
     ///
+    /// * `safe_sorting_only` - Only use sorting modes that don't risk breaking user refunds.
     /// * `task_queue` - The queue to store the generated tasks.
     /// * `group_result_sender` - The sender to send the results of the conflict resolution.
+    /// * `hyperparam_sweep` - When `true`, emit all 15 (alpha,lambda) `DexDirectionBalanced` tasks per
+    ///   eligible group (>120 orderings) for backtest hyperparameter analysis. When `false`,
+    ///   emit a single task with default parameters (live builder).
     pub fn new(
         safe_sorting_only: bool,
         task_queue: TaskQueueSender,
         group_result_sender: std_mpsc::Sender<ConflictResolutionResultPerGroup>,
+        hyperparam_sweep: bool,
     ) -> Self {
         Self {
             safe_sorting_only,
+            hyperparam_sweep,
             existing_groups: HashMap::default(),
             task_queue,
             group_result_sender,
@@ -330,7 +344,7 @@ impl ConflictTaskGenerator {
     /// * `new_group` - The `ConflictGroup` to create tasks for.
     /// * `priority` - The priority to assign to the tasks.
     fn create_new_tasks(&mut self, new_group: &ConflictGroup, priority: TaskPriority) {
-        let tasks = get_tasks_for_group(new_group, priority, self.safe_sorting_only);
+        let tasks = get_tasks_for_group(new_group, priority, self.safe_sorting_only, self.hyperparam_sweep);
         for task in tasks {
             let _ = self.task_queue.send(task);
         }
@@ -352,115 +366,76 @@ pub fn get_tasks_for_group(
     group: &ConflictGroup,
     priority: TaskPriority,
     safe_sorting_only: bool,
+    hyperparam_sweep: bool,
 ) -> Vec<ConflictTask> {
     let mut tasks = vec![];
     let created_at = Instant::now();
 
     if let Some(_deps) = GroupDeps::from_group(&group) {
-        if is_simple_chain(&group) {
-            // Single sender: only AllPermutations (no need for Greedy/others)
-            tasks.push(ConflictTask {
-                group_idx: group.id,
-                algorithm: Algorithm::AllPermutations,
-                priority,
-                group: group.clone(),
-                created_at,
-            });
-            return tasks;
-        }
+        // if is_simple_chain(&group) {
+        //     // Single sender: only AllPermutations (no need for Greedy/others)
+        //     tasks.push(ConflictTask {
+        //         group_idx: group.id,
+        //         algorithm: Algorithm::AllPermutations,
+        //         priority,
+        //         group: group.clone(),
+        //         created_at,
+        //     });
+        //     return tasks;
+        // }
 
-        // Always try Greedy first (fast baseline)
-        tasks.push(ConflictTask {
-            group_idx: group.id,
-            algorithm: Algorithm::Greedy,
-            priority,
-            group: group.clone(),
-            created_at,
-        });
+        // // Always try Greedy first (fast baseline)
+        // tasks.push(ConflictTask {
+        //     group_idx: group.id,
+        //     algorithm: Algorithm::Greedy,
+        //     priority,
+        //     group: group.clone(),
+        //     created_at,
+        // });
         // Check if we can enumerate all orderings within the cap
         if let Some(small) = orderings_leq_cap(group, MULTINOMIAL_ALL_PERMS_THRESHOLD) {
             if small {
-                tasks.push(ConflictTask {
-                    group_idx: group.id,
-                    algorithm: Algorithm::AllPermutations,
-                    priority,
-                    group: group.clone(),
-                    created_at,
-                });
+                // tasks.push(ConflictTask {
+                //     group_idx: group.id,
+                //     algorithm: Algorithm::AllPermutations,
+                //     priority,
+                //     group: group.clone(),
+                //     created_at,
+                // });
             } else {
+                // Always run Greedy as the baseline.
                 tasks.push(ConflictTask {
                     group_idx: group.id,
-                    algorithm: Algorithm::GreedyFast,
+                    algorithm: Algorithm::Greedy,
                     priority,
                     group: group.clone(),
                     created_at,
                 });
-                tasks.push(ConflictTask {
-                    group_idx: group.id,
-                    algorithm: Algorithm::Genetic {
-                        population: 100,
-                        crossover_rate: 0.8,
-                        mutation_rate: 0.15,
-                        max_generations: 100,
-                        time_ms: 60000,
-                        seed: group.id as u64,
-                        num_islands: 4,
-                        migration_interval: 3,
-                        w_choice: 0.3,
-                        early_stopping_generations: 10,
-                        temp_tight_low: 0.5,
-                        temp_tight_high: 2.0,
-                        temp_broad_low: 3.0,
-                        temp_broad_high: 8.0,
-                        tight_fraction: 0.6,
-                    },
-                    priority: TaskPriority::Medium,
-                    group: group.clone(),
-                    created_at,
-                });
-                tasks.push(ConflictTask {
-                    group_idx: group.id,
-                    algorithm: Algorithm::GreedyHeap,
-                    priority,
-                    group: group.clone(),
-                    created_at,
-                });
-                tasks.push(ConflictTask {
-                    group_idx: group.id,
-                    algorithm: Algorithm::Random {
-                        seed: group.id as u64,
-                        count: 50,
-                    },
-                    priority: TaskPriority::Low,
-                    group: group.clone(),
-                    created_at,
-                });
 
-                tasks.push(ConflictTask {
-                    group_idx: group.id,
-                    algorithm: Algorithm::RandomImproved {
-                        seed: group.id as u64,
-                        count: 50,
-                    },
-                    priority: TaskPriority::Low,
-                    group: group.clone(),
-                    created_at,
-                });
-
-                tasks.push(ConflictTask {
-                    group_idx: group.id,
-                    algorithm: Algorithm::Length,
-                    priority: TaskPriority::Low,
-                    group: group.clone(),
-                    created_at,
-                });
-                tasks.push(ConflictTask {
-                    group_idx: group.id,
-                    algorithm: Algorithm::ReverseGreedy,
-                    priority: TaskPriority::Low,
-                    group: group.clone(),
-                    created_at,
-                });
+                if hyperparam_sweep {
+                    // Backtest mode: emit all (alpha, lambda) combinations so we can identify
+                    // the best hyperparameters across blocks.
+                    for &alpha in DEX_ALPHA_VALUES {
+                        for &lambda in DEX_LAMBDA_VALUES {
+                            tasks.push(ConflictTask {
+                                group_idx: group.id,
+                                algorithm: Algorithm::DexDirectionBalanced { alpha, lambda },
+                                priority: TaskPriority::Medium,
+                                group: group.clone(),
+                                created_at,
+                            });
+                        }
+                    }
+                } else {
+                    // Live mode: single task with the default (alpha=1.0, lambda=0.5) combination.
+                    tasks.push(ConflictTask {
+                        group_idx: group.id,
+                        algorithm: Algorithm::DexDirectionBalanced { alpha: 1.0, lambda: 0.5 },
+                        priority: TaskPriority::Medium,
+                        group: group.clone(),
+                        created_at,
+                    });
+                }
             }
             return tasks;
         }
@@ -622,7 +597,7 @@ mod tests {
     fn create_task_generator() -> (ConflictTaskGenerator, crossbeam::channel::Receiver<ConflictTask>) {
         let (sender, _receiver) = mpsc::channel();
         let (task_sender, task_receiver) = crossbeam::channel::unbounded();
-        (ConflictTaskGenerator::new(false, task_sender, sender), task_receiver)
+        (ConflictTaskGenerator::new(false, task_sender, sender, false), task_receiver)
     }
 
 
@@ -642,7 +617,8 @@ mod tests {
 
         assert_eq!(conflict_manager.existing_groups.len(), 1);
         assert!(conflict_manager.existing_groups.contains_key(&1));
-        assert_eq!(conflict_manager.task_queue.len(), 2);
+        // Test orders all share nonce=0 → nonce-conflict path → small=true → 0 tasks generated.
+        assert_eq!(conflict_manager.task_queue.len(), 0);
     }
 
     #[test]
@@ -672,7 +648,8 @@ mod tests {
         conflict_manager.process_single_group(updated_group);
 
         assert_eq!(conflict_manager.existing_groups.len(), 1);
-        assert_eq!(conflict_manager.task_queue.len(), 2);
+        // Test orders share nonce=0 → nonce-conflict path → small=true → 0 tasks.
+        assert_eq!(conflict_manager.task_queue.len(), 0);
     }
 
     #[test]
@@ -705,7 +682,8 @@ mod tests {
 
         assert_eq!(conflict_manager.existing_groups.len(), 1);
         assert!(conflict_manager.existing_groups.contains_key(&2));
-        assert_eq!(conflict_manager.task_queue.len(), 2);
+        // Test orders share nonce=0 → nonce-conflict path → small=true → 0 tasks.
+        assert_eq!(conflict_manager.task_queue.len(), 0);
     }
 
     #[test]
@@ -749,7 +727,8 @@ mod tests {
         assert_eq!(conflict_manager.existing_groups.len(), 2);
         assert!(conflict_manager.existing_groups.contains_key(&2));
         assert!(conflict_manager.existing_groups.contains_key(&3));
-        assert_eq!(conflict_manager.task_queue.len(), 4);
+        // Test orders share nonce=0 → nonce-conflict path → small=true → 0 tasks per group.
+        assert_eq!(conflict_manager.task_queue.len(), 0);
     }
 
     #[test]

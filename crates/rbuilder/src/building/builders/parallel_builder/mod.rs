@@ -147,6 +147,7 @@ where
             config.safe_sorting_only,
             task_queue_sender,
             group_result_sender_for_task_generator,
+            false, // live builder: single default DexDirectionBalanced task
         );
 
         let conflict_resolving_pool = ConflictResolvingPool::new(
@@ -366,6 +367,134 @@ fn dedup_by_bundle_signer_and_slots(orders: Vec<Arc<SimulatedOrder>>) -> Vec<Arc
     result
 }
 
+// ── DEX hyperparameter sweep analytics ───────────────────────────────────────
+
+/// One (alpha, lambda) combination result for a single conflict group.
+#[derive(Debug, serde::Serialize)]
+struct DexCombo {
+    alpha: f64,
+    lambda: f64,
+    profit_wei: String,
+}
+
+/// Per-group summary of the DEX hyperparameter sweep.
+#[derive(Debug, serde::Serialize)]
+struct DexGroupHyperparamResult {
+    group_id: usize,
+    order_count: usize,
+    greedy_profit_wei: String,
+    best_dex_profit_wei: String,
+    /// `(best_dex - greedy) / greedy * 100`; `null` when greedy profit is zero.
+    improvement_over_greedy_pct: Option<f64>,
+    /// All (alpha, lambda) combinations that tied for the best DEX profit.
+    winning_combos: Vec<DexCombo>,
+    /// All 15 combinations, sorted alpha asc then lambda asc.
+    all_combos: Vec<DexCombo>,
+}
+
+/// Top-level file written per block.
+#[derive(Debug, serde::Serialize)]
+struct DexHyperparamFile {
+    block_number: u64,
+    block_profit_wei: String,
+    /// Number of groups that had >120 valid orderings and ran the sweep.
+    eligible_groups: usize,
+    groups: Vec<DexGroupHyperparamResult>,
+}
+
+/// Build per-group DEX hyperparameter results from the flat list of `AlgoRecord`s.
+fn build_dex_hyperparam_results(algo_records: &[conflict_resolvers::AlgoRecord]) -> Vec<DexGroupHyperparamResult> {
+    use alloy_primitives::U256;
+    use std::str::FromStr;
+
+    // Bucket records by group_id.
+    let mut by_group: HashMap<usize, Vec<&conflict_resolvers::AlgoRecord>> = HashMap::default();
+    for rec in algo_records {
+        by_group.entry(rec.group_id).or_default().push(rec);
+    }
+
+    let mut results: Vec<DexGroupHyperparamResult> = Vec::new();
+
+    for (group_id, records) in &by_group {
+        // Split into Greedy and DEX records.
+        let greedy_records: Vec<_> = records.iter()
+            .filter(|r| r.algo == "Greedy" && r.dex_alpha.is_none())
+            .collect();
+        let dex_records: Vec<_> = records.iter()
+            .filter(|r| r.dex_alpha.is_some())
+            .collect();
+
+        // Skip groups that didn't run any DEX tasks (e.g. they fell through to the legacy path).
+        if dex_records.is_empty() {
+            continue;
+        }
+
+        let order_count = records.first().map(|r| r.order_count).unwrap_or(0);
+
+        // Best greedy profit (take the max if somehow multiple records exist).
+        let greedy_profit: U256 = greedy_records.iter()
+            .filter_map(|r| U256::from_str(&r.profit_wei).ok())
+            .max()
+            .unwrap_or(U256::ZERO);
+
+        // Find the maximum DEX profit across all (alpha, lambda) combinations.
+        let best_dex_profit: U256 = dex_records.iter()
+            .filter_map(|r| U256::from_str(&r.profit_wei).ok())
+            .max()
+            .unwrap_or(U256::ZERO);
+
+        // Collect all combos that tied for best.
+        let mut winning_combos: Vec<DexCombo> = dex_records.iter()
+            .filter(|r| U256::from_str(&r.profit_wei).ok() == Some(best_dex_profit))
+            .map(|r| DexCombo {
+                alpha: r.dex_alpha.unwrap_or(0.0),
+                lambda: r.dex_lambda.unwrap_or(0.0),
+                profit_wei: r.profit_wei.clone(),
+            })
+            .collect();
+        winning_combos.sort_by(|a, b| a.alpha.partial_cmp(&b.alpha)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.lambda.partial_cmp(&b.lambda).unwrap_or(std::cmp::Ordering::Equal)));
+
+        // All combos sorted alpha asc, lambda asc.
+        let mut all_combos: Vec<DexCombo> = dex_records.iter()
+            .map(|r| DexCombo {
+                alpha: r.dex_alpha.unwrap_or(0.0),
+                lambda: r.dex_lambda.unwrap_or(0.0),
+                profit_wei: r.profit_wei.clone(),
+            })
+            .collect();
+        all_combos.sort_by(|a, b| a.alpha.partial_cmp(&b.alpha)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.lambda.partial_cmp(&b.lambda).unwrap_or(std::cmp::Ordering::Equal)));
+
+        let improvement_over_greedy_pct = if greedy_profit.is_zero() {
+            None
+        } else {
+            // Compute as f64: (best_dex - greedy) / greedy * 100
+            // Use saturating sub to avoid panic on underflow.
+            let diff = best_dex_profit.saturating_sub(greedy_profit);
+            let diff_f64: f64 = diff.to_string().parse().unwrap_or(0.0);
+            let greedy_f64: f64 = greedy_profit.to_string().parse().unwrap_or(1.0);
+            Some(diff_f64 / greedy_f64 * 100.0)
+        };
+
+        results.push(DexGroupHyperparamResult {
+            group_id: *group_id,
+            order_count,
+            greedy_profit_wei: greedy_profit.to_string(),
+            best_dex_profit_wei: best_dex_profit.to_string(),
+            improvement_over_greedy_pct,
+            winning_combos,
+            all_combos,
+        });
+    }
+
+    // Sort by group_id for deterministic output.
+    results.sort_by_key(|r| r.group_id);
+    results
+}
+
 pub fn parallel_build_backtest<P>(
     input: BacktestSimulateBlockInput<'_, P>,
     config: ParallelBuilderConfig,
@@ -435,7 +564,12 @@ where
     // println!("After keeping only largest group(s), {} groups remain with {} orders", groups.len(), groups.iter().map(|g| g.orders.len()).sum::<usize>());
 
     // Generate tasks using the same logic as live builder
-    let mut task_generator = ConflictTaskGenerator::new(config.safe_sorting_only, task_queue_sender.clone(), group_result_sender_for_task_generator);
+    let mut task_generator = ConflictTaskGenerator::new(
+        config.safe_sorting_only,
+        task_queue_sender.clone(),
+        group_result_sender_for_task_generator,
+        true, // backtest: sweep all (alpha,lambda) hyperparameter combinations
+    );
     // let processing_start = Instant::now();
     task_generator.process_groups(groups.clone());
 
@@ -476,6 +610,7 @@ where
         &input.ctx,
         block_state.clone(),
         Arc::clone(&simulation_cache),
+        true, // backtest: sweep all (alpha,lambda) hyperparameter combinations
     );
 
 
@@ -583,6 +718,7 @@ where
             error!(%e, "Failed to create parallel_builder_analytics directory");
         } else {
             let block = input.ctx.block();
+
             // File 1: algo results + block profit
             #[derive(serde::Serialize)]
             struct AlgoResultsFile<'a> {
@@ -608,6 +744,23 @@ where
                 if let Ok(json) = serde_json::to_string_pretty(&ga_records) {
                     if let Err(e) = std::fs::write(&ga_file, json) {
                         error!(%e, "Failed to write ga_analytics");
+                    }
+                }
+            }
+
+            // File 3: DEX hyperparameter sweep results
+            let dex_groups = build_dex_hyperparam_results(&algo_records);
+            if !dex_groups.is_empty() {
+                let dex_payload = DexHyperparamFile {
+                    block_number: block,
+                    block_profit_wei: payout_tx_value.to_string(),
+                    eligible_groups: dex_groups.len(),
+                    groups: dex_groups,
+                };
+                let dex_file = analytics_dir.join(format!("dex_hyperparam_{}.json", block));
+                if let Ok(json) = serde_json::to_string_pretty(&dex_payload) {
+                    if let Err(e) = std::fs::write(&dex_file, json) {
+                        error!(%e, "Failed to write dex_hyperparam analytics");
                     }
                 }
             }

@@ -40,6 +40,11 @@ pub struct AlgoRecord {
     pub order_count: usize,
     pub elapsed_ms: f64,
     pub profit_wei: String,
+    pub sequence_tx_count: usize,
+    pub gas_used: u64,
+    /// Set only for `DexDirectionBalanced` runs; `None` for all other algorithms.
+    pub dex_alpha: Option<f64>,
+    pub dex_lambda: Option<f64>,
 }
 
 /// One record per GA generation (plus an "initial" record before gen 0).
@@ -229,6 +234,10 @@ impl ResolverContext {
         };
 
         let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+        let (dex_alpha, dex_lambda) = match task.algorithm {
+            Algorithm::DexDirectionBalanced { alpha, lambda } => (Some(alpha), Some(lambda)),
+            _ => (None, None),
+        };
         inner.map(|(res, ga_records)| {
             let algo_record = AlgoRecord {
                 group_id,
@@ -236,6 +245,10 @@ impl ResolverContext {
                 order_count,
                 elapsed_ms,
                 profit_wei: res.total_profit.to_string(),
+                sequence_tx_count: res.sequence_of_orders.len(),
+                gas_used: res.gas_used,
+                dex_alpha,
+                dex_lambda,
             };
             (res, algo_record, ga_records)
         })
@@ -1058,6 +1071,7 @@ pub fn generate_sequences_of_orders_to_try(task: &ConflictTask) -> Vec<Vec<usize
         Algorithm::Random { seed, count } => generate_random_permutations(task, seed, count),
         Algorithm::Genetic { .. } => vec![],
         Algorithm::RandomImproved { seed, count } => generate_random_permutations_with_nonce(task, seed, count),
+        Algorithm::DexDirectionBalanced { alpha, lambda } => generate_dex_marginal_centered_sequence(task, alpha, lambda),
     }
 }
 
@@ -1171,7 +1185,7 @@ fn generate_greedy_sequence(task: &ConflictTask, reverse: bool) -> Vec<Vec<usize
 
     vec![
         create_sequence(|sim_order| sim_order.sim_value.full_profit_info().coinbase_profit()),
-        create_sequence(|sim_order| sim_order.sim_value.full_profit_info().mev_gas_price()),
+        // create_sequence(|sim_order| sim_order.sim_value.full_profit_info().mev_gas_price()),
     ]
 }
 
@@ -1200,6 +1214,65 @@ fn generate_length_based_sequence(task: &ConflictTask) -> Vec<Vec<usize>> {
 
     sequences_of_orders.push(length_based_sequence);
     sequences_of_orders
+}
+
+/// Score-based DEX ordering: sort orders by `profit_eth - lambda * impact`, where
+/// impact is the sum of pool price displacements weighted by pool popularity:
+///   `w(pool) = 1 + alpha * ln(1 + touch_count)`.
+///
+/// Pools touched by many orders in the conflict group get a higher weight, because
+/// a displacement there cascades across more downstream orders.
+///
+/// Orders without a state trace get impact = 0 and are sorted purely by profit.
+fn generate_dex_marginal_centered_sequence(task: &ConflictTask, alpha: f64, lambda: f64) -> Vec<Vec<usize>> {
+    const WEI_TO_ETH: f64 = 1e-18;
+
+    let n = task.group.orders.len();
+    let orders = &task.group.orders;
+
+    // Step 1: count how many orders touch each pool.
+    let mut touch_count: HashMap<Address, usize> = HashMap::default();
+    for order in orders.iter() {
+        if let Some(trace) = &order.used_state_trace {
+            for pool in trace.touched_pools.keys() {
+                *touch_count.entry(*pool).or_default() += 1;
+            }
+        }
+    }
+
+    // Step 2: compute a continuous score for each order.
+    let mut scored: Vec<(usize, f64)> = (0..n)
+        .map(|i| {
+            let order = &orders[i];
+            let profit_eth =
+                order.sim_value.full_profit_info().coinbase_profit().to::<u128>() as f64
+                    * WEI_TO_ETH;
+
+            let (impact, pool_dbg) = if let Some(trace) = &order.used_state_trace {
+                let displacements = trace.price_displacement();
+                let mut impact = 0.0f64;
+                let mut pool_dbg: Vec<String> = Vec::new();
+                for (pool, disp) in &displacements {
+                    let tc = *touch_count.get(pool).unwrap_or(&1);
+                    let w = 1.0 + alpha * (1.0 + tc as f64).ln();
+                    impact += w * disp;
+                    pool_dbg.push(format!("{pool:?}:disp={disp:.4},w={w:.2},tc={tc}"));
+                }
+                (impact, pool_dbg)
+            } else {
+                (0.0, vec![])
+            };
+
+            let score = profit_eth - lambda * impact;
+            (i, score)
+        })
+        .collect();
+
+    // Step 3: sort by score descending.
+    scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    let score_sequence: Vec<usize> = scored.into_iter().map(|(i, _)| i).collect();
+
+    vec![score_sequence]
 }
 
 #[cfg(test)]

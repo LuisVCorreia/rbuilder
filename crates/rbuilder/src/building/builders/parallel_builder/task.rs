@@ -57,7 +57,7 @@ impl Ord for ConflictTask {
 
 /// Algorithm provides an algorithm for resolving a [ConflictGroup].
 /// Initially these are all algorithms that produce a sequence of orders to execute.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Algorithm {
     /// `Greedy` checks the following ordrerings: max profit, mev gas price
     Greedy,
@@ -77,6 +77,9 @@ pub enum Algorithm {
     Genetic { population: usize, crossover_rate: f64, mutation_rate: f64, max_generations: usize, time_ms: u64, seed: u64, num_islands: usize, migration_interval: usize, w_choice: f64, early_stopping_generations: usize, temp_tight_low: f64, temp_tight_high: f64, temp_broad_low: f64, temp_broad_high: f64, tight_fraction: f64 },
     /// `RandomImproved` checks nonce-valid random permutations of the group only.
     RandomImproved { seed: u64, count: usize },
+    /// `DexDirectionBalanced` scores orders by `profit_eth - lambda * impact` where impact
+    /// is a pool-popularity-weighted sum of price displacements.
+    DexDirectionBalanced { alpha: f64, lambda: f64 },
 }
 
 impl Algorithm {
@@ -91,7 +94,7 @@ impl Algorithm {
             Algorithm::Random { .. } => "Random",
             Algorithm::Genetic { .. } => "Genetic",
             Algorithm::RandomImproved { .. } => "RandomImproved",
-
+            Algorithm::DexDirectionBalanced { .. } => "DexDirectionBalanced",
         }
     }
 }

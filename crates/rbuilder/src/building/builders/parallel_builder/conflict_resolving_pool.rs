@@ -1,5 +1,6 @@
 use alloy_primitives::utils::format_ether;
 use eyre::Result;
+use rayon::prelude::*;
 use reth_provider::StateProvider;
 use std::{
     sync::{mpsc as std_mpsc, Arc},
@@ -179,29 +180,35 @@ where
         ctx: &BlockBuildingContext,
         state: Arc<dyn StateProvider>,
         simulation_cache: Arc<SharedSimulationCache>,
+        hyperparam_sweep: bool,
     ) -> (Vec<(GroupId, (ResolutionResult, ConflictGroup))>, Vec<AlgoRecord>, Vec<GAGenRecord>) {
-        let mut results = Vec::new();
-        let mut algo_records: Vec<AlgoRecord> = Vec::new();
-        let mut ga_records: Vec<GAGenRecord> = Vec::new();
-        let mut local_ctx = ThreadBlockBuildingContext::default();
-        for new_group in new_groups {
-            let tasks = get_tasks_for_group(&new_group, TaskPriority::High, self.safe_sorting_only);
-            for task in tasks {
-                let simulation_cache = Arc::clone(&simulation_cache);
-                let result = Self::process_task(
+        let all_tasks: Vec<ConflictTask> = new_groups
+            .iter()
+            .flat_map(|g| get_tasks_for_group(g, TaskPriority::High, self.safe_sorting_only, hyperparam_sweep))
+            .collect();
+
+        let parallel_results: Vec<_> = all_tasks
+            .into_par_iter()
+            .filter_map(|task| {
+                let mut local_ctx = ThreadBlockBuildingContext::default();
+                Self::process_task(
                     task,
                     ctx,
                     &mut local_ctx,
                     state.clone(),
                     CancellationToken::new(),
-                    simulation_cache,
-                );
-                if let Ok((gid, res_grp, algo_rec, ga_recs)) = result {
-                    results.push((gid, res_grp));
-                    algo_records.push(algo_rec);
-                    ga_records.extend(ga_recs);
-                }
-            }
+                    Arc::clone(&simulation_cache),
+                ).ok()
+            })
+            .collect();
+
+        let mut results = Vec::new();
+        let mut algo_records: Vec<AlgoRecord> = Vec::new();
+        let mut ga_records: Vec<GAGenRecord> = Vec::new();
+        for (gid, res_grp, algo_rec, ga_recs) in parallel_results {
+            results.push((gid, res_grp));
+            algo_records.push(algo_rec);
+            ga_records.extend(ga_recs);
         }
         (results, algo_records, ga_records)
     }
